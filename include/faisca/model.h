@@ -25,10 +25,12 @@ struct LlamaHparams
     float rope_freq_base = 10000.0f;
 };
 
-// a matrix of n_out rows of n_in values, F32 or Q8_0, in the file's own layout
+// a matrix of n_out rows of n_in values: F32, Q8_0 in the file's own layout, or
+// Q8_0 packed in groups of 16 rows (see ops.h)
 struct Weight
 {
     GgmlType type = GgmlType::F32;
+    bool packed = false;
     const uint8_t* data = nullptr;
     size_t n_in = 0;
     size_t n_out = 0;
@@ -38,10 +40,21 @@ struct Weight
         return reinterpret_cast<const float*>(data);
     }
 
+    // bytes of one row in the file's layout, also the bytes per row of the packed form
     size_t row_bytes() const;
 
     // one row as float32
     void row(size_t index, float* out) const;
+
+    // out[o] for o in [first, last): x is the float32 input, xq its Q8_0 form with the
+    // block sums from q8_0_block_sums; the quantized forms may be null for F32 weights
+    void matvec(const float* x, const uint8_t* xq, const int32_t* x_sums, size_t first, size_t last, float* out) const;
+
+    // rows per unit of work: results do not depend on how units are split between threads
+    size_t row_group() const
+    {
+        return packed ? 16 : 4;
+    }
 };
 
 struct LlamaLayer
@@ -57,9 +70,10 @@ struct LlamaLayer
     Weight ffn_down;
 };
 
-// the llama architecture. F32 and Q8_0 tensors are used in place in the mapped
-// file, F16 tensors are converted to float32 at load. With dequantize set, Q8_0
-// is converted to float32 too. The GGUF file must stay open.
+// the llama architecture. F32 tensors are used in place in the mapped file, F16
+// tensors are converted to float32 at load. Q8_0 tensors are packed for the VNNI
+// kernels into their own memory when the build has them, used in place otherwise,
+// and converted to float32 with dequantize set. The GGUF file must stay open.
 class LlamaModel
 {
 public:
@@ -109,7 +123,12 @@ public:
 
     size_t converted_bytes() const
     {
-        return m_storage.size() * sizeof(float);
+        return m_storage.size() * sizeof(float) + m_packed_bytes;
+    }
+
+    bool packed() const
+    {
+        return m_packed != nullptr;
     }
 
     // bytes the forward pass reads per token
@@ -124,7 +143,11 @@ private:
 
     LlamaHparams m_hparams;
     bool m_dequantize = false;
+    bool m_pack = false;
     Array<float> m_storage;
+    uint8_t* m_packed = nullptr;
+    size_t m_packed_bytes = 0;
+    size_t m_packed_used = 0;
     Array<LlamaLayer> m_layers;
     Weight m_token_embd;
     const float* m_output_norm = nullptr;

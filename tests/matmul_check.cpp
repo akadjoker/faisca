@@ -87,6 +87,7 @@ void check(const faisca::Weight& w, const Tensor& input, const Tensor& output, c
     }
 
     std::vector<uint8_t> xq((w.n_in / faisca::Q8_0_BLOCK) * faisca::Q8_0_BLOCK_BYTES);
+    std::vector<int32_t> sums(w.n_in / faisca::Q8_0_BLOCK);
     std::vector<float> out(w.n_out);
     double error = 0.0;
     double norm = 0.0;
@@ -96,12 +97,9 @@ void check(const faisca::Weight& w, const Tensor& input, const Tensor& output, c
         if (w.type == faisca::GgmlType::Q8_0)
         {
             faisca::quantize_q8_0(x, w.n_in, xq.data());
-            faisca::matvec_q8_0(w.data, xq.data(), w.n_in, w.n_out, out.data());
+            faisca::q8_0_block_sums(xq.data(), w.n_in, sums.data());
         }
-        else
-        {
-            faisca::matvec(w.f32(), x, w.n_in, w.n_out, out.data());
-        }
+        w.matvec(x, xq.data(), sums.data(), 0, w.n_out, out.data());
         const float* expected = output.values.data() + t * w.n_out;
         for (size_t o = 0; o < w.n_out; ++o)
         {
@@ -206,7 +204,8 @@ int main(int argc, char** argv)
         check(model.output(), *result_norm, *result_output, "output", limit, verbose);
     }
 
-    std::printf("%s %s: %d matrices checked with llama.cpp's inputs, worst rel L2 %.3e (%s), %d failures\n",
-                g_failures == 0 ? "ok  " : "FAIL", argv[1], g_checks, g_worst, g_worst_name.c_str(), g_failures);
+    std::printf("%s %s (%s): %d matrices checked with llama.cpp's inputs, worst rel L2 %.3e (%s), %d failures\n",
+                g_failures == 0 ? "ok  " : "FAIL", argv[1], model.packed() ? "packed Q8_0" : "Q8_0 rows", g_checks,
+                g_worst, g_worst_name.c_str(), g_failures);
     return g_failures == 0 ? 0 : 1;
 }

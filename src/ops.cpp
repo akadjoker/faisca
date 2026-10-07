@@ -6,6 +6,11 @@
 #if defined(__AVX2__) && defined(__FMA__) && defined(__F16C__)
 #include <immintrin.h>
 #define FAISCA_AVX2 1
+#if defined(__AVX512VNNI__) && defined(__AVX512VL__) && defined(__AVX512F__) && defined(__AVX512BW__)
+#define FAISCA_AVX512_VNNI 1
+#elif defined(__AVXVNNI__)
+#define FAISCA_AVX_VNNI 1
+#endif
 #endif
 
 namespace faisca
@@ -13,12 +18,355 @@ namespace faisca
 
 const char* simd_name()
 {
-#if defined(FAISCA_AVX2)
+#if defined(FAISCA_AVX512_VNNI)
+    return "AVX-512 VNNI";
+#elif defined(FAISCA_AVX_VNNI)
+    return "AVX2+FMA+F16C+VNNI";
+#elif defined(FAISCA_AVX2)
     return "AVX2+FMA+F16C";
 #else
     return "scalar";
 #endif
 }
+
+bool q8_0_packed_supported()
+{
+#if defined(FAISCA_AVX512_VNNI) || defined(FAISCA_AVX_VNNI)
+    return true;
+#else
+    return false;
+#endif
+}
+
+size_t q8_0_padded_rows(size_t n_out)
+{
+    return (n_out + Q8_0_GROUP - 1) / Q8_0_GROUP * Q8_0_GROUP;
+}
+
+size_t q8_0_packed_bytes(size_t n_in, size_t n_out)
+{
+    return q8_0_padded_rows(n_out) / Q8_0_GROUP * (n_in / Q8_0_BLOCK) * Q8_0_GROUP_BLOCK_BYTES;
+}
+
+void pack_q8_0(const uint8_t* rows, size_t n_in, size_t n_out, uint8_t* out)
+{
+    const size_t blocks = n_in / Q8_0_BLOCK;
+    const size_t row_bytes = blocks * Q8_0_BLOCK_BYTES;
+    const size_t groups = q8_0_padded_rows(n_out) / Q8_0_GROUP;
+
+    for (size_t g = 0; g < groups; ++g)
+    {
+        for (size_t b = 0; b < blocks; ++b)
+        {
+            uint8_t* scales = out;
+            uint8_t* quants = out + 2 * Q8_0_GROUP;
+            for (size_t r = 0; r < Q8_0_GROUP; ++r)
+            {
+                const size_t row = g * Q8_0_GROUP + r;
+                if (row >= n_out)
+                {
+                    scales[2 * r] = 0;
+                    scales[2 * r + 1] = 0;
+                    for (size_t k = 0; k < Q8_0_BLOCK; ++k)
+                    {
+                        quants[(k / 4) * 64 + r * 4 + (k % 4)] = 128;
+                    }
+                    continue;
+                }
+                const uint8_t* block = rows + row * row_bytes + b * Q8_0_BLOCK_BYTES;
+                scales[2 * r] = block[0];
+                scales[2 * r + 1] = block[1];
+                for (size_t k = 0; k < Q8_0_BLOCK; ++k)
+                {
+                    quants[(k / 4) * 64 + r * 4 + (k % 4)] = static_cast<uint8_t>(block[2 + k] + 128);
+                }
+            }
+            out += Q8_0_GROUP_BLOCK_BYTES;
+        }
+    }
+}
+
+void row_q8_0_packed(const uint8_t* packed, size_t n_in, size_t row, float* out)
+{
+    const size_t blocks = n_in / Q8_0_BLOCK;
+    const size_t g = row / Q8_0_GROUP;
+    const size_t r = row % Q8_0_GROUP;
+    const uint8_t* group = packed + g * blocks * Q8_0_GROUP_BLOCK_BYTES;
+    for (size_t b = 0; b < blocks; ++b)
+    {
+        const uint8_t* block = group + b * Q8_0_GROUP_BLOCK_BYTES;
+        uint16_t bits = 0;
+        std::memcpy(&bits, block + 2 * r, 2);
+        const float d = f16_to_f32(bits);
+        const uint8_t* quants = block + 2 * Q8_0_GROUP;
+        for (size_t k = 0; k < Q8_0_BLOCK; ++k)
+        {
+            const int value = static_cast<int>(quants[(k / 4) * 64 + r * 4 + (k % 4)]) - 128;
+            out[b * Q8_0_BLOCK + k] = static_cast<float>(value) * d;
+        }
+    }
+}
+
+void q8_0_block_sums(const uint8_t* xq, size_t n, int32_t* out)
+{
+    for (size_t b = 0; b < n / Q8_0_BLOCK; ++b)
+    {
+        const int8_t* q = reinterpret_cast<const int8_t*>(xq + b * Q8_0_BLOCK_BYTES + 2);
+        int32_t sum = 0;
+        for (size_t k = 0; k < Q8_0_BLOCK; ++k)
+        {
+            sum += q[k];
+        }
+        out[b] = 128 * sum;
+    }
+}
+
+void matvec_q8_0_packed_scalar(const uint8_t* packed, const uint8_t* xq, const int32_t* x_sums, size_t n_in,
+                               size_t n_out, size_t first, size_t last, float* out)
+{
+    const size_t blocks = n_in / Q8_0_BLOCK;
+    for (size_t g = first / Q8_0_GROUP; g * Q8_0_GROUP < last; ++g)
+    {
+        const uint8_t* group = packed + g * blocks * Q8_0_GROUP_BLOCK_BYTES;
+        float acc[Q8_0_GROUP] = {};
+        for (size_t b = 0; b < blocks; ++b)
+        {
+            const uint8_t* block = group + b * Q8_0_GROUP_BLOCK_BYTES;
+            const uint8_t* quants = block + 2 * Q8_0_GROUP;
+            const int8_t* x = reinterpret_cast<const int8_t*>(xq + b * Q8_0_BLOCK_BYTES + 2);
+            uint16_t dx_bits = 0;
+            std::memcpy(&dx_bits, xq + b * Q8_0_BLOCK_BYTES, 2);
+            const float dx = f16_to_f32(dx_bits);
+            for (size_t r = 0; r < Q8_0_GROUP; ++r)
+            {
+                int32_t sum = 0;
+                for (size_t k = 0; k < Q8_0_BLOCK; ++k)
+                {
+                    sum += static_cast<int32_t>(quants[(k / 4) * 64 + r * 4 + (k % 4)]) * x[k];
+                }
+                sum -= x_sums[b];
+                uint16_t bits = 0;
+                std::memcpy(&bits, block + 2 * r, 2);
+                acc[r] += static_cast<float>(sum) * (f16_to_f32(bits) * dx);
+            }
+        }
+        for (size_t r = 0; r < Q8_0_GROUP && g * Q8_0_GROUP + r < last; ++r)
+        {
+            out[g * Q8_0_GROUP + r] = acc[r];
+        }
+    }
+    (void)n_out;
+}
+
+#if defined(FAISCA_AVX512_VNNI)
+
+namespace
+{
+
+constexpr size_t GEMM_TOKENS = 16;
+
+// one group of 16 rows against up to 16 inputs, the 8 chunks of every block loaded once
+template <size_t TOKENS>
+void gemm_group_avx512(const uint8_t* block, const uint8_t* xq, size_t xq_stride, const int32_t* x_sums,
+                       size_t sums_stride, size_t blocks, size_t row, size_t last, float* out, size_t out_stride)
+{
+    __m512 acc[TOKENS];
+    for (size_t t = 0; t < TOKENS; ++t)
+    {
+        acc[t] = _mm512_setzero_ps();
+    }
+    for (size_t b = 0; b < blocks; ++b)
+    {
+        const uint8_t* quants = block + 2 * Q8_0_GROUP;
+        __m512i w[8];
+        for (size_t j = 0; j < 8; ++j)
+        {
+            w[j] = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(quants + 64 * j));
+        }
+        const __m512 scales = _mm512_cvtph_ps(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(block)));
+        for (size_t t = 0; t < TOKENS; ++t)
+        {
+            const uint8_t* x = xq + t * xq_stride + b * Q8_0_BLOCK_BYTES;
+            __m512i sum = _mm512_setzero_si512();
+            for (size_t j = 0; j < 8; ++j)
+            {
+                int32_t x4 = 0;
+                std::memcpy(&x4, x + 2 + 4 * j, 4);
+                sum = _mm512_dpbusd_epi32(sum, w[j], _mm512_set1_epi32(x4));
+            }
+            sum = _mm512_sub_epi32(sum, _mm512_set1_epi32(x_sums[t * sums_stride + b]));
+            uint16_t dx_bits = 0;
+            std::memcpy(&dx_bits, x, 2);
+            const __m512 d = _mm512_mul_ps(scales, _mm512_set1_ps(f16_to_f32(dx_bits)));
+            acc[t] = _mm512_fmadd_ps(_mm512_cvtepi32_ps(sum), d, acc[t]);
+        }
+        block += Q8_0_GROUP_BLOCK_BYTES;
+    }
+    for (size_t t = 0; t < TOKENS; ++t)
+    {
+        float* o = out + t * out_stride + row;
+        if (row + Q8_0_GROUP <= last)
+        {
+            _mm512_storeu_ps(o, acc[t]);
+        }
+        else
+        {
+            _mm512_mask_storeu_ps(o, static_cast<__mmask16>((1u << (last - row)) - 1), acc[t]);
+        }
+    }
+}
+
+}
+
+void matmul_q8_0_packed(const uint8_t* packed, const uint8_t* xq, size_t xq_stride, const int32_t* x_sums,
+                        size_t sums_stride, size_t n_tokens, size_t n_in, size_t n_out, size_t first, size_t last,
+                        float* out, size_t out_stride)
+{
+    const size_t blocks = n_in / Q8_0_BLOCK;
+    for (size_t g = first / Q8_0_GROUP; g * Q8_0_GROUP < last; ++g)
+    {
+        const uint8_t* block = packed + g * blocks * Q8_0_GROUP_BLOCK_BYTES;
+        const size_t row = g * Q8_0_GROUP;
+        size_t t = 0;
+        for (; t + GEMM_TOKENS <= n_tokens; t += GEMM_TOKENS)
+        {
+            gemm_group_avx512<GEMM_TOKENS>(block, xq + t * xq_stride, xq_stride, x_sums + t * sums_stride, sums_stride,
+                                           blocks, row, last, out + t * out_stride, out_stride);
+        }
+        for (; t < n_tokens; ++t)
+        {
+            gemm_group_avx512<1>(block, xq + t * xq_stride, xq_stride, x_sums + t * sums_stride, sums_stride, blocks,
+                                 row, last, out + t * out_stride, out_stride);
+        }
+    }
+    (void)n_out;
+}
+
+void matvec_q8_0_packed(const uint8_t* packed, const uint8_t* xq, const int32_t* x_sums, size_t n_in, size_t n_out,
+                        size_t first, size_t last, float* out)
+{
+    const size_t blocks = n_in / Q8_0_BLOCK;
+    for (size_t g = first / Q8_0_GROUP; g * Q8_0_GROUP < last; ++g)
+    {
+        const uint8_t* block = packed + g * blocks * Q8_0_GROUP_BLOCK_BYTES;
+        const uint8_t* x = xq;
+        __m512 acc = _mm512_setzero_ps();
+        for (size_t b = 0; b < blocks; ++b)
+        {
+            const uint8_t* quants = block + 2 * Q8_0_GROUP;
+            __m512i sum = _mm512_setzero_si512();
+            for (size_t j = 0; j < 8; ++j)
+            {
+                int32_t x4 = 0;
+                std::memcpy(&x4, x + 2 + 4 * j, 4);
+                sum = _mm512_dpbusd_epi32(sum, _mm512_loadu_si512(reinterpret_cast<const __m512i*>(quants + 64 * j)),
+                                          _mm512_set1_epi32(x4));
+            }
+            sum = _mm512_sub_epi32(sum, _mm512_set1_epi32(x_sums[b]));
+
+            uint16_t dx_bits = 0;
+            std::memcpy(&dx_bits, x, 2);
+            const __m512 scales = _mm512_cvtph_ps(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(block)));
+            const __m512 d = _mm512_mul_ps(scales, _mm512_set1_ps(f16_to_f32(dx_bits)));
+            acc = _mm512_fmadd_ps(_mm512_cvtepi32_ps(sum), d, acc);
+
+            block += Q8_0_GROUP_BLOCK_BYTES;
+            x += Q8_0_BLOCK_BYTES;
+        }
+        const size_t row = g * Q8_0_GROUP;
+        if (row + Q8_0_GROUP <= last)
+        {
+            _mm512_storeu_ps(out + row, acc);
+        }
+        else
+        {
+            _mm512_mask_storeu_ps(out + row, static_cast<__mmask16>((1u << (last - row)) - 1), acc);
+        }
+    }
+    (void)n_out;
+}
+
+#elif defined(FAISCA_AVX_VNNI)
+
+void matmul_q8_0_packed(const uint8_t* packed, const uint8_t* xq, size_t xq_stride, const int32_t* x_sums,
+                        size_t sums_stride, size_t n_tokens, size_t n_in, size_t n_out, size_t first, size_t last,
+                        float* out, size_t out_stride)
+{
+    for (size_t t = 0; t < n_tokens; ++t)
+    {
+        matvec_q8_0_packed(packed, xq + t * xq_stride, x_sums + t * sums_stride, n_in, n_out, first, last,
+                           out + t * out_stride);
+    }
+}
+
+void matvec_q8_0_packed(const uint8_t* packed, const uint8_t* xq, const int32_t* x_sums, size_t n_in, size_t n_out,
+                        size_t first, size_t last, float* out)
+{
+    const size_t blocks = n_in / Q8_0_BLOCK;
+    for (size_t g = first / Q8_0_GROUP; g * Q8_0_GROUP < last; ++g)
+    {
+        const uint8_t* block = packed + g * blocks * Q8_0_GROUP_BLOCK_BYTES;
+        const uint8_t* x = xq;
+        __m256 acc_lo = _mm256_setzero_ps();
+        __m256 acc_hi = _mm256_setzero_ps();
+        for (size_t b = 0; b < blocks; ++b)
+        {
+            const uint8_t* quants = block + 2 * Q8_0_GROUP;
+            __m256i sum_lo = _mm256_setzero_si256();
+            __m256i sum_hi = _mm256_setzero_si256();
+            for (size_t j = 0; j < 8; ++j)
+            {
+                int32_t x4 = 0;
+                std::memcpy(&x4, x + 2 + 4 * j, 4);
+                const __m256i xb = _mm256_set1_epi32(x4);
+                sum_lo = _mm256_dpbusd_avx_epi32(sum_lo, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(quants + 64 * j)), xb);
+                sum_hi = _mm256_dpbusd_avx_epi32(sum_hi, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(quants + 64 * j + 32)), xb);
+            }
+            const __m256i correction = _mm256_set1_epi32(x_sums[b]);
+            sum_lo = _mm256_sub_epi32(sum_lo, correction);
+            sum_hi = _mm256_sub_epi32(sum_hi, correction);
+
+            uint16_t dx_bits = 0;
+            std::memcpy(&dx_bits, x, 2);
+            const __m256 dx = _mm256_set1_ps(f16_to_f32(dx_bits));
+            const __m256 d_lo = _mm256_mul_ps(_mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(block))), dx);
+            const __m256 d_hi = _mm256_mul_ps(_mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(block + 16))), dx);
+            acc_lo = _mm256_fmadd_ps(_mm256_cvtepi32_ps(sum_lo), d_lo, acc_lo);
+            acc_hi = _mm256_fmadd_ps(_mm256_cvtepi32_ps(sum_hi), d_hi, acc_hi);
+
+            block += Q8_0_GROUP_BLOCK_BYTES;
+            x += Q8_0_BLOCK_BYTES;
+        }
+        const size_t row = g * Q8_0_GROUP;
+        float values[Q8_0_GROUP];
+        _mm256_storeu_ps(values, acc_lo);
+        _mm256_storeu_ps(values + 8, acc_hi);
+        const size_t count = row + Q8_0_GROUP <= last ? Q8_0_GROUP : last - row;
+        std::memcpy(out + row, values, count * sizeof(float));
+    }
+    (void)n_out;
+}
+
+#else
+
+void matmul_q8_0_packed(const uint8_t* packed, const uint8_t* xq, size_t xq_stride, const int32_t* x_sums,
+                        size_t sums_stride, size_t n_tokens, size_t n_in, size_t n_out, size_t first, size_t last,
+                        float* out, size_t out_stride)
+{
+    for (size_t t = 0; t < n_tokens; ++t)
+    {
+        matvec_q8_0_packed_scalar(packed, xq + t * xq_stride, x_sums + t * sums_stride, n_in, n_out, first, last,
+                                  out + t * out_stride);
+    }
+}
+
+void matvec_q8_0_packed(const uint8_t* packed, const uint8_t* xq, const int32_t* x_sums, size_t n_in, size_t n_out,
+                        size_t first, size_t last, float* out)
+{
+    matvec_q8_0_packed_scalar(packed, xq, x_sums, n_in, n_out, first, last, out);
+}
+
+#endif
 
 float f16_to_f32(uint16_t bits)
 {
@@ -170,9 +518,20 @@ inline __m256 sum_i8_products(__m256i x, __m256i y)
 {
     const __m256i ax = _mm256_sign_epi8(x, x);
     const __m256i sy = _mm256_sign_epi8(y, x);
+#if defined(__AVXVNNI__)
+    return _mm256_cvtepi32_ps(_mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), ax, sy));
+#else
     const __m256i dot = _mm256_maddubs_epi16(ax, sy);
     const __m256i ones = _mm256_set1_epi16(1);
     return _mm256_cvtepi32_ps(_mm256_madd_epi16(ones, dot));
+#endif
+}
+
+inline float scale_of(const uint8_t* block)
+{
+    uint16_t bits = 0;
+    std::memcpy(&bits, block, 2);
+    return _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128(bits)));
 }
 
 inline float horizontal_sum(__m256 x)
@@ -221,6 +580,71 @@ float dot_q8_0(const uint8_t* a, const uint8_t* b, size_t n)
 
 #endif
 
+#if defined(FAISCA_AVX2)
+
+// four rows share every load of the vector; each row accumulates exactly as dot_q8_0 does
+void matvec_q8_0(const uint8_t* w, const uint8_t* xq, size_t n_in, size_t n_out, float* out)
+{
+    const size_t blocks = n_in / Q8_0_BLOCK;
+    const size_t stride = blocks * Q8_0_BLOCK_BYTES;
+
+    float x_scales[8192 / Q8_0_BLOCK];
+    if (blocks > sizeof(x_scales) / sizeof(x_scales[0]))
+    {
+        for (size_t o = 0; o < n_out; ++o)
+        {
+            out[o] = dot_q8_0(w + o * stride, xq, n_in);
+        }
+        return;
+    }
+    for (size_t b = 0; b < blocks; ++b)
+    {
+        x_scales[b] = scale_of(xq + b * Q8_0_BLOCK_BYTES);
+    }
+
+    size_t o = 0;
+    for (; o + 4 <= n_out; o += 4)
+    {
+        const uint8_t* w0 = w + o * stride;
+        const uint8_t* w1 = w0 + stride;
+        const uint8_t* w2 = w1 + stride;
+        const uint8_t* w3 = w2 + stride;
+        const uint8_t* x = xq;
+        __m256 acc0 = _mm256_setzero_ps();
+        __m256 acc1 = _mm256_setzero_ps();
+        __m256 acc2 = _mm256_setzero_ps();
+        __m256 acc3 = _mm256_setzero_ps();
+        for (size_t b = 0; b < blocks; ++b)
+        {
+            const __m256i qx = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(x + 2));
+            const float dx = x_scales[b];
+            acc0 = _mm256_fmadd_ps(_mm256_set1_ps(scale_of(w0) * dx),
+                                   sum_i8_products(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(w0 + 2)), qx), acc0);
+            acc1 = _mm256_fmadd_ps(_mm256_set1_ps(scale_of(w1) * dx),
+                                   sum_i8_products(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(w1 + 2)), qx), acc1);
+            acc2 = _mm256_fmadd_ps(_mm256_set1_ps(scale_of(w2) * dx),
+                                   sum_i8_products(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(w2 + 2)), qx), acc2);
+            acc3 = _mm256_fmadd_ps(_mm256_set1_ps(scale_of(w3) * dx),
+                                   sum_i8_products(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(w3 + 2)), qx), acc3);
+            x += Q8_0_BLOCK_BYTES;
+            w0 += Q8_0_BLOCK_BYTES;
+            w1 += Q8_0_BLOCK_BYTES;
+            w2 += Q8_0_BLOCK_BYTES;
+            w3 += Q8_0_BLOCK_BYTES;
+        }
+        out[o] = horizontal_sum(acc0);
+        out[o + 1] = horizontal_sum(acc1);
+        out[o + 2] = horizontal_sum(acc2);
+        out[o + 3] = horizontal_sum(acc3);
+    }
+    for (; o < n_out; ++o)
+    {
+        out[o] = dot_q8_0(w + o * stride, xq, n_in);
+    }
+}
+
+#else
+
 void matvec_q8_0(const uint8_t* w, const uint8_t* xq, size_t n_in, size_t n_out, float* out)
 {
     const size_t stride = n_in / Q8_0_BLOCK * Q8_0_BLOCK_BYTES;
@@ -229,6 +653,8 @@ void matvec_q8_0(const uint8_t* w, const uint8_t* xq, size_t n_in, size_t n_out,
         out[o] = dot_q8_0(w + o * stride, xq, n_in);
     }
 }
+
+#endif
 
 float dot(const float* a, const float* b, size_t n)
 {

@@ -1,5 +1,6 @@
 #include "faisca/model.h"
 
+#include "faisca/memory.h"
 #include "faisca/ops.h"
 
 #include <cinttypes>
@@ -47,6 +48,11 @@ size_t Weight::row_bytes() const
 
 void Weight::row(size_t index, float* out) const
 {
+    if (packed)
+    {
+        row_q8_0_packed(data, n_in, index, out);
+        return;
+    }
     const uint8_t* source = data + index * row_bytes();
     if (type == GgmlType::Q8_0)
     {
@@ -56,8 +62,33 @@ void Weight::row(size_t index, float* out) const
     std::memcpy(out, source, n_in * sizeof(float));
 }
 
+void Weight::matvec(const float* x, const uint8_t* xq, const int32_t* x_sums, size_t first, size_t last,
+                    float* out) const
+{
+    if (first >= last)
+    {
+        return;
+    }
+    if (packed)
+    {
+        matvec_q8_0_packed(data, xq, x_sums, n_in, n_out, first, last, out);
+        return;
+    }
+    if (type == GgmlType::Q8_0)
+    {
+        matvec_q8_0(data + first * row_bytes(), xq, n_in, last - first, out + first);
+        return;
+    }
+    faisca::matvec(f32() + first * n_in, x, n_in, last - first, out + first);
+}
+
 void LlamaModel::release()
 {
+    free_large(m_packed, m_packed_bytes);
+    m_packed = nullptr;
+    m_packed_bytes = 0;
+    m_packed_used = 0;
+    m_pack = false;
     m_storage.release();
     m_layers.release();
     m_token_embd = Weight();
@@ -238,6 +269,15 @@ Weight LlamaModel::materialize(const GgufTensor* tensor)
     weight.n_in = static_cast<size_t>(tensor->dims[0]);
     weight.n_out = tensor->n_dims > 1 ? static_cast<size_t>(tensor->dims[1]) : 1;
 
+    if (tensor->type == GgmlType::Q8_0 && m_pack)
+    {
+        weight.type = tensor->type;
+        weight.packed = true;
+        weight.data = m_packed + m_packed_used;
+        pack_q8_0(tensor->data, weight.n_in, weight.n_out, m_packed + m_packed_used);
+        m_packed_used += q8_0_packed_bytes(weight.n_in, weight.n_out);
+        return weight;
+    }
     if (tensor->type == GgmlType::F32 || (tensor->type == GgmlType::Q8_0 && !m_dequantize))
     {
         weight.type = tensor->type;
@@ -271,6 +311,7 @@ bool LlamaModel::load(const GgufFile& file, Error& error, bool dequantize)
 {
     release();
     m_dequantize = dequantize;
+    m_pack = !dequantize && q8_0_packed_supported();
     if (!load_hparams(file, error))
     {
         return false;
@@ -339,6 +380,41 @@ bool LlamaModel::load(const GgufFile& file, Error& error, bool dequantize)
     {
         error.set("out of memory: %zu MiB needed for the converted weights", elements * sizeof(float) >> 20);
         return false;
+    }
+
+    if (m_pack)
+    {
+        size_t packed_bytes = 0;
+        const auto count_packed = [&packed_bytes](const GgufTensor* tensor)
+        {
+            if (tensor != nullptr && tensor->type == GgmlType::Q8_0)
+            {
+                packed_bytes += q8_0_packed_bytes(static_cast<size_t>(tensor->dims[0]), static_cast<size_t>(tensor->dims[1]));
+            }
+        };
+        count_packed(token_embd);
+        count_packed(output);
+        for (const LayerTensors& t : layers)
+        {
+            for (const GgufTensor* tensor : t.tensors)
+            {
+                count_packed(tensor);
+            }
+        }
+        if (packed_bytes != 0)
+        {
+            m_packed = static_cast<uint8_t*>(allocate_large(packed_bytes));
+            if (m_packed == nullptr)
+            {
+                error.set("out of memory: %zu MiB needed for the packed weights", packed_bytes >> 20);
+                return false;
+            }
+            m_packed_bytes = packed_bytes;
+        }
+        else
+        {
+            m_pack = false;
+        }
     }
 
     m_token_embd = materialize(token_embd);

@@ -9,8 +9,24 @@
 namespace faisca
 {
 
+struct Runner::MatmulJob
+{
+    const Runner* runner;
+    const Weight* weight;
+    float* out;
+};
+
+struct Runner::AttentionJob
+{
+    Runner* runner;
+    const LlamaLayer* layer;
+    int il;
+    uint32_t pos;
+};
+
 void Runner::release()
 {
+    m_pool.stop();
     m_model = nullptr;
     m_n_ctx = 0;
     m_pos = 0;
@@ -28,9 +44,10 @@ void Runner::release()
     m_input_size = 0;
     m_input_quantized = false;
     m_input_q8.release();
+    m_input_sums.release();
 }
 
-bool Runner::init(const LlamaModel& model, uint32_t n_ctx, Error& error)
+bool Runner::init(const LlamaModel& model, uint32_t n_ctx, int n_threads, Error& error)
 {
     release();
     if (!model.is_loaded())
@@ -41,6 +58,10 @@ bool Runner::init(const LlamaModel& model, uint32_t n_ctx, Error& error)
     if (n_ctx == 0)
     {
         error.set("the context size must be at least 1");
+        return false;
+    }
+    if (!m_pool.start(n_threads, error))
+    {
         return false;
     }
 
@@ -58,8 +79,9 @@ bool Runner::init(const LlamaModel& model, uint32_t n_ctx, Error& error)
     if (!m_k.resize_uninitialized(cache) || !m_v.resize_uninitialized(cache) || !m_x.resize_uninitialized(h.n_embd) ||
         !m_h.resize_uninitialized(h.n_embd) || !m_q.resize_uninitialized(n_q) || !m_attn.resize_uninitialized(n_q) ||
         !m_gate.resize_uninitialized(h.n_ff) || !m_up.resize_uninitialized(h.n_ff) ||
-        !m_act.resize_uninitialized(h.n_ff) || !m_scores.resize_uninitialized(n_ctx) ||
-        !m_input_q8.resize_uninitialized((widest / Q8_0_BLOCK + 1) * Q8_0_BLOCK_BYTES))
+        !m_act.resize_uninitialized(h.n_ff) || !m_scores.resize_uninitialized(static_cast<size_t>(n_ctx) * h.n_head) ||
+        !m_input_q8.resize_uninitialized((widest / Q8_0_BLOCK + 1) * Q8_0_BLOCK_BYTES) ||
+        !m_input_sums.resize_uninitialized(widest / Q8_0_BLOCK + 1))
     {
         release();
         error.set("out of memory: the KV cache for %" PRIu32 " positions needs %zu MiB", n_ctx,
@@ -130,19 +152,42 @@ void Runner::set_input(const float* x, size_t n)
     m_input_quantized = false;
 }
 
+void Runner::matmul_rows(const Weight& w, float* out, size_t first, size_t last) const
+{
+    w.matvec(m_input, m_input_q8.data(), m_input_sums.data(), first, last, out);
+}
+
+void Runner::matmul_task(void* user, int thread_index, int thread_count)
+{
+    const MatmulJob& job = *static_cast<const MatmulJob*>(user);
+    // whole row groups per thread, so every row is summed the same way whatever the thread count
+    const size_t group = job.weight->row_group();
+    const size_t groups = (job.weight->n_out + group - 1) / group;
+    const size_t first = groups * static_cast<size_t>(thread_index) / static_cast<size_t>(thread_count) * group;
+    size_t last = groups * static_cast<size_t>(thread_index + 1) / static_cast<size_t>(thread_count) * group;
+    last = last < job.weight->n_out ? last : job.weight->n_out;
+    job.runner->matmul_rows(*job.weight, job.out, first, last);
+}
+
 void Runner::matmul(const Weight& w, float* out)
 {
-    if (w.type == GgmlType::Q8_0)
+    if (w.type == GgmlType::Q8_0 && !m_input_quantized)
     {
-        if (!m_input_quantized)
-        {
-            quantize_q8_0(m_input, m_input_size, m_input_q8.data());
-            m_input_quantized = true;
-        }
-        matvec_q8_0(w.data, m_input_q8.data(), w.n_in, w.n_out, out);
-        return;
+        quantize_q8_0(m_input, m_input_size, m_input_q8.data());
+        q8_0_block_sums(m_input_q8.data(), m_input_size, m_input_sums.data());
+        m_input_quantized = true;
     }
-    matvec(w.f32(), m_input, w.n_in, w.n_out, out);
+    MatmulJob job{this, &w, out};
+    m_pool.run(matmul_task, &job);
+}
+
+void Runner::attention_task(void* user, int thread_index, int thread_count)
+{
+    AttentionJob& job = *static_cast<AttentionJob*>(user);
+    const size_t n_head = job.runner->m_model->hparams().n_head;
+    const size_t first = n_head * static_cast<size_t>(thread_index) / static_cast<size_t>(thread_count);
+    const size_t last = n_head * static_cast<size_t>(thread_index + 1) / static_cast<size_t>(thread_count);
+    job.runner->attention_heads(*job.layer, job.il, job.pos, first, last);
 }
 
 void Runner::attention(const LlamaLayer& layer, int il, uint32_t pos)
@@ -150,13 +195,8 @@ void Runner::attention(const LlamaLayer& layer, int il, uint32_t pos)
     const LlamaHparams& h = m_model->hparams();
     const size_t head_dim = h.head_dim;
     const size_t n_kv = static_cast<size_t>(h.n_head_kv) * head_dim;
-    const size_t group = h.n_head / h.n_head_kv;
-    const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
-
-    float* k_cache = m_k.data() + static_cast<size_t>(il) * m_n_ctx * n_kv;
-    float* v_cache = m_v.data() + static_cast<size_t>(il) * m_n_ctx * n_kv;
-    float* k_cur = k_cache + static_cast<size_t>(pos) * n_kv;
-    float* v_cur = v_cache + static_cast<size_t>(pos) * n_kv;
+    float* k_cur = m_k.data() + (static_cast<size_t>(il) * m_n_ctx + pos) * n_kv;
+    float* v_cur = m_v.data() + (static_cast<size_t>(il) * m_n_ctx + pos) * n_kv;
 
     set_input(m_h.data(), h.n_embd);
     matmul(layer.wq, m_q.data());
@@ -169,12 +209,30 @@ void Runner::attention(const LlamaLayer& layer, int il, uint32_t pos)
     trace("Kcur", il, k_cur, n_kv);
     trace("Vcur", il, v_cur, n_kv);
 
+    AttentionJob job{this, &layer, il, pos};
+    m_pool.run(attention_task, &job);
+
+    set_input(m_attn.data(), static_cast<size_t>(h.n_head) * head_dim);
+    matmul(layer.wo, m_h.data());
+    trace("attn_out", il, m_h.data(), h.n_embd);
+}
+
+void Runner::attention_heads(const LlamaLayer&, int il, uint32_t pos, size_t first, size_t last)
+{
+    const LlamaHparams& h = m_model->hparams();
+    const size_t head_dim = h.head_dim;
+    const size_t n_kv = static_cast<size_t>(h.n_head_kv) * head_dim;
+    const size_t group = h.n_head / h.n_head_kv;
+    const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+    const float* k_cache = m_k.data() + static_cast<size_t>(il) * m_n_ctx * n_kv;
+    const float* v_cache = m_v.data() + static_cast<size_t>(il) * m_n_ctx * n_kv;
+
     const size_t n_past = static_cast<size_t>(pos) + 1;
-    for (size_t head = 0; head < h.n_head; ++head)
+    for (size_t head = first; head < last; ++head)
     {
         const float* q = m_q.data() + head * head_dim;
         const size_t kv_offset = (head / group) * head_dim;
-        float* scores = m_scores.data();
+        float* scores = m_scores.data() + head * m_n_ctx;
         for (size_t j = 0; j < n_past; ++j)
         {
             scores[j] = dot(q, k_cache + j * n_kv + kv_offset, head_dim) * scale;
@@ -196,10 +254,6 @@ void Runner::attention(const LlamaLayer& layer, int il, uint32_t pos)
             }
         }
     }
-
-    set_input(m_attn.data(), static_cast<size_t>(h.n_head) * head_dim);
-    matmul(layer.wo, m_h.data());
-    trace("attn_out", il, m_h.data(), h.n_embd);
 }
 
 void Runner::forward_one(int32_t token, uint32_t pos, float* logits)

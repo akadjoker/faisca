@@ -25,17 +25,18 @@ void print_usage()
         "\n"
         "usage:\n"
         "  faisca info <model.gguf> [--meta] [--tensors]\n"
-        "  faisca generate <model.gguf> -p <prompt> [-n <tokens>] [-c <context>] [--raw] [--f32]\n"
+        "  faisca generate <model.gguf> -p <prompt> [-n <tokens>] [-c <context>] [-t <threads>] [--raw] [--f32]\n"
         "  faisca version\n"
         "\n"
         "info options:\n"
         "  --meta      list every metadata key\n"
         "  --tensors   list every tensor\n"
         "\n"
-        "generate options (greedy, one thread):\n"
+        "generate options (greedy):\n"
         "  -p <text>   the user message, wrapped in the chat template unless --raw\n"
         "  -n <count>  tokens to generate (default 128)\n"
         "  -c <size>   context size in tokens (default 2048)\n"
+        "  -t <count>  threads (default 1)\n"
         "  --raw       feed the prompt as is\n"
         "  --f32       convert the weights to float32 at load instead of computing on Q8_0\n",
         FAISCA_VERSION);
@@ -440,6 +441,7 @@ int command_generate(int argc, char** argv)
     long context = 2048;
     bool raw = false;
     bool dequantize = false;
+    int threads = 1;
 
     for (int i = 2; i < argc; ++i)
     {
@@ -454,6 +456,10 @@ int command_generate(int argc, char** argv)
         else if (std::strcmp(argv[i], "-c") == 0 && i + 1 < argc)
         {
             context = std::atol(argv[++i]);
+        }
+        else if (std::strcmp(argv[i], "-t") == 0 && i + 1 < argc)
+        {
+            threads = std::atoi(argv[++i]);
         }
         else if (std::strcmp(argv[i], "--raw") == 0)
         {
@@ -498,7 +504,7 @@ int command_generate(int argc, char** argv)
 
     const auto load_start = std::chrono::steady_clock::now();
     if (!file.open(path, error) || !tokenizer.load(file, error) || !model.load(file, error, dequantize) ||
-        !runner.init(model, static_cast<uint32_t>(context), error))
+        !runner.init(model, static_cast<uint32_t>(context), threads, error))
     {
         std::fprintf(stderr, "faisca: %s\n", error.c_str());
         return 1;
@@ -572,9 +578,9 @@ int command_generate(int argc, char** argv)
     std::printf("\n");
 
     std::fprintf(stderr,
-                 "\n%s, %zu MiB of weights per token, load %.2f s, prompt %zu tokens in %.2f s (%.1f tok/s), "
+                 "\n%s, %d threads, %zu MiB of weights per token, load %.2f s, prompt %zu tokens in %.2f s (%.1f tok/s), "
                  "%d tokens generated in %.2f s (%.1f tok/s)\n",
-                 simd_name(), model.weight_bytes() >> 20, load_seconds, tokens.size(), prompt_seconds,
+                 simd_name(), runner.threads(), model.weight_bytes() >> 20, load_seconds, tokens.size(), prompt_seconds,
                  static_cast<double>(tokens.size()) / prompt_seconds, generated, generate_seconds,
                  generated > 0 ? static_cast<double>(generated) / generate_seconds : 0.0);
     return 0;

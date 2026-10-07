@@ -30,6 +30,11 @@ if(FAISCA_NATIVE AND NOT MSVC)
     add_compile_options(-march=native)
 endif()
 
+# the same float32 results at every optimization level: FMA only where the code asks for it
+if(NOT MSVC)
+    add_compile_options(-ffp-contract=off)
+endif()
+
 if(FAISCA_SANITIZE AND NOT MSVC)
     add_compile_options(-fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer)
     add_link_options(-fsanitize=address,undefined)
@@ -39,12 +44,16 @@ add_library(faisca_lib STATIC
     src/error.cpp
     src/gguf.cpp
     src/mapped_file.cpp
+    src/memory.cpp
     src/model.cpp
     src/ops.cpp
     src/runner.cpp
+    src/thread.cpp
     src/tokenizer.cpp
     src/unicode.cpp
 )
+find_package(Threads REQUIRED)
+target_link_libraries(faisca_lib PUBLIC Threads::Threads)
 set_target_properties(faisca_lib PROPERTIES OUTPUT_NAME faisca)
 target_include_directories(faisca_lib PUBLIC include)
 target_compile_options(faisca_lib PRIVATE ${FAISCA_WARNINGS})

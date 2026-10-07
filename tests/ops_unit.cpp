@@ -244,6 +244,100 @@ void test_q8_0()
     CHECK(all_close);
 }
 
+void test_q8_0_packed()
+{
+    std::mt19937 rng(31);
+    const size_t n_in = 960;
+    for (const size_t n_out : {16, 37, 64})
+    {
+        const size_t row_bytes = n_in / Q8_0_BLOCK * Q8_0_BLOCK_BYTES;
+        std::vector<uint8_t> rows(n_out * row_bytes);
+        std::vector<float> dense;
+        for (size_t o = 0; o < n_out; ++o)
+        {
+            const std::vector<float> row = random_values(rng, n_in, 0.1f);
+            quantize_q8_0(row.data(), n_in, rows.data() + o * row_bytes);
+            std::vector<float> back(n_in);
+            dequantize_q8_0(rows.data() + o * row_bytes, n_in, back.data());
+            dense.insert(dense.end(), back.begin(), back.end());
+        }
+
+        std::vector<uint8_t> packed(q8_0_packed_bytes(n_in, n_out));
+        CHECK(packed.size() == q8_0_padded_rows(n_out) / Q8_0_GROUP * (n_in / Q8_0_BLOCK) * Q8_0_GROUP_BLOCK_BYTES);
+        pack_q8_0(rows.data(), n_in, n_out, packed.data());
+
+        bool rows_back = true;
+        std::vector<float> row(n_in);
+        for (size_t o = 0; o < n_out; ++o)
+        {
+            row_q8_0_packed(packed.data(), n_in, o, row.data());
+            rows_back = rows_back && std::memcmp(row.data(), dense.data() + o * n_in, n_in * sizeof(float)) == 0;
+        }
+        CHECK(rows_back);
+
+        const std::vector<float> x = random_values(rng, n_in, 1.0f);
+        std::vector<uint8_t> xq(n_in / Q8_0_BLOCK * Q8_0_BLOCK_BYTES);
+        quantize_q8_0(x.data(), n_in, xq.data());
+        std::vector<int32_t> sums(n_in / Q8_0_BLOCK);
+        q8_0_block_sums(xq.data(), n_in, sums.data());
+        bool sums_ok = true;
+        for (size_t b = 0; b < sums.size(); ++b)
+        {
+            int32_t expected = 0;
+            for (size_t k = 0; k < Q8_0_BLOCK; ++k)
+            {
+                expected += static_cast<int8_t>(xq[b * Q8_0_BLOCK_BYTES + 2 + k]);
+            }
+            sums_ok = sums_ok && sums[b] == 128 * expected;
+        }
+        CHECK(sums_ok);
+
+        std::vector<float> reference(n_out);
+        for (size_t o = 0; o < n_out; ++o)
+        {
+            reference[o] = dot_q8_0_scalar(rows.data() + o * row_bytes, xq.data(), n_in);
+        }
+        std::vector<float> scalar(n_out, 999.0f);
+        std::vector<float> fast(n_out, 999.0f);
+        matvec_q8_0_packed_scalar(packed.data(), xq.data(), sums.data(), n_in, n_out, 0, n_out, scalar.data());
+        matvec_q8_0_packed(packed.data(), xq.data(), sums.data(), n_in, n_out, 0, n_out, fast.data());
+        bool all_close = true;
+        for (size_t o = 0; o < n_out; ++o)
+        {
+            all_close = all_close && close(scalar[o], reference[o], 1e-6) && close(fast[o], reference[o], 1e-6);
+        }
+        CHECK(all_close);
+
+        // the batched kernel gives every input exactly what the single kernel gives
+        const size_t n_tokens = 21;
+        std::vector<uint8_t> xqs(n_tokens * xq.size());
+        std::vector<int32_t> sums_all(n_tokens * sums.size());
+        std::vector<float> expected_all(n_tokens * n_out);
+        for (size_t t = 0; t < n_tokens; ++t)
+        {
+            const std::vector<float> xt = random_values(rng, n_in, 1.0f + static_cast<float>(t));
+            quantize_q8_0(xt.data(), n_in, xqs.data() + t * xq.size());
+            q8_0_block_sums(xqs.data() + t * xq.size(), n_in, sums_all.data() + t * sums.size());
+            matvec_q8_0_packed(packed.data(), xqs.data() + t * xq.size(), sums_all.data() + t * sums.size(), n_in,
+                               n_out, 0, n_out, expected_all.data() + t * n_out);
+        }
+        std::vector<float> batched(n_tokens * n_out, 999.0f);
+        matmul_q8_0_packed(packed.data(), xqs.data(), xq.size(), sums_all.data(), sums.size(), n_tokens, n_in, n_out, 0,
+                           n_out, batched.data(), n_out);
+        CHECK(std::memcmp(batched.data(), expected_all.data(), batched.size() * sizeof(float)) == 0);
+
+        // a partial range writes only its rows
+        std::vector<float> partial(n_out, 999.0f);
+        matvec_q8_0_packed(packed.data(), xq.data(), sums.data(), n_in, n_out, 16, n_out, partial.data());
+        bool partial_ok = true;
+        for (size_t o = 0; o < n_out; ++o)
+        {
+            partial_ok = partial_ok && (o < 16 ? partial[o] == 999.0f : close(partial[o], reference[o], 1e-6));
+        }
+        CHECK(partial_ok);
+    }
+}
+
 void test_dot_and_matvec()
 {
     std::mt19937 rng(7);
@@ -429,6 +523,7 @@ int main()
     test_f16();
     test_f32_to_f16();
     test_q8_0();
+    test_q8_0_packed();
     test_dot_and_matvec();
     test_rms_norm();
     test_rope();

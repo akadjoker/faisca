@@ -3,6 +3,7 @@
 #include "faisca/array.h"
 #include "faisca/error.h"
 #include "faisca/model.h"
+#include "faisca/thread.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -13,7 +14,9 @@ namespace faisca
 // called for every intermediate vector of every token when a trace is set; layer is -1 after the last block
 typedef void (*RunnerTrace)(void* user, const char* name, int layer, const float* data, size_t count);
 
-// float32 forward pass, one token at a time, with a KV cache of n_ctx positions
+// forward pass one token at a time, with a KV cache of n_ctx positions; every
+// matrix row and every attention head is computed by one thread, so the result
+// does not depend on the thread count
 class Runner
 {
 public:
@@ -22,7 +25,12 @@ public:
     Runner(const Runner&) = delete;
     Runner& operator=(const Runner&) = delete;
 
-    bool init(const LlamaModel& model, uint32_t n_ctx, Error& error);
+    bool init(const LlamaModel& model, uint32_t n_ctx, int n_threads, Error& error);
+
+    int threads() const
+    {
+        return m_pool.size();
+    }
 
     void release();
 
@@ -63,8 +71,16 @@ private:
     // the vector every following matmul multiplies; quantized once if a weight needs it
     void set_input(const float* x, size_t n);
     void matmul(const Weight& w, float* out);
+    void matmul_rows(const Weight& w, float* out, size_t first, size_t last) const;
+    void attention_heads(const LlamaLayer& layer, int il, uint32_t pos, size_t first, size_t last);
+
+    struct MatmulJob;
+    struct AttentionJob;
+    static void matmul_task(void* user, int thread_index, int thread_count);
+    static void attention_task(void* user, int thread_index, int thread_count);
 
     const LlamaModel* m_model = nullptr;
+    ThreadPool m_pool;
     uint32_t m_n_ctx = 0;
     uint32_t m_pos = 0;
     RunnerTrace m_trace = nullptr;
@@ -86,6 +102,7 @@ private:
     size_t m_input_size = 0;
     bool m_input_quantized = false;
     Array<uint8_t> m_input_q8;
+    Array<int32_t> m_input_sums;
 };
 
 }
