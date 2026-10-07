@@ -1,0 +1,328 @@
+#include "faisca/model.h"
+
+#include "faisca/ops.h"
+
+#include <cinttypes>
+#include <cstdio>
+#include <cstring>
+
+namespace faisca
+{
+
+namespace
+{
+
+constexpr size_t Q8_0_BLOCK = 32;
+constexpr size_t Q8_0_BLOCK_BYTES = 34;
+
+bool get_u32(const GgufFile& file, const char* key, uint32_t& out, bool required, Error& error)
+{
+    uint64_t value = 0;
+    if (!file.get_uint(key, value))
+    {
+        if (required)
+        {
+            error.set("%s is missing", key);
+        }
+        return !required;
+    }
+    if (value == 0 || value > 0xffffffffu)
+    {
+        error.set("%s has an invalid value %" PRIu64, key, value);
+        return false;
+    }
+    out = static_cast<uint32_t>(value);
+    return true;
+}
+
+}
+
+void LlamaModel::release()
+{
+    m_storage.release();
+    m_layers.release();
+    m_token_embd = nullptr;
+    m_output_norm = nullptr;
+    m_output = nullptr;
+    m_hparams = LlamaHparams();
+}
+
+bool LlamaModel::load_hparams(const GgufFile& file, Error& error)
+{
+    std::string_view architecture;
+    if (!file.get_string("general.architecture", architecture))
+    {
+        error.set("general.architecture is missing");
+        return false;
+    }
+    if (architecture != "llama")
+    {
+        error.set("architecture '%.*s' is not supported, only 'llama'", static_cast<int>(architecture.size()),
+                  architecture.data());
+        return false;
+    }
+
+    LlamaHparams& h = m_hparams;
+    if (!get_u32(file, "llama.embedding_length", h.n_embd, true, error) ||
+        !get_u32(file, "llama.block_count", h.n_layer, true, error) ||
+        !get_u32(file, "llama.feed_forward_length", h.n_ff, true, error) ||
+        !get_u32(file, "llama.attention.head_count", h.n_head, true, error) ||
+        !get_u32(file, "llama.context_length", h.n_ctx_train, true, error))
+    {
+        return false;
+    }
+
+    h.n_head_kv = h.n_head;
+    if (!get_u32(file, "llama.attention.head_count_kv", h.n_head_kv, false, error))
+    {
+        return false;
+    }
+    if (h.n_embd % h.n_head != 0 || h.n_head % h.n_head_kv != 0)
+    {
+        error.set("embedding length %" PRIu32 ", %" PRIu32 " heads and %" PRIu32 " kv heads do not divide", h.n_embd,
+                  h.n_head, h.n_head_kv);
+        return false;
+    }
+    h.head_dim = h.n_embd / h.n_head;
+
+    h.n_rot = h.head_dim;
+    if (!get_u32(file, "llama.rope.dimension_count", h.n_rot, false, error))
+    {
+        return false;
+    }
+    if (h.n_rot > h.head_dim || h.n_rot % 2 != 0)
+    {
+        error.set("rope dimension count %" PRIu32 " does not fit a head of %" PRIu32, h.n_rot, h.head_dim);
+        return false;
+    }
+
+    const GgufArray* tokens = file.get_array("tokenizer.ggml.tokens");
+    uint64_t vocab = tokens != nullptr ? tokens->count : 0;
+    file.get_uint("llama.vocab_size", vocab);
+    if (vocab == 0 || vocab > 0xffffffffu)
+    {
+        error.set("the vocabulary size is missing");
+        return false;
+    }
+    h.n_vocab = static_cast<uint32_t>(vocab);
+
+    double value = 0.0;
+    if (file.get_float("llama.attention.layer_norm_rms_epsilon", value))
+    {
+        h.rms_eps = static_cast<float>(value);
+    }
+    if (file.get_float("llama.rope.freq_base", value))
+    {
+        h.rope_freq_base = static_cast<float>(value);
+    }
+
+    std::string_view scaling;
+    if (file.get_string("llama.rope.scaling.type", scaling) && !scaling.empty() && scaling != "none" &&
+        scaling != "linear")
+    {
+        error.set("rope scaling '%.*s' is not supported yet", static_cast<int>(scaling.size()), scaling.data());
+        return false;
+    }
+    if (file.get_float("llama.rope.scaling.factor", value) && value != 1.0)
+    {
+        error.set("rope scaling factor %g is not supported yet", value);
+        return false;
+    }
+    return true;
+}
+
+const GgufTensor* LlamaModel::find(const GgufFile& file, const char* name, int layer, uint64_t n0, uint64_t n1,
+                                   bool required, Error& error) const
+{
+    char full[128];
+    if (layer >= 0)
+    {
+        std::snprintf(full, sizeof(full), "blk.%d.%s.weight", layer, name);
+    }
+    else
+    {
+        std::snprintf(full, sizeof(full), "%s.weight", name);
+    }
+
+    const GgufTensor* tensor = file.find_tensor(full);
+    if (tensor == nullptr)
+    {
+        if (required)
+        {
+            error.set("tensor %s is missing", full);
+        }
+        return nullptr;
+    }
+
+    const uint32_t dims = n1 == 0 ? 1 : 2;
+    if (tensor->n_dims != dims || tensor->dims[0] != n0 || (dims == 2 && tensor->dims[1] != n1))
+    {
+        error.set("tensor %s has shape [%" PRIu64 ", %" PRIu64 "], expected [%" PRIu64 ", %" PRIu64 "]", full,
+                  tensor->dims[0], tensor->n_dims > 1 ? tensor->dims[1] : 0, n0, n1);
+        return nullptr;
+    }
+    if (tensor->type != GgmlType::F32 && tensor->type != GgmlType::F16 && tensor->type != GgmlType::Q8_0)
+    {
+        error.set("tensor %s is %s, the float32 runner reads F32, F16 and Q8_0", full, ggml_type_info(tensor->type)->name);
+        return nullptr;
+    }
+    if (tensor->type == GgmlType::Q8_0 && tensor->dims[0] % Q8_0_BLOCK != 0)
+    {
+        error.set("tensor %s has a row of %" PRIu64 " values, not a multiple of %zu", full, tensor->dims[0], Q8_0_BLOCK);
+        return nullptr;
+    }
+    return tensor;
+}
+
+bool LlamaModel::count_storage(const GgufTensor* tensor, size_t& elements, Error& error) const
+{
+    if (tensor == nullptr || tensor->type == GgmlType::F32)
+    {
+        return true;
+    }
+    if (tensor->n_elements > static_cast<uint64_t>(static_cast<size_t>(-1) / sizeof(float)) - elements)
+    {
+        error.set("the model does not fit in memory");
+        return false;
+    }
+    elements += static_cast<size_t>(tensor->n_elements);
+    return true;
+}
+
+const float* LlamaModel::materialize(const GgufTensor* tensor)
+{
+    if (tensor == nullptr)
+    {
+        return nullptr;
+    }
+    if (tensor->type == GgmlType::F32)
+    {
+        return reinterpret_cast<const float*>(tensor->data);
+    }
+
+    const size_t count = static_cast<size_t>(tensor->n_elements);
+    float* out = m_storage.data() + m_storage.size();
+    m_storage.resize_uninitialized(m_storage.size() + count);
+
+    if (tensor->type == GgmlType::F16)
+    {
+        const uint8_t* src = tensor->data;
+        for (size_t i = 0; i < count; ++i)
+        {
+            uint16_t bits = 0;
+            std::memcpy(&bits, src + i * 2, 2);
+            out[i] = f16_to_f32(bits);
+        }
+        return out;
+    }
+
+    const uint8_t* block = tensor->data;
+    for (size_t i = 0; i < count; i += Q8_0_BLOCK)
+    {
+        uint16_t bits = 0;
+        std::memcpy(&bits, block, 2);
+        const float d = f16_to_f32(bits);
+        const int8_t* q = reinterpret_cast<const int8_t*>(block + 2);
+        for (size_t j = 0; j < Q8_0_BLOCK; ++j)
+        {
+            out[i + j] = static_cast<float>(q[j]) * d;
+        }
+        block += Q8_0_BLOCK_BYTES;
+    }
+    return out;
+}
+
+bool LlamaModel::load(const GgufFile& file, Error& error)
+{
+    release();
+    if (!load_hparams(file, error))
+    {
+        return false;
+    }
+
+    const LlamaHparams& h = m_hparams;
+    const uint64_t n_embd = h.n_embd;
+    const uint64_t n_q = static_cast<uint64_t>(h.n_head) * h.head_dim;
+    const uint64_t n_kv = static_cast<uint64_t>(h.n_head_kv) * h.head_dim;
+
+    struct LayerTensors
+    {
+        const GgufTensor* tensors[9];
+    };
+
+    const GgufTensor* token_embd = find(file, "token_embd", -1, n_embd, h.n_vocab, true, error);
+    const GgufTensor* output_norm = find(file, "output_norm", -1, n_embd, 0, true, error);
+    if (token_embd == nullptr || output_norm == nullptr)
+    {
+        return false;
+    }
+    const GgufTensor* output = find(file, "output", -1, n_embd, h.n_vocab, false, error);
+    if (output == nullptr && !error.empty())
+    {
+        return false;
+    }
+
+    Array<LayerTensors> layers;
+    if (!layers.reserve(h.n_layer) || !m_layers.reserve(h.n_layer))
+    {
+        error.set("out of memory");
+        return false;
+    }
+
+    size_t elements = 0;
+    if (!count_storage(token_embd, elements, error) || !count_storage(output_norm, elements, error) ||
+        !count_storage(output, elements, error))
+    {
+        return false;
+    }
+
+    for (uint32_t l = 0; l < h.n_layer; ++l)
+    {
+        const int il = static_cast<int>(l);
+        LayerTensors t;
+        t.tensors[0] = find(file, "attn_norm", il, n_embd, 0, true, error);
+        t.tensors[1] = find(file, "attn_q", il, n_embd, n_q, true, error);
+        t.tensors[2] = find(file, "attn_k", il, n_embd, n_kv, true, error);
+        t.tensors[3] = find(file, "attn_v", il, n_embd, n_kv, true, error);
+        t.tensors[4] = find(file, "attn_output", il, n_q, n_embd, true, error);
+        t.tensors[5] = find(file, "ffn_norm", il, n_embd, 0, true, error);
+        t.tensors[6] = find(file, "ffn_gate", il, n_embd, h.n_ff, true, error);
+        t.tensors[7] = find(file, "ffn_up", il, n_embd, h.n_ff, true, error);
+        t.tensors[8] = find(file, "ffn_down", il, h.n_ff, n_embd, true, error);
+        for (const GgufTensor* tensor : t.tensors)
+        {
+            if (tensor == nullptr || !count_storage(tensor, elements, error))
+            {
+                return false;
+            }
+        }
+        layers.push_back_unchecked(t);
+    }
+
+    if (!m_storage.reserve(elements))
+    {
+        error.set("out of memory: %zu MiB needed for the dequantized weights", elements * sizeof(float) >> 20);
+        return false;
+    }
+
+    m_token_embd = materialize(token_embd);
+    m_output_norm = materialize(output_norm);
+    m_output = output != nullptr ? materialize(output) : m_token_embd;
+    for (const LayerTensors& t : layers)
+    {
+        LlamaLayer layer;
+        layer.attn_norm = materialize(t.tensors[0]);
+        layer.wq = materialize(t.tensors[1]);
+        layer.wk = materialize(t.tensors[2]);
+        layer.wv = materialize(t.tensors[3]);
+        layer.wo = materialize(t.tensors[4]);
+        layer.ffn_norm = materialize(t.tensors[5]);
+        layer.ffn_gate = materialize(t.tensors[6]);
+        layer.ffn_up = materialize(t.tensors[7]);
+        layer.ffn_down = materialize(t.tensors[8]);
+        m_layers.push_back_unchecked(layer);
+    }
+    return true;
+}
+
+}

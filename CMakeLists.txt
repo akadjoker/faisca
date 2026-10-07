@@ -34,6 +34,9 @@ add_library(faisca_lib STATIC
     src/error.cpp
     src/gguf.cpp
     src/mapped_file.cpp
+    src/model.cpp
+    src/ops.cpp
+    src/runner.cpp
     src/tokenizer.cpp
     src/unicode.cpp
 )
@@ -65,6 +68,15 @@ if(FAISCA_BUILD_TESTS)
     target_link_libraries(tokenizer_unit PRIVATE faisca_lib)
     target_compile_options(tokenizer_unit PRIVATE ${FAISCA_WARNINGS})
     add_test(NAME tokenizer_unit COMMAND tokenizer_unit)
+
+    add_executable(ops_unit tests/ops_unit.cpp)
+    target_link_libraries(ops_unit PRIVATE faisca_lib)
+    target_compile_options(ops_unit PRIVATE ${FAISCA_WARNINGS})
+    add_test(NAME ops_unit COMMAND ops_unit)
+
+    add_executable(runner_dump tests/runner_dump.cpp)
+    target_link_libraries(runner_dump PRIVATE faisca_lib)
+    target_compile_options(runner_dump PRIVATE ${FAISCA_WARNINGS})
 
     add_executable(gguf_dump tests/gguf_dump.cpp)
     target_link_libraries(gguf_dump PRIVATE faisca_lib)
@@ -167,5 +179,13 @@ if(FAISCA_BUILD_BENCH)
         add_executable(bench_tokenizer bench/bench_tokenizer.cpp)
         target_link_libraries(bench_tokenizer PRIVATE faisca_lib llama)
         target_include_directories(bench_tokenizer PRIVATE ${FAISCA_LLAMA_DIR}/include ${FAISCA_LLAMA_DIR}/ggml/include)
+
+        add_executable(llama_tokenizer_dump tests/reference/llama_tokenizer_dump.cpp)
+        target_link_libraries(llama_tokenizer_dump PRIVATE llama)
+        target_include_directories(llama_tokenizer_dump PRIVATE ${FAISCA_LLAMA_DIR}/include ${FAISCA_LLAMA_DIR}/ggml/include)
+
+        add_executable(llama_layer_dump tests/reference/llama_layer_dump.cpp)
+        target_link_libraries(llama_layer_dump PRIVATE llama)
+        target_include_directories(llama_layer_dump PRIVATE ${FAISCA_LLAMA_DIR}/include ${FAISCA_LLAMA_DIR}/ggml/include)
     endif()
 endif()

@@ -17,8 +17,8 @@ or exceptions. It has its own containers (`faisca::Array`, `faisca::StringMap`,
 | --- | --- |
 | GGUF loader (memory mapped, zero-copy) | done |
 | Tokenizer (byte level BPE, validated against llama.cpp) | done |
-| CPU runner, float32, validated against a reference | next |
-| CPU optimization (threads, SIMD, quantized weights) | planned |
+| CPU runner, float32, validated layer by layer against llama.cpp | done |
+| CPU optimization (threads, SIMD, quantized weights) | next |
 | Vulkan compute backend | planned |
 | Own cache format and KV cache on disk | planned |
 
@@ -43,7 +43,14 @@ This produces the `faisca` static library and the `faisca` tool.
 faisca info model.gguf              # summary
 faisca info model.gguf --meta       # every metadata key
 faisca info model.gguf --tensors    # every tensor
+faisca generate model.gguf -p "What is the capital of France?" -n 64
 ```
+
+`generate` wraps the prompt in the SmolLM2 chat template (`--raw` to skip
+that), decodes greedily and prints the tokens as they come, then the timings.
+It runs the float32 path on one thread: on SmolLM2-360M that is about 5 tokens
+per second on a 2.1 GHz Xeon core, with 1.35 GB of dequantized weights. The
+optimization step comes next.
 
 ## Library
 
@@ -93,6 +100,28 @@ llama.cpp, special tokens and malformed UTF-8 included. Token texts are views
 into the GGUF file, which must stay open. One `Tokenizer` per thread: it keeps
 scratch buffers and a cache of the tokens of every word it has seen.
 
+```cpp
+#include "faisca/model.h"
+#include "faisca/runner.h"
+
+faisca::LlamaModel model;
+faisca::Runner runner;
+if (!model.load(file, error) || !runner.init(model, /*n_ctx*/ 2048, error))
+{
+    // unsupported architecture or tensor type, or out of memory
+}
+
+faisca::Array<float> logits;
+runner.forward(tokens.data(), tokens.size(), logits, error); // logits of the last token
+// pick the next token, then runner.forward(&next, 1, logits, error) and so on
+```
+
+`LlamaModel` reads the `llama` architecture (SmolLM2, Llama 2 and 3 style
+models without rope scaling). F32 tensors are used in place in the mapped
+file; F16 and Q8_0 tensors are dequantized to float32 at load. `Runner` is the
+float32 forward pass: RMS norm, RoPE, grouped query attention over a KV cache
+of `n_ctx` positions, SwiGLU, one token at a time, one thread.
+
 `GgufFile` is a plain value object: no smart pointers, no heap allocation for
 the object itself. The reader never copies or decodes anything up front.
 Strings, arrays and tensors are views into the mapping and stay valid until the
@@ -124,6 +153,9 @@ python3 tests/compare_with_gguf_py.py build/gguf_dump model.gguf
   against `std::unordered_map` on random operations, including two different
   keys built to have the same 64-bit hash.
 - `gguf_unit`: hand written images for edge cases and every rejection path.
+- `ops_unit`: the float32 kernels (F16 conversion over every finite half,
+  dot product, matrix times vector, RMS norm, RoPE, softmax, SwiGLU) against
+  double precision references.
 - `tokenizer_unit`: a hand written vocabulary with merges, special, byte,
   unused and empty tokens; load errors, byte fallback, special token
   partition, BOS/EOS, both pre-tokenizers, decode variants and the
@@ -151,6 +183,23 @@ python3 tests/compare_with_gguf_py.py build/gguf_dump model.gguf
   The one known difference: a malformed 4 byte sequence that decodes above
   U+10FFFF makes llama.cpp throw, faisca encodes it as U+FFFD. The script
   counts those cases separately.
+- `compare_layers.py`: runs the same prompt through `runner_dump` and through
+  llama.cpp (`tests/reference/llama_layer_dump.cpp`, built with
+  `-DFAISCA_BUILD_BENCH=ON -DFAISCA_LLAMA_DIR=...`), which captures every
+  intermediate tensor of every block through `cb_eval`, with the KV cache in
+  float32, flash attention off and one thread. Both read the same float32 GGUF
+  made by `tests/make_f32_gguf.py`, so the only differences left are rounding
+  and summation order. Then both generate greedily and the tokens must match.
+
+  Results on SmolLM2-360M-Instruct, llama.cpp b86d2f0:
+
+  | Prompt | Tensors compared | Worst relative L2 error | Generated tokens |
+  | --- | --- | --- | --- |
+  | chat prompt, 16 tokens | 386 | 4.5e-6 (`l_out-31`) | 16, identical |
+  | chat prompt, 1045 tokens | 386 | 2.1e-6 (`ffn_out-13`) | 32, identical |
+
+  The Q8_0 model read directly by faisca gives bit identical tensors and
+  tokens to the float32 copy, so the dequantization matches gguf-py exactly.
 
 ## Layout
 

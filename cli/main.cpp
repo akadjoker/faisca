@@ -1,7 +1,12 @@
 #include "faisca/gguf.h"
+#include "faisca/model.h"
+#include "faisca/runner.h"
+#include "faisca/tokenizer.h"
 
+#include <chrono>
 #include <cinttypes>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 namespace
@@ -19,11 +24,18 @@ void print_usage()
         "\n"
         "usage:\n"
         "  faisca info <model.gguf> [--meta] [--tensors]\n"
+        "  faisca generate <model.gguf> -p <prompt> [-n <tokens>] [-c <context>] [--raw]\n"
         "  faisca version\n"
         "\n"
         "info options:\n"
         "  --meta      list every metadata key\n"
-        "  --tensors   list every tensor\n",
+        "  --tensors   list every tensor\n"
+        "\n"
+        "generate options (greedy, float32, one thread):\n"
+        "  -p <text>   the user message, wrapped in the chat template unless --raw\n"
+        "  -n <count>  tokens to generate (default 128)\n"
+        "  -c <size>   context size in tokens (default 2048)\n"
+        "  --raw       feed the prompt as is\n",
         FAISCA_VERSION);
 }
 
@@ -408,6 +420,156 @@ int command_info(int argc, char** argv)
     return 0;
 }
 
+double seconds_since(std::chrono::steady_clock::time_point start)
+{
+    return std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+}
+
+bool append_text(Array<char>& out, const char* text)
+{
+    return out.append(text, std::strlen(text));
+}
+
+int command_generate(int argc, char** argv)
+{
+    const char* path = nullptr;
+    const char* prompt = nullptr;
+    int count = 128;
+    long context = 2048;
+    bool raw = false;
+
+    for (int i = 2; i < argc; ++i)
+    {
+        if (std::strcmp(argv[i], "-p") == 0 && i + 1 < argc)
+        {
+            prompt = argv[++i];
+        }
+        else if (std::strcmp(argv[i], "-n") == 0 && i + 1 < argc)
+        {
+            count = std::atoi(argv[++i]);
+        }
+        else if (std::strcmp(argv[i], "-c") == 0 && i + 1 < argc)
+        {
+            context = std::atol(argv[++i]);
+        }
+        else if (std::strcmp(argv[i], "--raw") == 0)
+        {
+            raw = true;
+        }
+        else if (argv[i][0] == '-' && argv[i][1] != '\0')
+        {
+            std::fprintf(stderr, "faisca: unknown option '%s'\n", argv[i]);
+            return 2;
+        }
+        else if (path == nullptr)
+        {
+            path = argv[i];
+        }
+        else
+        {
+            std::fprintf(stderr, "faisca: unexpected argument '%s'\n", argv[i]);
+            return 2;
+        }
+    }
+
+    if (path == nullptr || prompt == nullptr)
+    {
+        std::fprintf(stderr, "faisca: generate needs a model file and -p <prompt>\n");
+        return 2;
+    }
+    if (count < 1 || context < 1 || context > 0x7fffffffL)
+    {
+        std::fprintf(stderr, "faisca: -n and -c must be positive\n");
+        return 2;
+    }
+
+    Error error;
+    GgufFile file;
+    Tokenizer tokenizer;
+    LlamaModel model;
+    Runner runner;
+
+    const auto load_start = std::chrono::steady_clock::now();
+    if (!file.open(path, error) || !tokenizer.load(file, error) || !model.load(file, error) ||
+        !runner.init(model, static_cast<uint32_t>(context), error))
+    {
+        std::fprintf(stderr, "faisca: %s\n", error.c_str());
+        return 1;
+    }
+    const double load_seconds = seconds_since(load_start);
+
+    Array<char> text;
+    if (raw)
+    {
+        append_text(text, prompt);
+    }
+    else
+    {
+        append_text(text, "<|im_start|>user\n");
+        append_text(text, prompt);
+        append_text(text, "<|im_end|>\n<|im_start|>assistant\n");
+    }
+
+    Array<int32_t> tokens;
+    if (!tokenizer.encode(std::string_view(text.data(), text.size()), true, true, tokens) || tokens.empty())
+    {
+        std::fprintf(stderr, "faisca: the prompt produced no tokens\n");
+        return 1;
+    }
+    if (tokens.size() + static_cast<size_t>(count) > runner.context_size())
+    {
+        std::fprintf(stderr, "faisca: %zu prompt tokens plus %d generated do not fit a context of %" PRIu32 "\n",
+                     tokens.size(), count, runner.context_size());
+        return 1;
+    }
+
+    Array<float> logits;
+    const auto prompt_start = std::chrono::steady_clock::now();
+    if (!runner.forward(tokens.data(), tokens.size(), logits, error))
+    {
+        std::fprintf(stderr, "faisca: %s\n", error.c_str());
+        return 1;
+    }
+    const double prompt_seconds = seconds_since(prompt_start);
+
+    const auto generate_start = std::chrono::steady_clock::now();
+    Array<char> piece;
+    int generated = 0;
+    for (; generated < count; ++generated)
+    {
+        int32_t best = 0;
+        for (size_t t = 1; t < logits.size(); ++t)
+        {
+            if (logits[t] > logits[static_cast<size_t>(best)])
+            {
+                best = static_cast<int32_t>(t);
+            }
+        }
+        if (best == tokenizer.eos() || tokenizer.token_type(best) == TokenType::Control)
+        {
+            break;
+        }
+
+        piece.clear();
+        tokenizer.token_to_piece(best, false, piece);
+        std::fwrite(piece.data(), 1, piece.size(), stdout);
+        std::fflush(stdout);
+
+        if (generated + 1 < count && !runner.forward(&best, 1, logits, error))
+        {
+            std::fprintf(stderr, "\nfaisca: %s\n", error.c_str());
+            return 1;
+        }
+    }
+    const double generate_seconds = seconds_since(generate_start);
+    std::printf("\n");
+
+    std::fprintf(stderr, "\nload %.2f s, prompt %zu tokens in %.2f s (%.1f tok/s), %d tokens generated in %.2f s (%.1f tok/s)\n",
+                 load_seconds, tokens.size(), prompt_seconds, static_cast<double>(tokens.size()) / prompt_seconds,
+                 generated, generate_seconds, generated > 0 ? static_cast<double>(generated) / generate_seconds : 0.0);
+    return 0;
+}
+
 }
 
 int main(int argc, char** argv)
@@ -422,6 +584,10 @@ int main(int argc, char** argv)
     if (std::strcmp(command, "info") == 0)
     {
         return command_info(argc, argv);
+    }
+    if (std::strcmp(command, "generate") == 0)
+    {
+        return command_generate(argc, argv);
     }
     if (std::strcmp(command, "version") == 0 || std::strcmp(command, "--version") == 0)
     {
