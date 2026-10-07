@@ -155,6 +155,32 @@ The decode side got a piece table built at load: the decoded bytes of every
 token back to back, so a token is a `memcpy`. That is what llama.cpp does too,
 and it took faisca from 21.5 to 14.2 ns/token, for 1 ms more at load.
 
+## Runner against llama.cpp
+
+Measured with `faisca generate` (prompt of 633 tokens from llama.cpp's README,
+then greedy tokens) and `llama-bench` (pp512 and tg32) on the same machine:
+2.1 GHz Sapphire Rapids VM with 4 vCPUs, AVX-512 VNNI and AMX, llama.cpp
+b86d2f0 built with GGML_NATIVE (its CPU backend uses the AMX buffer here).
+SmolLM2-360M-Instruct.
+
+| | threads | llama.cpp | faisca |
+| --- | --- | --- | --- |
+| Q8_0 generation (tok/s) | 1 | 24.9 | 24.6 |
+| Q8_0 generation (tok/s) | 4 | 71 | 83 |
+| Q8_0 prompt (tok/s) | 1 | 255 | 142 |
+| Q8_0 prompt (tok/s) | 4 | 143 (pp512), 893 (pp128) | 443 |
+| Q4_0 generation (tok/s) | 1 | 38.8 | 31 |
+| Q4_0 generation (tok/s) | 4 | 70 | 66 |
+| Q4_0 prompt (tok/s) | 1 | 249 | 165 |
+| Q4_0 prompt (tok/s) | 4 | 147 | 480 |
+
+How the generation speed got there, one thread, Q8_0: float32 weights 4.7
+tok/s; Q8_0 rows with an AVX2 kernel 7.8; block scales converted with F16C
+13.4; packed groups of 16 rows with VNNI 24.6. The kernels are checked
+against llama.cpp's own outputs on its own inputs (`matmul_check`, zero
+error) and the thread splits never change a sum, so these numbers come with
+bit identical results across thread counts.
+
 ## What the numbers say
 
 - **Parsing a model does not depend on the containers.** All three land within

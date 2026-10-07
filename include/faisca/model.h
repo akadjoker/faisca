@@ -50,6 +50,10 @@ struct Weight
     // block sums from q8_0_block_sums; the quantized forms may be null for F32 weights
     void matvec(const float* x, const uint8_t* xq, const int32_t* x_sums, size_t first, size_t last, float* out) const;
 
+    // the same for n_tokens inputs, input t at x + t * x_stride (xq, x_sums alike), output t at out + t * out_stride
+    void matmul(const float* x, size_t x_stride, const uint8_t* xq, size_t xq_stride, const int32_t* x_sums,
+                size_t sums_stride, size_t n_tokens, size_t first, size_t last, float* out, size_t out_stride) const;
+
     // rows per unit of work: results do not depend on how units are split between threads
     size_t row_group() const
     {

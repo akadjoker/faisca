@@ -41,6 +41,8 @@ size_t Weight::row_bytes() const
     {
         case GgmlType::Q8_0:
             return n_in / Q8_0_BLOCK * Q8_0_BLOCK_BYTES;
+        case GgmlType::Q4_0:
+            return n_in / Q4_0_BLOCK * Q4_0_BLOCK_BYTES;
         default:
             return n_in * sizeof(float);
     }
@@ -50,13 +52,25 @@ void Weight::row(size_t index, float* out) const
 {
     if (packed)
     {
-        row_q8_0_packed(data, n_in, index, out);
+        if (type == GgmlType::Q4_0)
+        {
+            row_q4_0_packed(data, n_in, index, out);
+        }
+        else
+        {
+            row_q8_0_packed(data, n_in, index, out);
+        }
         return;
     }
     const uint8_t* source = data + index * row_bytes();
     if (type == GgmlType::Q8_0)
     {
         dequantize_q8_0(source, n_in, out);
+        return;
+    }
+    if (type == GgmlType::Q4_0)
+    {
+        dequantize_q4_0(source, n_in, out);
         return;
     }
     std::memcpy(out, source, n_in * sizeof(float));
@@ -71,7 +85,14 @@ void Weight::matvec(const float* x, const uint8_t* xq, const int32_t* x_sums, si
     }
     if (packed)
     {
-        matvec_q8_0_packed(data, xq, x_sums, n_in, n_out, first, last, out);
+        if (type == GgmlType::Q4_0)
+        {
+            matmul_q4_0_packed(data, xq, 0, x_sums, 0, 1, n_in, n_out, first, last, out, 0);
+        }
+        else
+        {
+            matvec_q8_0_packed(data, xq, x_sums, n_in, n_out, first, last, out);
+        }
         return;
     }
     if (type == GgmlType::Q8_0)
@@ -80,6 +101,31 @@ void Weight::matvec(const float* x, const uint8_t* xq, const int32_t* x_sums, si
         return;
     }
     faisca::matvec(f32() + first * n_in, x, n_in, last - first, out + first);
+}
+
+void Weight::matmul(const float* x, size_t x_stride, const uint8_t* xq, size_t xq_stride, const int32_t* x_sums,
+                    size_t sums_stride, size_t n_tokens, size_t first, size_t last, float* out, size_t out_stride) const
+{
+    if (first >= last)
+    {
+        return;
+    }
+    if (packed)
+    {
+        if (type == GgmlType::Q4_0)
+        {
+            matmul_q4_0_packed(data, xq, xq_stride, x_sums, sums_stride, n_tokens, n_in, n_out, first, last, out, out_stride);
+        }
+        else
+        {
+            matmul_q8_0_packed(data, xq, xq_stride, x_sums, sums_stride, n_tokens, n_in, n_out, first, last, out, out_stride);
+        }
+        return;
+    }
+    for (size_t t = 0; t < n_tokens; ++t)
+    {
+        matvec(x + t * x_stride, xq + t * xq_stride, x_sums + t * sums_stride, first, last, out + t * out_stride);
+    }
 }
 
 void LlamaModel::release()
@@ -226,9 +272,10 @@ const GgufTensor* LlamaModel::find(const GgufFile& file, const char* name, int l
                   tensor->dims[0], tensor->n_dims > 1 ? tensor->dims[1] : 0, n0, n1);
         return nullptr;
     }
-    if (tensor->type != GgmlType::F32 && tensor->type != GgmlType::F16 && tensor->type != GgmlType::Q8_0)
+    if (tensor->type != GgmlType::F32 && tensor->type != GgmlType::F16 && tensor->type != GgmlType::Q8_0 &&
+        tensor->type != GgmlType::Q4_0)
     {
-        error.set("tensor %s is %s, the runner reads F32, F16 and Q8_0", full, ggml_type_info(tensor->type)->name);
+        error.set("tensor %s is %s, the runner reads F32, F16, Q8_0 and Q4_0", full, ggml_type_info(tensor->type)->name);
         return nullptr;
     }
     if (dims == 1 && tensor->type != GgmlType::F32 && tensor->type != GgmlType::F16)
@@ -236,7 +283,7 @@ const GgufTensor* LlamaModel::find(const GgufFile& file, const char* name, int l
         error.set("tensor %s is %s, a norm must be F32 or F16", full, ggml_type_info(tensor->type)->name);
         return nullptr;
     }
-    if (tensor->type == GgmlType::Q8_0 && tensor->dims[0] % Q8_0_BLOCK != 0)
+    if ((tensor->type == GgmlType::Q8_0 || tensor->type == GgmlType::Q4_0) && tensor->dims[0] % Q8_0_BLOCK != 0)
     {
         error.set("tensor %s has a row of %" PRIu64 " values, not a multiple of %zu", full, tensor->dims[0], Q8_0_BLOCK);
         return nullptr;
@@ -246,7 +293,16 @@ const GgufTensor* LlamaModel::find(const GgufFile& file, const char* name, int l
 
 bool LlamaModel::count_storage(const GgufTensor* tensor, size_t& elements, Error& error) const
 {
-    if (tensor == nullptr || tensor->type == GgmlType::F32 || (tensor->type == GgmlType::Q8_0 && !m_dequantize))
+    if (tensor == nullptr || tensor->type == GgmlType::F32)
+    {
+        return true;
+    }
+    // Q8_0 computes in place or packed; Q4_0 packed or, without VNNI kernels, as float32
+    if (tensor->type == GgmlType::Q8_0 && !m_dequantize)
+    {
+        return true;
+    }
+    if (tensor->type == GgmlType::Q4_0 && m_pack)
     {
         return true;
     }
@@ -269,13 +325,21 @@ Weight LlamaModel::materialize(const GgufTensor* tensor)
     weight.n_in = static_cast<size_t>(tensor->dims[0]);
     weight.n_out = tensor->n_dims > 1 ? static_cast<size_t>(tensor->dims[1]) : 1;
 
-    if (tensor->type == GgmlType::Q8_0 && m_pack)
+    if ((tensor->type == GgmlType::Q8_0 || tensor->type == GgmlType::Q4_0) && m_pack)
     {
         weight.type = tensor->type;
         weight.packed = true;
         weight.data = m_packed + m_packed_used;
-        pack_q8_0(tensor->data, weight.n_in, weight.n_out, m_packed + m_packed_used);
-        m_packed_used += q8_0_packed_bytes(weight.n_in, weight.n_out);
+        if (tensor->type == GgmlType::Q4_0)
+        {
+            pack_q4_0(tensor->data, weight.n_in, weight.n_out, m_packed + m_packed_used);
+            m_packed_used += q4_0_packed_bytes(weight.n_in, weight.n_out);
+        }
+        else
+        {
+            pack_q8_0(tensor->data, weight.n_in, weight.n_out, m_packed + m_packed_used);
+            m_packed_used += q8_0_packed_bytes(weight.n_in, weight.n_out);
+        }
         return weight;
     }
     if (tensor->type == GgmlType::F32 || (tensor->type == GgmlType::Q8_0 && !m_dequantize))
@@ -303,6 +367,11 @@ Weight LlamaModel::materialize(const GgufTensor* tensor)
         return weight;
     }
 
+    if (tensor->type == GgmlType::Q4_0)
+    {
+        dequantize_q4_0(tensor->data, count, out);
+        return weight;
+    }
     dequantize_q8_0(tensor->data, count, out);
     return weight;
 }
@@ -390,6 +459,10 @@ bool LlamaModel::load(const GgufFile& file, Error& error, bool dequantize)
             if (tensor != nullptr && tensor->type == GgmlType::Q8_0)
             {
                 packed_bytes += q8_0_packed_bytes(static_cast<size_t>(tensor->dims[0]), static_cast<size_t>(tensor->dims[1]));
+            }
+            else if (tensor != nullptr && tensor->type == GgmlType::Q4_0)
+            {
+                packed_bytes += q4_0_packed_bytes(static_cast<size_t>(tensor->dims[0]), static_cast<size_t>(tensor->dims[1]));
             }
         };
         count_packed(token_embd);

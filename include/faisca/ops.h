@@ -42,8 +42,29 @@ size_t q8_0_packed_bytes(size_t n_in, size_t n_out);
 void pack_q8_0(const uint8_t* rows, size_t n_in, size_t n_out, uint8_t* out);
 void row_q8_0_packed(const uint8_t* packed, size_t n_in, size_t row, float* out);
 
-// 128 * sum of the quantized values of every block, the correction the packed kernel needs
+// sum of the quantized values of every block; the packed kernels multiply it by the
+// offset their weights carry (128 for Q8_0, 8 for Q4_0)
 void q8_0_block_sums(const uint8_t* xq, size_t n, int32_t* out);
+
+// Q4_0: blocks of 32 values, f16 scale then 16 bytes, value j in the low nibble of
+// byte j and value j + 16 in the high nibble, value = (nibble - 8) * scale
+constexpr size_t Q4_0_BLOCK = 32;
+constexpr size_t Q4_0_BLOCK_BYTES = 18;
+constexpr size_t Q4_0_GROUP_BLOCK_BYTES = Q8_0_GROUP * Q4_0_BLOCK_BYTES;
+
+void dequantize_q4_0(const uint8_t* blocks, size_t n, float* out);
+
+// Packed Q4_0: groups of 16 rows, block by block: 16 f16 scales then 4 chunks of 64
+// bytes; chunk c, bytes 4r..4r+3, holds values 8c..8c+3 of row r in the low nibbles and
+// values 8c+4..8c+7 in the high nibbles
+size_t q4_0_packed_bytes(size_t n_in, size_t n_out);
+void pack_q4_0(const uint8_t* rows, size_t n_in, size_t n_out, uint8_t* out);
+void row_q4_0_packed(const uint8_t* packed, size_t n_in, size_t row, float* out);
+void matvec_q4_0_packed_scalar(const uint8_t* packed, const uint8_t* xq, const int32_t* x_sums, size_t n_in,
+                               size_t n_out, size_t first, size_t last, float* out);
+void matmul_q4_0_packed(const uint8_t* packed, const uint8_t* xq, size_t xq_stride, const int32_t* x_sums,
+                        size_t sums_stride, size_t n_tokens, size_t n_in, size_t n_out, size_t first, size_t last,
+                        float* out, size_t out_stride);
 
 // out[o] for o in [first, last), both multiples of 16 (last may be n_out)
 void matvec_q8_0_packed(const uint8_t* packed, const uint8_t* xq, const int32_t* x_sums, size_t n_in, size_t n_out,
@@ -72,6 +93,27 @@ void rms_norm(const float* x, const float* weight, size_t n, float eps, float* o
 void rope_norm(float* x, size_t n_head, size_t head_dim, size_t n_rot, uint32_t pos, float freq_base);
 
 void softmax(float* x, size_t n);
+
+// e^x for every value, within 2 ulp of the libm result; the scalar one is the reference
+void exp_values(float* x, size_t n);
+void exp_values_scalar(float* x, size_t n);
+
+// keys of one head in tiles of 16 positions: value d of position p lives at
+// k_tiles[(p / 16) * head_dim * 16 + d * 16 + p % 16], so the scores of 16 positions
+// read head_dim * 64 contiguous bytes
+constexpr size_t KEY_TILE = 16;
+
+inline size_t key_index(size_t head_dim, size_t p, size_t d)
+{
+    return (p / KEY_TILE) * head_dim * KEY_TILE + d * KEY_TILE + p % KEY_TILE;
+}
+
+// one query against the cache of one head: v holds position p at v + p * v_stride; out
+// gets head_dim values and scores is scratch for n_past values rounded up to 16
+void attention_head(const float* q, const float* k_tiles, const float* v, size_t v_stride, size_t head_dim,
+                    size_t n_past, float scale, float* scores, float* out);
+void attention_head_scalar(const float* q, const float* k_tiles, const float* v, size_t v_stride, size_t head_dim,
+                           size_t n_past, float scale, float* scores, float* out);
 
 // out = silu(gate) * up
 void swiglu(const float* gate, const float* up, size_t n, float* out);

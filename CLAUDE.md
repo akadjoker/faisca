@@ -27,10 +27,11 @@ top. No third party dependencies. Owner: Luís (akadjoker). "faisca" is a workin
 2. Tokenizer: done, see below.
 3. CPU runner in float32: done, validated layer by layer against llama.cpp,
    see below.
-4. CPU optimization: threads, SIMD, quantized weights. Next. Order agreed
-   with the owner: quantized matvec with SIMD (Q8_0, Q4_0, Q4_K), threads for
-   the prompt, KV cache in f16 or Q8; then speculative decoding with
-   SmolLM2-135M as draft; then Vulkan; then the cache format.
+4. CPU optimization: in progress. Done: Q8_0 and Q4_0 packed VNNI kernels,
+   thread pool, batched prompt, tiled attention. Pending: K-quants (Q4_K,
+   Q6_K, Q5_0 for Q4_K_M files), KV cache in f16, AMX for the prompt, a
+   faster Q4_0 unpack. Then speculative decoding with SmolLM2-135M as draft;
+   then Vulkan; then the cache format.
 5. Vulkan compute backend (the owner chose Vulkan over CUDA and OpenGL).
 6. Own cache format with offset tables, KV cache kept between turns and saved to
    disk, longest common prefix reuse, snapshots.
@@ -67,17 +68,45 @@ Byte level BPE (`tokenizer.ggml.model` = gpt2) with the `gpt-2`, `phi-2` and
 
 ## Runner status
 
-`LlamaModel` + `Runner` (include/faisca/model.h, runner.h, ops.h): the `llama`
-architecture in float32, one token at a time, one thread. F32 tensors in place,
-F16 and Q8_0 dequantized at load (bit identical to gguf-py). No rope scaling,
-no biases, no MoE yet: those GGUF keys are rejected with an error.
+`LlamaModel` + `Runner` (include/faisca/model.h, runner.h, ops.h, thread.h,
+memory.h): the `llama` architecture. F32 in place, F16 converted to float32,
+Q8_0 and Q4_0 packed at load into groups of 16 interleaved rows (ops.h,
+"Packed Q8_0") in anonymous huge page memory; `--f32` / `--dequantize` convert
+everything to float32 for the reference comparison. Activations quantized to
+Q8_0 like llama.cpp on x86 (scale amax/127 as f16, 127/amax, round to even).
+Kernels: AVX-512 VNNI, AVX-VNNI, scalar reference; without VNNI, Q8_0 stays in
+the file layout with an AVX2 kernel and Q4_0 is converted to float32. Prompt
+in batches of 32 (Runner::BATCH), weights read once per batch. Attention over
+keys stored in tiles of 16 positions (key_index), own vectorized exp (1 ulp of
+expf). Thread pool over pthreads/Win32; every row group, head and token step
+whole on one thread, so output is bit identical for 1, 2 or 4 threads (cmp of
+runner_dump files is the test). -ffp-contract=off keeps Debug and Release
+identical. No rope scaling, no biases, no MoE yet: rejected with an error.
 
-- Validated against llama.cpp b86d2f0 on SmolLM2-360M-Instruct with
-  `tests/compare_layers.py`: 386 intermediate tensors per prompt, worst
-  relative L2 error 4.5e-6 on a 16 token prompt and 2.1e-6 on a 1045 token
-  prompt, greedy generation identical for 16 and 32 tokens. ASan/UBSan clean.
-- Speed, one thread, float32: about 5 tokens per second on the 360M model on a
-  2.1 GHz Xeon, 1.35 GB of dequantized weights. That is step 4's job.
+- Validation: float32 path against llama.cpp with compare_layers.py: 386
+  tensors, worst rel L2 4.5e-6 (16 tokens) and 3.9e-6 (1045 tokens), greedy
+  tokens identical. Quantized kernels with matmul_check against llama.cpp's
+  own inputs: 193 matrices, zero error, Q8_0 and Q4_0. Full quantized pass:
+  inherent noise, both runners 4.4e-2 from float32 logits, same argmax at
+  every position, 16 greedy tokens identical. ASan, UBSan, TSan clean with 4
+  threads.
+- Speed, SmolLM2-360M, 2.1 GHz Sapphire Rapids VM, 1 / 4 threads. Generation:
+  Q8_0 24.6 / 83 tok/s (llama.cpp 24.9 / 71), Q4_0 31 / 66 (llama.cpp 38.8 /
+  70). Prompt of 633 tokens: Q8_0 142 / 443 tok/s, Q4_0 165 / 480 (llama.cpp
+  pp512 255 / 143 with AMX; its pp128 with 4 threads was 893). float32 path:
+  about 5 tok/s on one thread.
+- What explained the speed (the investigation is in the commit messages): the
+  row by row kernel was compute bound at 6 GB/s of weights, ggml's own
+  vec_dot too when called from our harness; llama.cpp reaches 10 GB/s because
+  on this CPU it repacks Q8_0/Q4_0 into an AMX buffer and runs 512-bit VNNI
+  over 16 interleaved rows. Attention was 12 GMAC per 633 token prompt
+  (forgetting the 32 layers once cost an hour): tiles, broadcast FMAs and the
+  vectorized exp fixed it. Huge pages: +25% on the row kernel, so the packed
+  copy asks for them; load takes 0.5 to 1.2 s from synchronous compaction.
+- Reference tools: `tests/reference/llama_layer_dump.cpp` and
+  `tests/matmul_check.cpp` (see README). Q4_0 and Q4_K_M files of SmolLM2 were
+  made with llama-quantize from the float32 copy; the Q4_K_M one is mostly
+  Q5_0 with Q4_K/Q6_K only where n_in is a multiple of 256 (SmolLM2 has 960).
 - Reference setup: `python3 tests/make_f32_gguf.py q8.gguf f32.gguf` (both
   sides read the same float32 weights), `llama_layer_dump` is built by the bench
   configuration (`-DFAISCA_BUILD_BENCH=ON -DFAISCA_LLAMA_DIR=...`). The tools

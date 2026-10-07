@@ -18,7 +18,7 @@ or exceptions. It has its own containers (`faisca::Array`, `faisca::StringMap`,
 | GGUF loader (memory mapped, zero-copy) | done |
 | Tokenizer (byte level BPE, validated against llama.cpp) | done |
 | CPU runner, float32, validated layer by layer against llama.cpp | done |
-| CPU optimization (threads, SIMD, quantized weights) | next |
+| CPU optimization: threads, VNNI kernels for Q8_0 and Q4_0, batched prompt | done, K-quants and f16 KV cache pending |
 | Vulkan compute backend | planned |
 | Own cache format and KV cache on disk | planned |
 
@@ -43,14 +43,14 @@ This produces the `faisca` static library and the `faisca` tool.
 faisca info model.gguf              # summary
 faisca info model.gguf --meta       # every metadata key
 faisca info model.gguf --tensors    # every tensor
-faisca generate model.gguf -p "What is the capital of France?" -n 64
+faisca generate model.gguf -p "What is the capital of France?" -n 64 -t 4
 ```
 
 `generate` wraps the prompt in the SmolLM2 chat template (`--raw` to skip
 that), decodes greedily and prints the tokens as they come, then the timings.
-It runs the float32 path on one thread: on SmolLM2-360M that is about 5 tokens
-per second on a 2.1 GHz Xeon core, with 1.35 GB of dequantized weights. The
-optimization step comes next.
+`-t` sets the threads, `--f32` converts the weights to float32 at load (the
+validation path). SmolLM2-360M on a 2.1 GHz Xeon, 4 threads: 83 tokens per
+second from Q8_0, 66 from Q4_0, prompts at 440 to 480 tokens per second.
 
 ## Library
 
@@ -118,9 +118,19 @@ runner.forward(tokens.data(), tokens.size(), logits, error); // logits of the la
 
 `LlamaModel` reads the `llama` architecture (SmolLM2, Llama 2 and 3 style
 models without rope scaling). F32 tensors are used in place in the mapped
-file; F16 and Q8_0 tensors are dequantized to float32 at load. `Runner` is the
-float32 forward pass: RMS norm, RoPE, grouped query attention over a KV cache
-of `n_ctx` positions, SwiGLU, one token at a time, one thread.
+file, F16 tensors are converted to float32 at load. Q8_0 and Q4_0 tensors are
+repacked at load into groups of 16 interleaved rows in anonymous memory (huge
+pages where the system allows), the layout the VNNI kernels want: one
+`vpdpbusd` advances 16 output rows, and the weights are read once per batch of
+32 tokens. Activations are quantized to Q8_0 per block of 32, the way llama.cpp
+does on x86. Builds without VNNI keep Q8_0 in place with an AVX2 kernel and
+convert Q4_0 to float32.
+
+`Runner` holds the KV cache (`n_ctx` positions, float32, keys in tiles of 16
+positions) and a thread pool. Every matrix row group, attention head and
+token step is computed whole by one thread, so the output is bit identical
+for any thread count. The prompt is processed in batches; generation reuses
+the same kernels one token at a time.
 
 `GgufFile` is a plain value object: no smart pointers, no heap allocation for
 the object itself. The reader never copies or decodes anything up front.
@@ -191,15 +201,27 @@ python3 tests/compare_with_gguf_py.py build/gguf_dump model.gguf
   made by `tests/make_f32_gguf.py`, so the only differences left are rounding
   and summation order. Then both generate greedily and the tokens must match.
 
-  Results on SmolLM2-360M-Instruct, llama.cpp b86d2f0:
+  Results on SmolLM2-360M-Instruct, llama.cpp b86d2f0, float32 weights,
+  faisca with `--dequantize`:
 
   | Prompt | Tensors compared | Worst relative L2 error | Generated tokens |
   | --- | --- | --- | --- |
   | chat prompt, 16 tokens | 386 | 4.5e-6 (`l_out-31`) | 16, identical |
-  | chat prompt, 1045 tokens | 386 | 2.1e-6 (`ffn_out-13`) | 32, identical |
+  | chat prompt, 1045 tokens | 386 | 3.9e-6 (`ffn_out-13`) | 8, identical |
 
-  The Q8_0 model read directly by faisca gives bit identical tensors and
-  tokens to the float32 copy, so the dequantization matches gguf-py exactly.
+  The Q8_0 model converted to float32 by faisca gives bit identical tensors
+  and tokens to the float32 copy, so the dequantization matches gguf-py.
+- `matmul_check`: the quantized kernels on their own. It feeds every matrix of
+  every block with the exact input llama.cpp computed (from a
+  `llama_layer_dump` of the quantized model) and compares the products. On
+  SmolLM2 Q8_0 and Q4_0, all 193 matrices match llama.cpp's outputs with zero
+  error: the integer block sums are exact and the float accumulation has the
+  same structure as llama.cpp's VNNI kernels. A full pass with quantized
+  activations cannot be compared that tightly: differences of 1e-7 before the
+  quantization round to different integers, and both runners sit about 4e-2
+  from the float32 logits (llama.cpp 4.43e-2, faisca 4.42e-2) and 2e-2 from
+  each other, with the same argmax at every position and the same 16 greedy
+  tokens.
 
 ## Layout
 

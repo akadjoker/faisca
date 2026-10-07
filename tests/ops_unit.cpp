@@ -1,5 +1,6 @@
 #include "faisca/ops.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -288,7 +289,7 @@ void test_q8_0_packed()
             {
                 expected += static_cast<int8_t>(xq[b * Q8_0_BLOCK_BYTES + 2 + k]);
             }
-            sums_ok = sums_ok && sums[b] == 128 * expected;
+            sums_ok = sums_ok && sums[b] == expected;
         }
         CHECK(sums_ok);
 
@@ -335,6 +336,101 @@ void test_q8_0_packed()
             partial_ok = partial_ok && (o < 16 ? partial[o] == 999.0f : close(partial[o], reference[o], 1e-6));
         }
         CHECK(partial_ok);
+    }
+}
+
+void test_q4_0_packed()
+{
+    std::mt19937 rng(41);
+    const size_t n_in = 960;
+    for (const size_t n_out : {16, 37})
+    {
+        // rows quantized by hand to Q4_0: scale = max / -8 as llama.cpp, nibble = round(x / scale) + 8
+        const size_t row_bytes = n_in / Q4_0_BLOCK * Q4_0_BLOCK_BYTES;
+        std::vector<uint8_t> rows(n_out * row_bytes);
+        std::vector<float> dense;
+        for (size_t o = 0; o < n_out; ++o)
+        {
+            const std::vector<float> row = random_values(rng, n_in, 0.1f);
+            for (size_t b = 0; b < n_in / Q4_0_BLOCK; ++b)
+            {
+                float max = 0.0f;
+                float amax = 0.0f;
+                for (size_t k = 0; k < Q4_0_BLOCK; ++k)
+                {
+                    const float value = row[b * Q4_0_BLOCK + k];
+                    if (std::fabs(value) > amax)
+                    {
+                        amax = std::fabs(value);
+                        max = value;
+                    }
+                }
+                const float d = max / -8.0f;
+                const float id = d != 0.0f ? 1.0f / d : 0.0f;
+                uint8_t* block = rows.data() + o * row_bytes + b * Q4_0_BLOCK_BYTES;
+                const uint16_t bits = f32_to_f16(d);
+                std::memcpy(block, &bits, 2);
+                for (size_t j = 0; j < Q4_0_BLOCK / 2; ++j)
+                {
+                    const float v0 = row[b * Q4_0_BLOCK + j] * id + 8.5f;
+                    const float v1 = row[b * Q4_0_BLOCK + j + 16] * id + 8.5f;
+                    const uint8_t q0 = static_cast<uint8_t>(std::min(15.0f, std::max(0.0f, std::floor(v0))));
+                    const uint8_t q1 = static_cast<uint8_t>(std::min(15.0f, std::max(0.0f, std::floor(v1))));
+                    block[2 + j] = static_cast<uint8_t>(q0 | (q1 << 4));
+                }
+            }
+            std::vector<float> back(n_in);
+            dequantize_q4_0(rows.data() + o * row_bytes, n_in, back.data());
+            dense.insert(dense.end(), back.begin(), back.end());
+        }
+
+        std::vector<uint8_t> packed(q4_0_packed_bytes(n_in, n_out));
+        pack_q4_0(rows.data(), n_in, n_out, packed.data());
+        bool rows_back = true;
+        std::vector<float> row(n_in);
+        for (size_t o = 0; o < n_out; ++o)
+        {
+            row_q4_0_packed(packed.data(), n_in, o, row.data());
+            rows_back = rows_back && std::memcmp(row.data(), dense.data() + o * n_in, n_in * sizeof(float)) == 0;
+        }
+        CHECK(rows_back);
+
+        const size_t n_tokens = 19;
+        std::vector<uint8_t> xqs(n_tokens * n_in / Q8_0_BLOCK * Q8_0_BLOCK_BYTES);
+        std::vector<int32_t> sums(n_tokens * n_in / Q8_0_BLOCK);
+        std::vector<float> xs_back(n_tokens * n_in);
+        const size_t xq_stride = n_in / Q8_0_BLOCK * Q8_0_BLOCK_BYTES;
+        const size_t sums_stride = n_in / Q8_0_BLOCK;
+        for (size_t t = 0; t < n_tokens; ++t)
+        {
+            const std::vector<float> x = random_values(rng, n_in, 1.0f);
+            quantize_q8_0(x.data(), n_in, xqs.data() + t * xq_stride);
+            q8_0_block_sums(xqs.data() + t * xq_stride, n_in, sums.data() + t * sums_stride);
+            dequantize_q8_0(xqs.data() + t * xq_stride, n_in, xs_back.data() + t * n_in);
+        }
+        std::vector<float> scalar(n_tokens * n_out), fast(n_tokens * n_out, 999.0f);
+        for (size_t t = 0; t < n_tokens; ++t)
+        {
+            matvec_q4_0_packed_scalar(packed.data(), xqs.data() + t * xq_stride, sums.data() + t * sums_stride, n_in,
+                                      n_out, 0, n_out, scalar.data() + t * n_out);
+        }
+        matmul_q4_0_packed(packed.data(), xqs.data(), xq_stride, sums.data(), sums_stride, n_tokens, n_in, n_out, 0,
+                           n_out, fast.data(), n_out);
+        bool all_close = true;
+        for (size_t t = 0; t < n_tokens; ++t)
+        {
+            for (size_t o = 0; o < n_out; ++o)
+            {
+                double expected = 0.0;
+                for (size_t i = 0; i < n_in; ++i)
+                {
+                    expected += static_cast<double>(dense[o * n_in + i]) * xs_back[t * n_in + i];
+                }
+                all_close = all_close && close(scalar[t * n_out + o], expected, 1e-5) &&
+                            close(fast[t * n_out + o], expected, 1e-5);
+            }
+        }
+        CHECK(all_close);
     }
 }
 
@@ -499,6 +595,107 @@ void test_softmax()
     CHECK(large[0] == 0.5f && large[1] == 0.5f && large[2] == 0.0f);
 }
 
+void test_exp_and_attention()
+{
+    std::vector<float> x;
+    for (float value = -100.0f; value <= 88.7f; value += 0.0137f)
+    {
+        x.push_back(value);
+    }
+    x.push_back(-87.0f);
+    x.push_back(-87.4f);
+    x.push_back(0.0f);
+    x.push_back(88.72f);
+    std::vector<float> fast = x;
+    exp_values(fast.data(), fast.size());
+    double worst = 0.0;
+    bool finite = true;
+    bool tiny_ok = true;
+    for (size_t i = 0; i < x.size(); ++i)
+    {
+        const double expected = std::exp(static_cast<double>(x[i]));
+        finite = finite && std::isfinite(fast[i]) && fast[i] >= 0.0f;
+        if (expected >= 1.17549435e-38)
+        {
+            const double rel = std::fabs(static_cast<double>(fast[i]) - expected) / expected;
+            worst = rel > worst ? rel : worst;
+        }
+        else
+        {
+            tiny_ok = tiny_ok && fast[i] <= 1.17549435e-38f;
+        }
+    }
+    CHECK(finite);
+    CHECK(tiny_ok);
+    CHECK(worst < 2.5e-7);
+    CHECK(fast[x.size() - 2] == 1.0f);
+    CHECK(fast[x.size() - 1] > 3.3e38f);
+    std::vector<float> large = {89.0f, 200.0f};
+    exp_values(large.data(), large.size());
+    CHECK(std::isinf(large[0]) || large[0] > 3.3e38f);
+    CHECK(std::isinf(large[1]) || large[1] > 3.3e38f);
+
+    std::mt19937 rng(37);
+    const size_t n_ctx = 80;
+    const size_t head_dim = 64;
+    const size_t n_kv = 320;
+    std::vector<float> k_t = random_values(rng, head_dim * n_ctx, 1.0f); // in tiles, see key_index
+    std::vector<float> v = random_values(rng, n_ctx * n_kv, 1.0f);
+    std::vector<float> q = random_values(rng, head_dim, 1.0f);
+    for (float& value : q)
+    {
+        value *= 3.0f;
+    }
+    for (const size_t n_past : {1, 2, 15, 16, 17, 33, 64, 79})
+    {
+        std::vector<float> scores_a(n_ctx + 16), scores_b(n_ctx + 16), out_a(head_dim), out_b(head_dim);
+        attention_head_scalar(q.data(), k_t.data(), v.data() + 64, n_kv, head_dim, n_past, 0.125f, scores_a.data(),
+                              out_a.data());
+        attention_head(q.data(), k_t.data(), v.data() + 64, n_kv, head_dim, n_past, 0.125f, scores_b.data(),
+                       out_b.data());
+
+        // the scalar kernel against a plain double loop over the tiled layout
+        std::vector<double> plain(head_dim, 0.0);
+        std::vector<double> weights(n_past);
+        double max = -1e30;
+        for (size_t p = 0; p < n_past; ++p)
+        {
+            double s = 0.0;
+            for (size_t d = 0; d < head_dim; ++d)
+            {
+                s += static_cast<double>(q[d]) * k_t[key_index(head_dim, p, d)];
+            }
+            weights[p] = s * 0.125;
+            max = weights[p] > max ? weights[p] : max;
+        }
+        double sum = 0.0;
+        for (size_t p = 0; p < n_past; ++p)
+        {
+            weights[p] = std::exp(weights[p] - max);
+            sum += weights[p];
+        }
+        for (size_t p = 0; p < n_past; ++p)
+        {
+            for (size_t d = 0; d < head_dim; ++d)
+            {
+                plain[d] += weights[p] / sum * v[64 + p * n_kv + d];
+            }
+        }
+        bool scalar_close = true;
+        for (size_t d = 0; d < head_dim; ++d)
+        {
+            scalar_close = scalar_close && close(out_a[d], plain[d], 1e-5);
+        }
+        CHECK(scalar_close);
+        bool all_close = true;
+        for (size_t d = 0; d < head_dim; ++d)
+        {
+            all_close = all_close && close(out_b[d], out_a[d], 1e-5);
+        }
+        CHECK(all_close);
+    }
+}
+
 void test_swiglu_and_add()
 {
     const float gate[4] = {0.0f, 1.0f, -1.0f, 20.0f};
@@ -524,10 +721,12 @@ int main()
     test_f32_to_f16();
     test_q8_0();
     test_q8_0_packed();
+    test_q4_0_packed();
     test_dot_and_matvec();
     test_rms_norm();
     test_rope();
     test_softmax();
+    test_exp_and_attention();
     test_swiglu_and_add();
 
     std::printf("%s ops_unit: %d checks, %d failed\n", g_failures == 0 ? "ok  " : "FAIL", g_checks, g_failures);

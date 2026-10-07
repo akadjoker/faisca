@@ -11,17 +11,30 @@ namespace faisca
 
 struct Runner::MatmulJob
 {
-    const Runner* runner;
+    Runner* runner;
     const Weight* weight;
+    const float* x;
+    size_t x_stride;
+    size_t n_tokens;
     float* out;
+    size_t out_stride;
 };
 
 struct Runner::AttentionJob
 {
     Runner* runner;
-    const LlamaLayer* layer;
     int il;
     uint32_t pos;
+    size_t n_tokens;
+};
+
+struct Runner::TokenJob
+{
+    Runner* runner;
+    TokenStep step;
+    const LlamaLayer* layer;
+    uint32_t pos;
+    size_t n_tokens;
 };
 
 void Runner::release()
@@ -32,6 +45,7 @@ void Runner::release()
     m_pos = 0;
     m_k.release();
     m_v.release();
+    m_k_batch.release();
     m_x.release();
     m_h.release();
     m_q.release();
@@ -40,11 +54,11 @@ void Runner::release()
     m_up.release();
     m_act.release();
     m_scores.release();
-    m_input = nullptr;
-    m_input_size = 0;
-    m_input_quantized = false;
-    m_input_q8.release();
-    m_input_sums.release();
+    m_logits.release();
+    m_xq.release();
+    m_sums.release();
+    m_xq_stride = 0;
+    m_sums_stride = 0;
 }
 
 bool Runner::init(const LlamaModel& model, uint32_t n_ctx, int n_threads, Error& error)
@@ -76,18 +90,27 @@ bool Runner::init(const LlamaModel& model, uint32_t n_ctx, int n_threads, Error&
     }
 
     const size_t widest = h.n_ff > h.n_embd ? h.n_ff : h.n_embd;
-    if (!m_k.resize_uninitialized(cache) || !m_v.resize_uninitialized(cache) || !m_x.resize_uninitialized(h.n_embd) ||
-        !m_h.resize_uninitialized(h.n_embd) || !m_q.resize_uninitialized(n_q) || !m_attn.resize_uninitialized(n_q) ||
-        !m_gate.resize_uninitialized(h.n_ff) || !m_up.resize_uninitialized(h.n_ff) ||
-        !m_act.resize_uninitialized(h.n_ff) || !m_scores.resize_uninitialized(static_cast<size_t>(n_ctx) * h.n_head) ||
-        !m_input_q8.resize_uninitialized((widest / Q8_0_BLOCK + 1) * Q8_0_BLOCK_BYTES) ||
-        !m_input_sums.resize_uninitialized(widest / Q8_0_BLOCK + 1))
+    m_xq_stride = (widest / Q8_0_BLOCK) * Q8_0_BLOCK_BYTES;
+    m_sums_stride = widest / Q8_0_BLOCK;
+    const size_t threads = static_cast<size_t>(m_pool.size());
+    const size_t scores = (static_cast<size_t>(n_ctx) + 15) / 16 * 16;
+    const size_t k_cache = static_cast<size_t>(h.n_layer) * h.n_head_kv * (scores * h.head_dim);
+    if (!m_k.resize_uninitialized(k_cache) || !m_v.resize_uninitialized(cache) ||
+        !m_k_batch.resize_uninitialized(BATCH * n_kv) || !m_x.resize_uninitialized(BATCH * h.n_embd) ||
+        !m_h.resize_uninitialized(BATCH * h.n_embd) || !m_q.resize_uninitialized(BATCH * n_q) ||
+        !m_attn.resize_uninitialized(BATCH * n_q) || !m_gate.resize_uninitialized(BATCH * h.n_ff) ||
+        !m_up.resize_uninitialized(BATCH * h.n_ff) || !m_act.resize_uninitialized(BATCH * h.n_ff) ||
+        !m_scores.resize_uninitialized(threads * scores) || !m_xq.resize_uninitialized(BATCH * m_xq_stride) ||
+        !m_sums.resize_uninitialized(BATCH * m_sums_stride))
     {
         release();
         error.set("out of memory: the KV cache for %" PRIu32 " positions needs %zu MiB", n_ctx,
                   2 * cache * sizeof(float) >> 20);
         return false;
     }
+    // the score kernel reads whole tiles of 16 positions, so unused positions must hold numbers
+    std::memset(m_k.data(), 0, k_cache * sizeof(float));
+    std::memset(m_v.data(), 0, cache * sizeof(float));
 
     m_model = &model;
     m_n_ctx = n_ctx;
@@ -127,182 +150,266 @@ bool Runner::forward(const int32_t* tokens, size_t count, Array<float>& logits, 
         error.set("out of memory");
         return false;
     }
-
-    for (size_t i = 0; i < count; ++i)
+    if (m_trace != nullptr && !m_logits.resize_uninitialized(BATCH * h.n_vocab))
     {
-        const bool last = i + 1 == count;
-        forward_one(tokens[i], m_pos, last || m_trace != nullptr ? logits.data() : nullptr);
-        ++m_pos;
+        error.set("out of memory");
+        return false;
+    }
+
+    for (size_t done = 0; done < count;)
+    {
+        const size_t batch = count - done < BATCH ? count - done : BATCH;
+        forward_batch(tokens + done, batch, m_pos, logits.data());
+        m_pos += static_cast<uint32_t>(batch);
+        done += batch;
     }
     return true;
 }
 
-void Runner::trace(const char* name, int layer, const float* data, size_t count) const
+void Runner::trace_rows(const char* name, int layer, const float* data, size_t count, size_t n_tokens,
+                        size_t stride) const
 {
-    if (m_trace != nullptr)
+    if (m_trace == nullptr)
     {
-        m_trace(m_trace_user, name, layer, data, count);
+        return;
+    }
+    for (size_t t = 0; t < n_tokens; ++t)
+    {
+        m_trace(m_trace_user, name, layer, data + t * stride, count);
     }
 }
 
-void Runner::set_input(const float* x, size_t n)
+void Runner::quantize_task(void* user, int thread_index, int thread_count)
 {
-    m_input = x;
-    m_input_size = n;
-    m_input_quantized = false;
+    Runner& runner = *static_cast<Runner*>(user);
+    const size_t first = runner.m_quantize_tokens * static_cast<size_t>(thread_index) / static_cast<size_t>(thread_count);
+    const size_t last = runner.m_quantize_tokens * static_cast<size_t>(thread_index + 1) / static_cast<size_t>(thread_count);
+    for (size_t t = first; t < last; ++t)
+    {
+        quantize_q8_0(runner.m_quantize_x + t * runner.m_quantize_stride, runner.m_quantize_n,
+                      runner.m_xq.data() + t * runner.m_xq_stride);
+        q8_0_block_sums(runner.m_xq.data() + t * runner.m_xq_stride, runner.m_quantize_n,
+                        runner.m_sums.data() + t * runner.m_sums_stride);
+    }
 }
 
-void Runner::matmul_rows(const Weight& w, float* out, size_t first, size_t last) const
+void Runner::quantize_inputs(const float* x, size_t stride, size_t n_tokens, size_t n)
 {
-    w.matvec(m_input, m_input_q8.data(), m_input_sums.data(), first, last, out);
+    m_quantize_x = x;
+    m_quantize_stride = stride;
+    m_quantize_tokens = n_tokens;
+    m_quantize_n = n;
+    m_pool.run(quantize_task, this);
+}
+
+void Runner::token_task(void* user, int thread_index, int thread_count)
+{
+    const TokenJob& job = *static_cast<const TokenJob*>(user);
+    const size_t first = job.n_tokens * static_cast<size_t>(thread_index) / static_cast<size_t>(thread_count);
+    const size_t last = job.n_tokens * static_cast<size_t>(thread_index + 1) / static_cast<size_t>(thread_count);
+    for (size_t t = first; t < last; ++t)
+    {
+        (job.runner->*job.step)(job.layer, job.pos, t);
+    }
+}
+
+void Runner::for_tokens(TokenStep step, const LlamaLayer* layer, uint32_t pos, size_t n_tokens)
+{
+    TokenJob job{this, step, layer, pos, n_tokens};
+    m_pool.run(token_task, &job);
+}
+
+void Runner::step_attn_norm(const LlamaLayer* layer, uint32_t, size_t token)
+{
+    const LlamaHparams& h = m_model->hparams();
+    rms_norm(m_x.data() + token * h.n_embd, layer->attn_norm, h.n_embd, h.rms_eps, m_h.data() + token * h.n_embd);
+}
+
+void Runner::step_ffn_inp(const LlamaLayer* layer, uint32_t, size_t token)
+{
+    const LlamaHparams& h = m_model->hparams();
+    add(m_x.data() + token * h.n_embd, m_h.data() + token * h.n_embd, h.n_embd);
+    rms_norm(m_x.data() + token * h.n_embd, layer->ffn_norm, h.n_embd, h.rms_eps, m_h.data() + token * h.n_embd);
+}
+
+void Runner::step_swiglu(const LlamaLayer*, uint32_t, size_t token)
+{
+    const LlamaHparams& h = m_model->hparams();
+    swiglu(m_gate.data() + token * h.n_ff, m_up.data() + token * h.n_ff, h.n_ff, m_act.data() + token * h.n_ff);
+}
+
+void Runner::step_residual(const LlamaLayer*, uint32_t, size_t token)
+{
+    const LlamaHparams& h = m_model->hparams();
+    add(m_x.data() + token * h.n_embd, m_h.data() + token * h.n_embd, h.n_embd);
+}
+
+void Runner::step_output_norm(const LlamaLayer*, uint32_t, size_t token)
+{
+    const LlamaHparams& h = m_model->hparams();
+    rms_norm(m_x.data() + token * h.n_embd, m_model->output_norm(), h.n_embd, h.rms_eps, m_h.data() + token * h.n_embd);
 }
 
 void Runner::matmul_task(void* user, int thread_index, int thread_count)
 {
     const MatmulJob& job = *static_cast<const MatmulJob*>(user);
+    const Weight& w = *job.weight;
     // whole row groups per thread, so every row is summed the same way whatever the thread count
-    const size_t group = job.weight->row_group();
-    const size_t groups = (job.weight->n_out + group - 1) / group;
+    const size_t group = w.row_group();
+    const size_t groups = (w.n_out + group - 1) / group;
     const size_t first = groups * static_cast<size_t>(thread_index) / static_cast<size_t>(thread_count) * group;
     size_t last = groups * static_cast<size_t>(thread_index + 1) / static_cast<size_t>(thread_count) * group;
-    last = last < job.weight->n_out ? last : job.weight->n_out;
-    job.runner->matmul_rows(*job.weight, job.out, first, last);
+    last = last < w.n_out ? last : w.n_out;
+    if (first >= last)
+    {
+        return;
+    }
+    const Runner& runner = *job.runner;
+    w.matmul(job.x, job.x_stride, runner.m_xq.data(), runner.m_xq_stride, runner.m_sums.data(), runner.m_sums_stride,
+             job.n_tokens, first, last, job.out, job.out_stride);
 }
 
-void Runner::matmul(const Weight& w, float* out)
+void Runner::matmul(const Weight& w, const float* x, size_t x_stride, size_t n_tokens, float* out, size_t out_stride)
 {
-    if (w.type == GgmlType::Q8_0 && !m_input_quantized)
+    if (w.type != GgmlType::F32)
     {
-        quantize_q8_0(m_input, m_input_size, m_input_q8.data());
-        q8_0_block_sums(m_input_q8.data(), m_input_size, m_input_sums.data());
-        m_input_quantized = true;
+        quantize_inputs(x, x_stride, n_tokens, w.n_in);
     }
-    MatmulJob job{this, &w, out};
+    MatmulJob job{this, &w, x, x_stride, n_tokens, out, out_stride};
     m_pool.run(matmul_task, &job);
 }
 
 void Runner::attention_task(void* user, int thread_index, int thread_count)
 {
     AttentionJob& job = *static_cast<AttentionJob*>(user);
-    const size_t n_head = job.runner->m_model->hparams().n_head;
-    const size_t first = n_head * static_cast<size_t>(thread_index) / static_cast<size_t>(thread_count);
-    const size_t last = n_head * static_cast<size_t>(thread_index + 1) / static_cast<size_t>(thread_count);
-    job.runner->attention_heads(*job.layer, job.il, job.pos, first, last);
-}
-
-void Runner::attention(const LlamaLayer& layer, int il, uint32_t pos)
-{
-    const LlamaHparams& h = m_model->hparams();
-    const size_t head_dim = h.head_dim;
-    const size_t n_kv = static_cast<size_t>(h.n_head_kv) * head_dim;
-    float* k_cur = m_k.data() + (static_cast<size_t>(il) * m_n_ctx + pos) * n_kv;
-    float* v_cur = m_v.data() + (static_cast<size_t>(il) * m_n_ctx + pos) * n_kv;
-
-    set_input(m_h.data(), h.n_embd);
-    matmul(layer.wq, m_q.data());
-    matmul(layer.wk, k_cur);
-    matmul(layer.wv, v_cur);
-
-    rope_norm(m_q.data(), h.n_head, head_dim, h.n_rot, pos, h.rope_freq_base);
-    rope_norm(k_cur, h.n_head_kv, head_dim, h.n_rot, pos, h.rope_freq_base);
-    trace("Qcur", il, m_q.data(), static_cast<size_t>(h.n_head) * head_dim);
-    trace("Kcur", il, k_cur, n_kv);
-    trace("Vcur", il, v_cur, n_kv);
-
-    AttentionJob job{this, &layer, il, pos};
-    m_pool.run(attention_task, &job);
-
-    set_input(m_attn.data(), static_cast<size_t>(h.n_head) * head_dim);
-    matmul(layer.wo, m_h.data());
-    trace("attn_out", il, m_h.data(), h.n_embd);
-}
-
-void Runner::attention_heads(const LlamaLayer&, int il, uint32_t pos, size_t first, size_t last)
-{
-    const LlamaHparams& h = m_model->hparams();
-    const size_t head_dim = h.head_dim;
-    const size_t n_kv = static_cast<size_t>(h.n_head_kv) * head_dim;
-    const size_t group = h.n_head / h.n_head_kv;
-    const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
-    const float* k_cache = m_k.data() + static_cast<size_t>(il) * m_n_ctx * n_kv;
-    const float* v_cache = m_v.data() + static_cast<size_t>(il) * m_n_ctx * n_kv;
-
-    const size_t n_past = static_cast<size_t>(pos) + 1;
-    for (size_t head = first; head < last; ++head)
+    Runner& runner = *job.runner;
+    const size_t n_head = runner.m_model->hparams().n_head;
+    const size_t units = job.n_tokens * n_head;
+    const size_t first = units * static_cast<size_t>(thread_index) / static_cast<size_t>(thread_count);
+    const size_t last = units * static_cast<size_t>(thread_index + 1) / static_cast<size_t>(thread_count);
+    const size_t scores_stride = (static_cast<size_t>(runner.m_n_ctx) + 15) / 16 * 16;
+    float* scores = runner.m_scores.data() + static_cast<size_t>(thread_index) * scores_stride;
+    for (size_t u = first; u < last; ++u)
     {
-        const float* q = m_q.data() + head * head_dim;
-        const size_t kv_offset = (head / group) * head_dim;
-        float* scores = m_scores.data() + head * m_n_ctx;
-        for (size_t j = 0; j < n_past; ++j)
-        {
-            scores[j] = dot(q, k_cache + j * n_kv + kv_offset, head_dim) * scale;
-        }
-        softmax(scores, n_past);
+        runner.attention_unit(job.il, job.pos, u / n_head, u % n_head, scores);
+    }
+}
 
-        float* out = m_attn.data() + head * head_dim;
+void Runner::attention_unit(int il, uint32_t pos, size_t token, size_t head, float* scores)
+{
+    const LlamaHparams& h = m_model->hparams();
+    const size_t head_dim = h.head_dim;
+    const size_t n_kv = static_cast<size_t>(h.n_head_kv) * head_dim;
+    const size_t n_q = static_cast<size_t>(h.n_head) * head_dim;
+    const size_t kv_head = head / (h.n_head / h.n_head_kv);
+    const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+
+    const size_t tiles = (static_cast<size_t>(m_n_ctx) + 15) / 16;
+    const float* k_tiles = m_k.data() + (static_cast<size_t>(il) * h.n_head_kv + kv_head) * tiles * head_dim * KEY_TILE;
+    const float* v = m_v.data() + static_cast<size_t>(il) * m_n_ctx * n_kv + kv_head * head_dim;
+    const float* q = m_q.data() + token * n_q + head * head_dim;
+    float* out = m_attn.data() + token * n_q + head * head_dim;
+    attention_head(q, k_tiles, v, n_kv, head_dim, static_cast<size_t>(pos) + token + 1, scale, scores, out);
+}
+
+void Runner::step_rope_scatter(const LlamaLayer*, uint32_t pos, size_t token)
+{
+    const LlamaHparams& h = m_model->hparams();
+    const size_t head_dim = h.head_dim;
+    const size_t n_kv = static_cast<size_t>(h.n_head_kv) * head_dim;
+    const size_t n_q = static_cast<size_t>(h.n_head) * head_dim;
+    const uint32_t p = pos + static_cast<uint32_t>(token);
+    float* k_cur = m_k_batch.data() + token * n_kv;
+    rope_norm(m_q.data() + token * n_q, h.n_head, head_dim, h.n_rot, p, h.rope_freq_base);
+    rope_norm(k_cur, h.n_head_kv, head_dim, h.n_rot, p, h.rope_freq_base);
+
+    const size_t tiles = (static_cast<size_t>(m_n_ctx) + 15) / 16;
+    for (size_t kv_head = 0; kv_head < h.n_head_kv; ++kv_head)
+    {
+        float* k_tiles = m_k.data() + (static_cast<size_t>(m_layer) * h.n_head_kv + kv_head) * tiles * head_dim * KEY_TILE;
         for (size_t d = 0; d < head_dim; ++d)
         {
-            out[d] = 0.0f;
-        }
-        for (size_t j = 0; j < n_past; ++j)
-        {
-            const float p = scores[j];
-            const float* v = v_cache + j * n_kv + kv_offset;
-            for (size_t d = 0; d < head_dim; ++d)
-            {
-                out[d] += p * v[d];
-            }
+            k_tiles[key_index(head_dim, p, d)] = k_cur[kv_head * head_dim + d];
         }
     }
 }
 
-void Runner::forward_one(int32_t token, uint32_t pos, float* logits)
+void Runner::attention(const LlamaLayer& layer, int il, uint32_t pos, size_t n_tokens)
+{
+    const LlamaHparams& h = m_model->hparams();
+    const size_t head_dim = h.head_dim;
+    const size_t n_kv = static_cast<size_t>(h.n_head_kv) * head_dim;
+    const size_t n_q = static_cast<size_t>(h.n_head) * head_dim;
+    float* k_cur = m_k_batch.data();
+    float* v_cur = m_v.data() + (static_cast<size_t>(il) * m_n_ctx + pos) * n_kv;
+
+    matmul(layer.wq, m_h.data(), h.n_embd, n_tokens, m_q.data(), n_q);
+    matmul(layer.wk, m_h.data(), h.n_embd, n_tokens, k_cur, n_kv);
+    matmul(layer.wv, m_h.data(), h.n_embd, n_tokens, v_cur, n_kv);
+
+    m_layer = static_cast<size_t>(il);
+    for_tokens(&Runner::step_rope_scatter, &layer, pos, n_tokens);
+    trace_rows("Qcur", il, m_q.data(), n_q, n_tokens, n_q);
+    trace_rows("Kcur", il, k_cur, n_kv, n_tokens, n_kv);
+    trace_rows("Vcur", il, v_cur, n_kv, n_tokens, n_kv);
+
+    AttentionJob job{this, il, pos, n_tokens};
+    m_pool.run(attention_task, &job);
+
+    matmul(layer.wo, m_attn.data(), n_q, n_tokens, m_h.data(), h.n_embd);
+    trace_rows("attn_out", il, m_h.data(), h.n_embd, n_tokens, h.n_embd);
+}
+
+void Runner::forward_batch(const int32_t* tokens, size_t count, uint32_t pos, float* logits)
 {
     const LlamaHparams& h = m_model->hparams();
     const size_t n_embd = h.n_embd;
 
-    m_model->token_embd().row(static_cast<size_t>(token), m_x.data());
-    trace("inp_embd", -1, m_x.data(), n_embd);
+    for (size_t t = 0; t < count; ++t)
+    {
+        m_model->token_embd().row(static_cast<size_t>(tokens[t]), m_x.data() + t * n_embd);
+    }
+    trace_rows("inp_embd", -1, m_x.data(), n_embd, count, n_embd);
 
     for (uint32_t l = 0; l < h.n_layer; ++l)
     {
         const LlamaLayer& layer = m_model->layer(l);
         const int il = static_cast<int>(l);
 
-        rms_norm(m_x.data(), layer.attn_norm, n_embd, h.rms_eps, m_h.data());
-        trace("attn_norm", il, m_h.data(), n_embd);
+        for_tokens(&Runner::step_attn_norm, &layer, pos, count);
+        trace_rows("attn_norm", il, m_h.data(), n_embd, count, n_embd);
 
-        attention(layer, il, pos);
-        add(m_x.data(), m_h.data(), n_embd);
-        trace("ffn_inp", il, m_x.data(), n_embd);
+        attention(layer, il, pos, count);
+        for_tokens(&Runner::step_ffn_inp, &layer, pos, count);
+        trace_rows("ffn_inp", il, m_x.data(), n_embd, count, n_embd);
+        trace_rows("ffn_norm", il, m_h.data(), n_embd, count, n_embd);
 
-        rms_norm(m_x.data(), layer.ffn_norm, n_embd, h.rms_eps, m_h.data());
-        trace("ffn_norm", il, m_h.data(), n_embd);
+        matmul(layer.ffn_gate, m_h.data(), n_embd, count, m_gate.data(), h.n_ff);
+        matmul(layer.ffn_up, m_h.data(), n_embd, count, m_up.data(), h.n_ff);
+        trace_rows("ffn_gate", il, m_gate.data(), h.n_ff, count, h.n_ff);
+        trace_rows("ffn_up", il, m_up.data(), h.n_ff, count, h.n_ff);
+        for_tokens(&Runner::step_swiglu, &layer, pos, count);
+        trace_rows("ffn_swiglu", il, m_act.data(), h.n_ff, count, h.n_ff);
+        matmul(layer.ffn_down, m_act.data(), h.n_ff, count, m_h.data(), n_embd);
+        trace_rows("ffn_out", il, m_h.data(), n_embd, count, n_embd);
 
-        set_input(m_h.data(), n_embd);
-        matmul(layer.ffn_gate, m_gate.data());
-        matmul(layer.ffn_up, m_up.data());
-        trace("ffn_gate", il, m_gate.data(), h.n_ff);
-        trace("ffn_up", il, m_up.data(), h.n_ff);
-        swiglu(m_gate.data(), m_up.data(), h.n_ff, m_act.data());
-        trace("ffn_swiglu", il, m_act.data(), h.n_ff);
-        set_input(m_act.data(), h.n_ff);
-        matmul(layer.ffn_down, m_h.data());
-        trace("ffn_out", il, m_h.data(), n_embd);
-
-        add(m_x.data(), m_h.data(), n_embd);
-        trace("l_out", il, m_x.data(), n_embd);
+        for_tokens(&Runner::step_residual, &layer, pos, count);
+        trace_rows("l_out", il, m_x.data(), n_embd, count, n_embd);
     }
 
-    if (logits == nullptr)
+    if (m_trace != nullptr)
     {
+        for_tokens(&Runner::step_output_norm, nullptr, pos, count);
+        trace_rows("result_norm", -1, m_h.data(), n_embd, count, n_embd);
+        matmul(m_model->output(), m_h.data(), n_embd, count, m_logits.data(), h.n_vocab);
+        trace_rows("result_output", -1, m_logits.data(), h.n_vocab, count, h.n_vocab);
+        std::memcpy(logits, m_logits.data() + (count - 1) * h.n_vocab, h.n_vocab * sizeof(float));
         return;
     }
-    rms_norm(m_x.data(), m_model->output_norm(), n_embd, h.rms_eps, m_h.data());
-    trace("result_norm", -1, m_h.data(), n_embd);
-    set_input(m_h.data(), n_embd);
-    matmul(m_model->output(), logits);
-    trace("result_output", -1, logits, h.n_vocab);
+
+    const float* last = m_x.data() + (count - 1) * n_embd;
+    rms_norm(last, m_model->output_norm(), n_embd, h.rms_eps, m_h.data());
+    matmul(m_model->output(), m_h.data(), n_embd, 1, logits, h.n_vocab);
 }
 
 }
