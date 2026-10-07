@@ -12,9 +12,6 @@ namespace faisca
 namespace
 {
 
-constexpr size_t Q8_0_BLOCK = 32;
-constexpr size_t Q8_0_BLOCK_BYTES = 34;
-
 bool get_u32(const GgufFile& file, const char* key, uint32_t& out, bool required, Error& error)
 {
     uint64_t value = 0;
@@ -37,14 +34,51 @@ bool get_u32(const GgufFile& file, const char* key, uint32_t& out, bool required
 
 }
 
+size_t Weight::row_bytes() const
+{
+    switch (type)
+    {
+        case GgmlType::Q8_0:
+            return n_in / Q8_0_BLOCK * Q8_0_BLOCK_BYTES;
+        default:
+            return n_in * sizeof(float);
+    }
+}
+
+void Weight::row(size_t index, float* out) const
+{
+    const uint8_t* source = data + index * row_bytes();
+    if (type == GgmlType::Q8_0)
+    {
+        dequantize_q8_0(source, n_in, out);
+        return;
+    }
+    std::memcpy(out, source, n_in * sizeof(float));
+}
+
 void LlamaModel::release()
 {
     m_storage.release();
     m_layers.release();
-    m_token_embd = nullptr;
+    m_token_embd = Weight();
     m_output_norm = nullptr;
-    m_output = nullptr;
+    m_output = Weight();
     m_hparams = LlamaHparams();
+    m_dequantize = false;
+}
+
+size_t LlamaModel::weight_bytes() const
+{
+    size_t bytes = m_output.row_bytes() * m_output.n_out;
+    for (const LlamaLayer& layer : m_layers)
+    {
+        for (const Weight* w : {&layer.wq, &layer.wk, &layer.wv, &layer.wo, &layer.ffn_gate, &layer.ffn_up, &layer.ffn_down})
+        {
+            bytes += w->row_bytes() * w->n_out;
+        }
+        bytes += 2 * m_hparams.n_embd * sizeof(float);
+    }
+    return bytes;
 }
 
 bool LlamaModel::load_hparams(const GgufFile& file, Error& error)
@@ -163,7 +197,12 @@ const GgufTensor* LlamaModel::find(const GgufFile& file, const char* name, int l
     }
     if (tensor->type != GgmlType::F32 && tensor->type != GgmlType::F16 && tensor->type != GgmlType::Q8_0)
     {
-        error.set("tensor %s is %s, the float32 runner reads F32, F16 and Q8_0", full, ggml_type_info(tensor->type)->name);
+        error.set("tensor %s is %s, the runner reads F32, F16 and Q8_0", full, ggml_type_info(tensor->type)->name);
+        return nullptr;
+    }
+    if (dims == 1 && tensor->type != GgmlType::F32 && tensor->type != GgmlType::F16)
+    {
+        error.set("tensor %s is %s, a norm must be F32 or F16", full, ggml_type_info(tensor->type)->name);
         return nullptr;
     }
     if (tensor->type == GgmlType::Q8_0 && tensor->dims[0] % Q8_0_BLOCK != 0)
@@ -176,7 +215,7 @@ const GgufTensor* LlamaModel::find(const GgufFile& file, const char* name, int l
 
 bool LlamaModel::count_storage(const GgufTensor* tensor, size_t& elements, Error& error) const
 {
-    if (tensor == nullptr || tensor->type == GgmlType::F32)
+    if (tensor == nullptr || tensor->type == GgmlType::F32 || (tensor->type == GgmlType::Q8_0 && !m_dequantize))
     {
         return true;
     }
@@ -189,20 +228,28 @@ bool LlamaModel::count_storage(const GgufTensor* tensor, size_t& elements, Error
     return true;
 }
 
-const float* LlamaModel::materialize(const GgufTensor* tensor)
+Weight LlamaModel::materialize(const GgufTensor* tensor)
 {
+    Weight weight;
     if (tensor == nullptr)
     {
-        return nullptr;
+        return weight;
     }
-    if (tensor->type == GgmlType::F32)
+    weight.n_in = static_cast<size_t>(tensor->dims[0]);
+    weight.n_out = tensor->n_dims > 1 ? static_cast<size_t>(tensor->dims[1]) : 1;
+
+    if (tensor->type == GgmlType::F32 || (tensor->type == GgmlType::Q8_0 && !m_dequantize))
     {
-        return reinterpret_cast<const float*>(tensor->data);
+        weight.type = tensor->type;
+        weight.data = tensor->data;
+        return weight;
     }
 
     const size_t count = static_cast<size_t>(tensor->n_elements);
     float* out = m_storage.data() + m_storage.size();
     m_storage.resize_uninitialized(m_storage.size() + count);
+    weight.type = GgmlType::F32;
+    weight.data = reinterpret_cast<const uint8_t*>(out);
 
     if (tensor->type == GgmlType::F16)
     {
@@ -213,28 +260,17 @@ const float* LlamaModel::materialize(const GgufTensor* tensor)
             std::memcpy(&bits, src + i * 2, 2);
             out[i] = f16_to_f32(bits);
         }
-        return out;
+        return weight;
     }
 
-    const uint8_t* block = tensor->data;
-    for (size_t i = 0; i < count; i += Q8_0_BLOCK)
-    {
-        uint16_t bits = 0;
-        std::memcpy(&bits, block, 2);
-        const float d = f16_to_f32(bits);
-        const int8_t* q = reinterpret_cast<const int8_t*>(block + 2);
-        for (size_t j = 0; j < Q8_0_BLOCK; ++j)
-        {
-            out[i + j] = static_cast<float>(q[j]) * d;
-        }
-        block += Q8_0_BLOCK_BYTES;
-    }
-    return out;
+    dequantize_q8_0(tensor->data, count, out);
+    return weight;
 }
 
-bool LlamaModel::load(const GgufFile& file, Error& error)
+bool LlamaModel::load(const GgufFile& file, Error& error, bool dequantize)
 {
     release();
+    m_dequantize = dequantize;
     if (!load_hparams(file, error))
     {
         return false;
@@ -301,22 +337,22 @@ bool LlamaModel::load(const GgufFile& file, Error& error)
 
     if (!m_storage.reserve(elements))
     {
-        error.set("out of memory: %zu MiB needed for the dequantized weights", elements * sizeof(float) >> 20);
+        error.set("out of memory: %zu MiB needed for the converted weights", elements * sizeof(float) >> 20);
         return false;
     }
 
     m_token_embd = materialize(token_embd);
-    m_output_norm = materialize(output_norm);
+    m_output_norm = materialize(output_norm).f32();
     m_output = output != nullptr ? materialize(output) : m_token_embd;
     for (const LayerTensors& t : layers)
     {
         LlamaLayer layer;
-        layer.attn_norm = materialize(t.tensors[0]);
+        layer.attn_norm = materialize(t.tensors[0]).f32();
         layer.wq = materialize(t.tensors[1]);
         layer.wk = materialize(t.tensors[2]);
         layer.wv = materialize(t.tensors[3]);
         layer.wo = materialize(t.tensors[4]);
-        layer.ffn_norm = materialize(t.tensors[5]);
+        layer.ffn_norm = materialize(t.tensors[5]).f32();
         layer.ffn_gate = materialize(t.tensors[6]);
         layer.ffn_up = materialize(t.tensors[7]);
         layer.ffn_down = materialize(t.tensors[8]);

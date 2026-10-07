@@ -60,6 +60,10 @@ private:
     void attention(const LlamaLayer& layer, int il, uint32_t pos);
     void trace(const char* name, int layer, const float* data, size_t count) const;
 
+    // the vector every following matmul multiplies; quantized once if a weight needs it
+    void set_input(const float* x, size_t n);
+    void matmul(const Weight& w, float* out);
+
     const LlamaModel* m_model = nullptr;
     uint32_t m_n_ctx = 0;
     uint32_t m_pos = 0;
@@ -77,6 +81,11 @@ private:
     Array<float> m_up;
     Array<float> m_act;
     Array<float> m_scores;
+
+    const float* m_input = nullptr;
+    size_t m_input_size = 0;
+    bool m_input_quantized = false;
+    Array<uint8_t> m_input_q8;
 };
 
 }

@@ -10,7 +10,7 @@
 #include <string>
 #include <vector>
 
-// usage: runner_dump <model.gguf> <out.bin> <generate N> <token ids...>
+// usage: runner_dump [--dequantize] <model.gguf> <out.bin> <generate N> <token ids...>
 //
 // Same output as tests/reference/llama_layer_dump.cpp: every traced vector of
 // every prompt token, assembled per name into [values, tokens], then N greedy
@@ -53,9 +53,16 @@ void trace(void* user, const char* name, int layer, const float* data, size_t co
 
 int main(int argc, char** argv)
 {
+    bool dequantize = false;
+    if (argc > 1 && std::strcmp(argv[1], "--dequantize") == 0)
+    {
+        dequantize = true;
+        ++argv;
+        --argc;
+    }
     if (argc < 5)
     {
-        std::fprintf(stderr, "usage: runner_dump <model.gguf> <out.bin> <generate N> <token ids...>\n");
+        std::fprintf(stderr, "usage: runner_dump [--dequantize] <model.gguf> <out.bin> <generate N> <token ids...>\n");
         return 2;
     }
 
@@ -71,7 +78,7 @@ int main(int argc, char** argv)
     faisca::LlamaModel model;
     faisca::Runner runner;
     const uint32_t n_ctx = static_cast<uint32_t>(prompt.size() + static_cast<size_t>(generate) + 1);
-    if (!file.open(argv[1], error) || !model.load(file, error) || !runner.init(model, n_ctx, error))
+    if (!file.open(argv[1], error) || !model.load(file, error, dequantize) || !runner.init(model, n_ctx, error))
     {
         std::fprintf(stderr, "runner_dump: %s\n", error.c_str());
         return 1;

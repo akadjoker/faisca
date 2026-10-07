@@ -3,8 +3,22 @@
 #include <cmath>
 #include <cstring>
 
+#if defined(__AVX2__) && defined(__FMA__) && defined(__F16C__)
+#include <immintrin.h>
+#define FAISCA_AVX2 1
+#endif
+
 namespace faisca
 {
+
+const char* simd_name()
+{
+#if defined(FAISCA_AVX2)
+    return "AVX2+FMA+F16C";
+#else
+    return "scalar";
+#endif
+}
 
 float f16_to_f32(uint16_t bits)
 {
@@ -32,6 +46,188 @@ float f16_to_f32(uint16_t bits)
     float value = 0.0f;
     std::memcpy(&value, &out, 4);
     return value;
+}
+
+uint16_t f32_to_f16(float value)
+{
+    uint32_t w = 0;
+    std::memcpy(&w, &value, 4);
+    const uint32_t sign = w & 0x80000000u;
+    const uint32_t magnitude = w & 0x7fffffffu;
+
+    if (magnitude >= 0x7f800000u)
+    {
+        // infinity keeps its exponent, NaN keeps a payload bit
+        const uint32_t mantissa = magnitude & 0x7fffffu;
+        return static_cast<uint16_t>((sign >> 16) | 0x7c00u | (mantissa != 0 ? 0x200u : 0));
+    }
+    if (magnitude >= 0x477ff000u)
+    {
+        // rounds to or beyond the largest half
+        return static_cast<uint16_t>((sign >> 16) | 0x7c00u);
+    }
+    if (magnitude < 0x33000000u)
+    {
+        // below half the smallest subnormal
+        return static_cast<uint16_t>(sign >> 16);
+    }
+
+    uint32_t exponent = magnitude >> 23;
+    uint32_t mantissa = magnitude & 0x7fffffu;
+    uint32_t shift = 13;
+    if (exponent < 113)
+    {
+        // subnormal half: the hidden bit joins the mantissa and more bits are dropped
+        mantissa |= 0x800000u;
+        shift += 113 - exponent;
+        exponent = 0;
+    }
+    else
+    {
+        exponent -= 112;
+    }
+
+    const uint32_t dropped = mantissa & ((1u << shift) - 1);
+    const uint32_t half_way = 1u << (shift - 1);
+    uint32_t result = (exponent << 10) | (mantissa >> shift);
+    if (dropped > half_way || (dropped == half_way && (result & 1u) != 0))
+    {
+        ++result; // a carry moves into the exponent on its own
+    }
+    return static_cast<uint16_t>((sign >> 16) | result);
+}
+
+void quantize_q8_0(const float* x, size_t n, uint8_t* out)
+{
+    for (size_t i = 0; i < n; i += Q8_0_BLOCK)
+    {
+        float amax = 0.0f;
+        for (size_t j = 0; j < Q8_0_BLOCK; ++j)
+        {
+            const float a = std::fabs(x[i + j]);
+            amax = a > amax ? a : amax;
+        }
+        const float d = amax / 127.0f;
+        const float id = amax != 0.0f ? 127.0f / amax : 0.0f;
+
+        const uint16_t bits = f32_to_f16(d);
+        std::memcpy(out, &bits, 2);
+        int8_t* q = reinterpret_cast<int8_t*>(out + 2);
+        for (size_t j = 0; j < Q8_0_BLOCK; ++j)
+        {
+            q[j] = static_cast<int8_t>(std::nearbyint(x[i + j] * id));
+        }
+        out += Q8_0_BLOCK_BYTES;
+    }
+}
+
+void dequantize_q8_0(const uint8_t* blocks, size_t n, float* out)
+{
+    for (size_t i = 0; i < n; i += Q8_0_BLOCK)
+    {
+        uint16_t bits = 0;
+        std::memcpy(&bits, blocks, 2);
+        const float d = f16_to_f32(bits);
+        const int8_t* q = reinterpret_cast<const int8_t*>(blocks + 2);
+        for (size_t j = 0; j < Q8_0_BLOCK; ++j)
+        {
+            out[i + j] = static_cast<float>(q[j]) * d;
+        }
+        blocks += Q8_0_BLOCK_BYTES;
+    }
+}
+
+float dot_q8_0_scalar(const uint8_t* a, const uint8_t* b, size_t n)
+{
+    float sum = 0.0f;
+    for (size_t i = 0; i < n; i += Q8_0_BLOCK)
+    {
+        uint16_t da = 0;
+        uint16_t db = 0;
+        std::memcpy(&da, a, 2);
+        std::memcpy(&db, b, 2);
+        const int8_t* qa = reinterpret_cast<const int8_t*>(a + 2);
+        const int8_t* qb = reinterpret_cast<const int8_t*>(b + 2);
+        int32_t sumi = 0;
+        for (size_t j = 0; j < Q8_0_BLOCK; ++j)
+        {
+            sumi += static_cast<int32_t>(qa[j]) * qb[j];
+        }
+        sum += static_cast<float>(sumi) * (f16_to_f32(da) * f16_to_f32(db));
+        a += Q8_0_BLOCK_BYTES;
+        b += Q8_0_BLOCK_BYTES;
+    }
+    return sum;
+}
+
+#if defined(FAISCA_AVX2)
+
+namespace
+{
+
+// the 8 lanes each hold the sum of 4 products, as ggml's mul_sum_i8_pairs_float
+inline __m256 sum_i8_products(__m256i x, __m256i y)
+{
+    const __m256i ax = _mm256_sign_epi8(x, x);
+    const __m256i sy = _mm256_sign_epi8(y, x);
+    const __m256i dot = _mm256_maddubs_epi16(ax, sy);
+    const __m256i ones = _mm256_set1_epi16(1);
+    return _mm256_cvtepi32_ps(_mm256_madd_epi16(ones, dot));
+}
+
+inline float horizontal_sum(__m256 x)
+{
+    __m128 r = _mm256_extractf128_ps(x, 1);
+    r = _mm_add_ps(r, _mm256_castps256_ps128(x));
+    r = _mm_add_ps(r, _mm_movehl_ps(r, r));
+    r = _mm_add_ss(r, _mm_movehdup_ps(r));
+    return _mm_cvtss_f32(r);
+}
+
+// product of the two f16 block scales, converted with F16C
+inline __m256 block_scale(const uint8_t* a, const uint8_t* b)
+{
+    uint16_t bits_a = 0;
+    uint16_t bits_b = 0;
+    std::memcpy(&bits_a, a, 2);
+    std::memcpy(&bits_b, b, 2);
+    const __m128 scales = _mm_cvtph_ps(_mm_cvtsi32_si128(static_cast<int>(bits_a) | (static_cast<int>(bits_b) << 16)));
+    const __m128 product = _mm_mul_ss(scales, _mm_shuffle_ps(scales, scales, 1));
+    return _mm256_broadcastss_ps(product);
+}
+
+}
+
+float dot_q8_0(const uint8_t* a, const uint8_t* b, size_t n)
+{
+    __m256 acc = _mm256_setzero_ps();
+    for (size_t i = 0; i < n; i += Q8_0_BLOCK)
+    {
+        const __m256i qa = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(a + 2));
+        const __m256i qb = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(b + 2));
+        acc = _mm256_fmadd_ps(block_scale(a, b), sum_i8_products(qa, qb), acc);
+        a += Q8_0_BLOCK_BYTES;
+        b += Q8_0_BLOCK_BYTES;
+    }
+    return horizontal_sum(acc);
+}
+
+#else
+
+float dot_q8_0(const uint8_t* a, const uint8_t* b, size_t n)
+{
+    return dot_q8_0_scalar(a, b, n);
+}
+
+#endif
+
+void matvec_q8_0(const uint8_t* w, const uint8_t* xq, size_t n_in, size_t n_out, float* out)
+{
+    const size_t stride = n_in / Q8_0_BLOCK * Q8_0_BLOCK_BYTES;
+    for (size_t o = 0; o < n_out; ++o)
+    {
+        out[o] = dot_q8_0(w + o * stride, xq, n_in);
+    }
 }
 
 float dot(const float* a, const float* b, size_t n)

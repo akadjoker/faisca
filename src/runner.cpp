@@ -24,6 +24,10 @@ void Runner::release()
     m_up.release();
     m_act.release();
     m_scores.release();
+    m_input = nullptr;
+    m_input_size = 0;
+    m_input_quantized = false;
+    m_input_q8.release();
 }
 
 bool Runner::init(const LlamaModel& model, uint32_t n_ctx, Error& error)
@@ -50,10 +54,12 @@ bool Runner::init(const LlamaModel& model, uint32_t n_ctx, Error& error)
         return false;
     }
 
+    const size_t widest = h.n_ff > h.n_embd ? h.n_ff : h.n_embd;
     if (!m_k.resize_uninitialized(cache) || !m_v.resize_uninitialized(cache) || !m_x.resize_uninitialized(h.n_embd) ||
         !m_h.resize_uninitialized(h.n_embd) || !m_q.resize_uninitialized(n_q) || !m_attn.resize_uninitialized(n_q) ||
         !m_gate.resize_uninitialized(h.n_ff) || !m_up.resize_uninitialized(h.n_ff) ||
-        !m_act.resize_uninitialized(h.n_ff) || !m_scores.resize_uninitialized(n_ctx))
+        !m_act.resize_uninitialized(h.n_ff) || !m_scores.resize_uninitialized(n_ctx) ||
+        !m_input_q8.resize_uninitialized((widest / Q8_0_BLOCK + 1) * Q8_0_BLOCK_BYTES))
     {
         release();
         error.set("out of memory: the KV cache for %" PRIu32 " positions needs %zu MiB", n_ctx,
@@ -117,6 +123,28 @@ void Runner::trace(const char* name, int layer, const float* data, size_t count)
     }
 }
 
+void Runner::set_input(const float* x, size_t n)
+{
+    m_input = x;
+    m_input_size = n;
+    m_input_quantized = false;
+}
+
+void Runner::matmul(const Weight& w, float* out)
+{
+    if (w.type == GgmlType::Q8_0)
+    {
+        if (!m_input_quantized)
+        {
+            quantize_q8_0(m_input, m_input_size, m_input_q8.data());
+            m_input_quantized = true;
+        }
+        matvec_q8_0(w.data, m_input_q8.data(), w.n_in, w.n_out, out);
+        return;
+    }
+    matvec(w.f32(), m_input, w.n_in, w.n_out, out);
+}
+
 void Runner::attention(const LlamaLayer& layer, int il, uint32_t pos)
 {
     const LlamaHparams& h = m_model->hparams();
@@ -130,9 +158,10 @@ void Runner::attention(const LlamaLayer& layer, int il, uint32_t pos)
     float* k_cur = k_cache + static_cast<size_t>(pos) * n_kv;
     float* v_cur = v_cache + static_cast<size_t>(pos) * n_kv;
 
-    matvec(layer.wq, m_h.data(), h.n_embd, static_cast<size_t>(h.n_head) * head_dim, m_q.data());
-    matvec(layer.wk, m_h.data(), h.n_embd, n_kv, k_cur);
-    matvec(layer.wv, m_h.data(), h.n_embd, n_kv, v_cur);
+    set_input(m_h.data(), h.n_embd);
+    matmul(layer.wq, m_q.data());
+    matmul(layer.wk, k_cur);
+    matmul(layer.wv, v_cur);
 
     rope_norm(m_q.data(), h.n_head, head_dim, h.n_rot, pos, h.rope_freq_base);
     rope_norm(k_cur, h.n_head_kv, head_dim, h.n_rot, pos, h.rope_freq_base);
@@ -168,7 +197,8 @@ void Runner::attention(const LlamaLayer& layer, int il, uint32_t pos)
         }
     }
 
-    matvec(layer.wo, m_attn.data(), static_cast<size_t>(h.n_head) * head_dim, h.n_embd, m_h.data());
+    set_input(m_attn.data(), static_cast<size_t>(h.n_head) * head_dim);
+    matmul(layer.wo, m_h.data());
     trace("attn_out", il, m_h.data(), h.n_embd);
 }
 
@@ -177,7 +207,7 @@ void Runner::forward_one(int32_t token, uint32_t pos, float* logits)
     const LlamaHparams& h = m_model->hparams();
     const size_t n_embd = h.n_embd;
 
-    std::memcpy(m_x.data(), m_model->token_embd() + static_cast<size_t>(token) * n_embd, n_embd * sizeof(float));
+    m_model->token_embd().row(static_cast<size_t>(token), m_x.data());
     trace("inp_embd", -1, m_x.data(), n_embd);
 
     for (uint32_t l = 0; l < h.n_layer; ++l)
@@ -195,13 +225,15 @@ void Runner::forward_one(int32_t token, uint32_t pos, float* logits)
         rms_norm(m_x.data(), layer.ffn_norm, n_embd, h.rms_eps, m_h.data());
         trace("ffn_norm", il, m_h.data(), n_embd);
 
-        matvec(layer.ffn_gate, m_h.data(), n_embd, h.n_ff, m_gate.data());
-        matvec(layer.ffn_up, m_h.data(), n_embd, h.n_ff, m_up.data());
+        set_input(m_h.data(), n_embd);
+        matmul(layer.ffn_gate, m_gate.data());
+        matmul(layer.ffn_up, m_up.data());
         trace("ffn_gate", il, m_gate.data(), h.n_ff);
         trace("ffn_up", il, m_up.data(), h.n_ff);
         swiglu(m_gate.data(), m_up.data(), h.n_ff, m_act.data());
         trace("ffn_swiglu", il, m_act.data(), h.n_ff);
-        matvec(layer.ffn_down, m_act.data(), h.n_ff, n_embd, m_h.data());
+        set_input(m_act.data(), h.n_ff);
+        matmul(layer.ffn_down, m_h.data());
         trace("ffn_out", il, m_h.data(), n_embd);
 
         add(m_x.data(), m_h.data(), n_embd);
@@ -214,7 +246,8 @@ void Runner::forward_one(int32_t token, uint32_t pos, float* logits)
     }
     rms_norm(m_x.data(), m_model->output_norm(), n_embd, h.rms_eps, m_h.data());
     trace("result_norm", -1, m_h.data(), n_embd);
-    matvec(m_model->output(), m_h.data(), n_embd, h.n_vocab, logits);
+    set_input(m_h.data(), n_embd);
+    matmul(m_model->output(), logits);
     trace("result_output", -1, logits, h.n_vocab);
 }
 

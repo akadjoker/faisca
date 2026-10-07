@@ -25,22 +25,41 @@ struct LlamaHparams
     float rope_freq_base = 10000.0f;
 };
 
-// every weight is float32: n_out rows of n_in values
+// a matrix of n_out rows of n_in values, F32 or Q8_0, in the file's own layout
+struct Weight
+{
+    GgmlType type = GgmlType::F32;
+    const uint8_t* data = nullptr;
+    size_t n_in = 0;
+    size_t n_out = 0;
+
+    const float* f32() const
+    {
+        return reinterpret_cast<const float*>(data);
+    }
+
+    size_t row_bytes() const;
+
+    // one row as float32
+    void row(size_t index, float* out) const;
+};
+
 struct LlamaLayer
 {
     const float* attn_norm;
-    const float* wq;
-    const float* wk;
-    const float* wv;
-    const float* wo;
+    Weight wq;
+    Weight wk;
+    Weight wv;
+    Weight wo;
     const float* ffn_norm;
-    const float* ffn_gate;
-    const float* ffn_up;
-    const float* ffn_down;
+    Weight ffn_gate;
+    Weight ffn_up;
+    Weight ffn_down;
 };
 
-// the llama architecture in float32. F32 tensors are used in place in the mapped
-// file, F16 and Q8_0 tensors are dequantized at load. The GGUF file must stay open.
+// the llama architecture. F32 and Q8_0 tensors are used in place in the mapped
+// file, F16 tensors are converted to float32 at load. With dequantize set, Q8_0
+// is converted to float32 too. The GGUF file must stay open.
 class LlamaModel
 {
 public:
@@ -49,13 +68,13 @@ public:
     LlamaModel(const LlamaModel&) = delete;
     LlamaModel& operator=(const LlamaModel&) = delete;
 
-    bool load(const GgufFile& file, Error& error);
+    bool load(const GgufFile& file, Error& error, bool dequantize = false);
 
     void release();
 
     bool is_loaded() const
     {
-        return m_token_embd != nullptr;
+        return m_token_embd.data != nullptr;
     }
 
     const LlamaHparams& hparams() const
@@ -63,7 +82,7 @@ public:
         return m_hparams;
     }
 
-    const float* token_embd() const
+    const Weight& token_embd() const
     {
         return m_token_embd;
     }
@@ -73,14 +92,14 @@ public:
         return m_output_norm;
     }
 
-    const float* output() const
+    const Weight& output() const
     {
         return m_output;
     }
 
     bool tied_output() const
     {
-        return m_output == m_token_embd;
+        return m_output.data == m_token_embd.data;
     }
 
     const LlamaLayer& layer(size_t index) const
@@ -88,24 +107,28 @@ public:
         return m_layers[index];
     }
 
-    size_t dequantized_bytes() const
+    size_t converted_bytes() const
     {
         return m_storage.size() * sizeof(float);
     }
+
+    // bytes the forward pass reads per token
+    size_t weight_bytes() const;
 
 private:
     bool load_hparams(const GgufFile& file, Error& error);
     const GgufTensor* find(const GgufFile& file, const char* name, int layer, uint64_t n0, uint64_t n1, bool required,
                            Error& error) const;
     bool count_storage(const GgufTensor* tensor, size_t& elements, Error& error) const;
-    const float* materialize(const GgufTensor* tensor);
+    Weight materialize(const GgufTensor* tensor);
 
     LlamaHparams m_hparams;
+    bool m_dequantize = false;
     Array<float> m_storage;
     Array<LlamaLayer> m_layers;
-    const float* m_token_embd = nullptr;
+    Weight m_token_embd;
     const float* m_output_norm = nullptr;
-    const float* m_output = nullptr;
+    Weight m_output;
 };
 
 }

@@ -43,8 +43,8 @@ def read_dump(path: str) -> dict[str, np.ndarray]:
     return tensors
 
 
-def run(tool: str, model: str, out: str, generate: int, tokens: list[int]) -> list[int]:
-    command = [tool, model, out, str(generate)] + [str(t) for t in tokens]
+def run(tool: str, model: str, out: str, generate: int, tokens: list[int], flags: list[str]) -> list[int]:
+    command = [tool] + flags + [model, out, str(generate)] + [str(t) for t in tokens]
     result = subprocess.run(command, capture_output=True)
     if result.returncode != 0:
         raise RuntimeError(f"{tool}: {result.stderr.decode('utf-8', 'replace').strip()}")
@@ -64,11 +64,13 @@ def main() -> int:
     parser.add_argument("--rel", type=float, default=1e-5, help="largest relative L2 error")
     parser.add_argument("--abs", type=float, default=1e-4, help="largest difference, relative to the tensor's largest magnitude")
     parser.add_argument("--quiet", action="store_true")
+    parser.add_argument("--dequantize", action="store_true", help="faisca converts every weight to float32 at load")
     args = parser.parse_args()
 
     with tempfile.NamedTemporaryFile(suffix=".bin") as ours_file, tempfile.NamedTemporaryFile(suffix=".bin") as ref_file:
-        ours_generated = run(args.ours, args.model, ours_file.name, args.generate, args.tokens)
-        ref_generated = run(args.reference, args.model, ref_file.name, args.generate, args.tokens)
+        ours_generated = run(args.ours, args.model, ours_file.name, args.generate, args.tokens,
+                             ["--dequantize"] if args.dequantize else [])
+        ref_generated = run(args.reference, args.model, ref_file.name, args.generate, args.tokens, [])
         ours = read_dump(ours_file.name)
         reference = read_dump(ref_file.name)
 

@@ -6,6 +6,10 @@
 #include <random>
 #include <vector>
 
+#if defined(__F16C__)
+#include <immintrin.h>
+#endif
+
 using namespace faisca;
 
 namespace
@@ -80,6 +84,164 @@ void test_f16()
         exact = exact && static_cast<double>(f16_to_f32(static_cast<uint16_t>(h))) == expected;
     }
     CHECK(exact);
+}
+
+void test_f32_to_f16()
+{
+    CHECK(f32_to_f16(0.0f) == 0x0000);
+    CHECK(f32_to_f16(-0.0f) == 0x8000);
+    CHECK(f32_to_f16(1.0f) == 0x3c00);
+    CHECK(f32_to_f16(-2.0f) == 0xc000);
+    CHECK(f32_to_f16(65504.0f) == 0x7bff);
+    CHECK(f32_to_f16(65519.0f) == 0x7bff);
+    CHECK(f32_to_f16(65520.0f) == 0x7c00);
+    CHECK(f32_to_f16(1e10f) == 0x7c00);
+    CHECK(f32_to_f16(-1e10f) == 0xfc00);
+    CHECK(f32_to_f16(5.960464477539063e-08f) == 0x0001);
+    CHECK(f32_to_f16(2.9802322387695312e-08f) == 0x0000);
+    CHECK(f32_to_f16(2.98023224e-08f * 1.5f) == 0x0001);
+    CHECK(f32_to_f16(6.103515625e-05f) == 0x0400);
+    CHECK((f32_to_f16(std::nanf("")) & 0x7c00) == 0x7c00 && (f32_to_f16(std::nanf("")) & 0x3ff) != 0);
+    CHECK(f32_to_f16(1.0f + 1.0f / 2048.0f) == 0x3c00);
+    CHECK(f32_to_f16(1.0f + 3.0f / 2048.0f) == 0x3c02);
+    CHECK(f32_to_f16(1.0f + 1.0f / 1024.0f) == 0x3c01);
+
+    bool round_trip = true;
+    for (uint32_t h = 0; h < 0x10000; ++h)
+    {
+        if (((h >> 10) & 0x1f) == 31)
+        {
+            continue;
+        }
+        round_trip = round_trip && f32_to_f16(f16_to_f32(static_cast<uint16_t>(h))) == h;
+    }
+    CHECK(round_trip);
+
+#if defined(__F16C__)
+    std::mt19937 rng(23);
+    std::uniform_int_distribution<uint32_t> any_bits(0, 0xffffffffu);
+    std::uniform_real_distribution<float> small(-70000.0f, 70000.0f);
+    bool same_as_f16c = true;
+    for (int i = 0; i < 2000000 && same_as_f16c; ++i)
+    {
+        float value = 0.0f;
+        if (i % 2 == 0)
+        {
+            const uint32_t bits = any_bits(rng);
+            std::memcpy(&value, &bits, 4);
+        }
+        else
+        {
+            value = small(rng);
+        }
+        if (std::isnan(value))
+        {
+            continue;
+        }
+        same_as_f16c = f32_to_f16(value) == static_cast<uint16_t>(_cvtss_sh(value, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
+        if (!same_as_f16c)
+        {
+            std::fprintf(stderr, "  f32_to_f16(%a) = %04x, F16C gives %04x\n", static_cast<double>(value),
+                         f32_to_f16(value), _cvtss_sh(value, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
+        }
+    }
+    CHECK(same_as_f16c);
+#endif
+}
+
+void test_q8_0()
+{
+    std::mt19937 rng(29);
+    const size_t n = 2560;
+    std::vector<float> x = random_values(rng, n, 1.5f);
+    x[5] = 0.0f;
+    for (size_t i = 64; i < 96; ++i)
+    {
+        x[i] = 0.0f; // a block of zeros
+    }
+    x[100] = 3.0f;
+    x[101] = -3.0f; // ties round to even: 127 * 3 / 3 = 127 exactly, no tie, but amax decides the scale
+
+    std::vector<uint8_t> xq(n / Q8_0_BLOCK * Q8_0_BLOCK_BYTES);
+    quantize_q8_0(x.data(), n, xq.data());
+
+    bool blocks_ok = true;
+    for (size_t b = 0; b < n / Q8_0_BLOCK; ++b)
+    {
+        const uint8_t* block = xq.data() + b * Q8_0_BLOCK_BYTES;
+        uint16_t bits = 0;
+        std::memcpy(&bits, block, 2);
+        float amax = 0.0f;
+        for (size_t j = 0; j < Q8_0_BLOCK; ++j)
+        {
+            amax = std::fabs(x[b * Q8_0_BLOCK + j]) > amax ? std::fabs(x[b * Q8_0_BLOCK + j]) : amax;
+        }
+        blocks_ok = blocks_ok && bits == f32_to_f16(amax / 127.0f);
+        const float id = amax != 0.0f ? 127.0f / amax : 0.0f;
+        for (size_t j = 0; j < Q8_0_BLOCK; ++j)
+        {
+            const int8_t q = static_cast<int8_t>(block[2 + j]);
+            blocks_ok = blocks_ok && q == static_cast<int8_t>(std::nearbyint(x[b * Q8_0_BLOCK + j] * id));
+            blocks_ok = blocks_ok && q != -128;
+        }
+    }
+    CHECK(blocks_ok);
+
+    std::vector<float> back(n);
+    dequantize_q8_0(xq.data(), n, back.data());
+    double error = 0.0;
+    double energy = 0.0;
+    for (size_t i = 0; i < n; ++i)
+    {
+        error += (static_cast<double>(back[i]) - x[i]) * (static_cast<double>(back[i]) - x[i]);
+        energy += static_cast<double>(x[i]) * x[i];
+    }
+    CHECK(std::sqrt(error / energy) < 0.01);
+    CHECK(back[64] == 0.0f && back[90] == 0.0f);
+
+    const std::vector<float> w = random_values(rng, n, 0.05f);
+    std::vector<uint8_t> wq(xq.size());
+    quantize_q8_0(w.data(), n, wq.data());
+    std::vector<float> w_back(n);
+    dequantize_q8_0(wq.data(), n, w_back.data());
+
+    double expected = 0.0;
+    for (size_t i = 0; i < n; ++i)
+    {
+        expected += static_cast<double>(w_back[i]) * back[i];
+    }
+    const float scalar = dot_q8_0_scalar(wq.data(), xq.data(), n);
+    const float fast = dot_q8_0(wq.data(), xq.data(), n);
+    CHECK(close(scalar, expected, 1e-5));
+    CHECK(close(fast, expected, 1e-5));
+    CHECK(close(fast, scalar, 1e-6));
+
+    const size_t n_out = 17;
+    std::vector<uint8_t> matrix;
+    std::vector<float> rows_back;
+    for (size_t o = 0; o < n_out; ++o)
+    {
+        const std::vector<float> row = random_values(rng, n, 0.05f);
+        std::vector<uint8_t> rq(xq.size());
+        quantize_q8_0(row.data(), n, rq.data());
+        matrix.insert(matrix.end(), rq.begin(), rq.end());
+        std::vector<float> rb(n);
+        dequantize_q8_0(rq.data(), n, rb.data());
+        rows_back.insert(rows_back.end(), rb.begin(), rb.end());
+    }
+    std::vector<float> out(n_out);
+    matvec_q8_0(matrix.data(), xq.data(), n, n_out, out.data());
+    bool all_close = true;
+    for (size_t o = 0; o < n_out; ++o)
+    {
+        double e = 0.0;
+        for (size_t i = 0; i < n; ++i)
+        {
+            e += static_cast<double>(rows_back[o * n + i]) * back[i];
+        }
+        all_close = all_close && close(out[o], e, 1e-5);
+    }
+    CHECK(all_close);
 }
 
 void test_dot_and_matvec()
@@ -265,6 +427,8 @@ void test_swiglu_and_add()
 int main()
 {
     test_f16();
+    test_f32_to_f16();
+    test_q8_0();
     test_dot_and_matvec();
     test_rms_norm();
     test_rope();

@@ -14,6 +14,7 @@ option(FAISCA_BUILD_CLI "Build the faisca command line tool" ON)
 option(FAISCA_BUILD_TESTS "Build the tests" ON)
 option(FAISCA_BUILD_BENCH "Build the benchmarks" OFF)
 option(FAISCA_SANITIZE "Build with AddressSanitizer and UndefinedBehaviorSanitizer" OFF)
+option(FAISCA_NATIVE "Compile for the CPU of this machine (-march=native)" ON)
 set(FAISCA_CT_DIR "" CACHE PATH
     "Checkout of github.com/akadjoker/containers, adds the ct candidates to the benchmarks")
 set(FAISCA_LLAMA_DIR "" CACHE PATH
@@ -23,6 +24,10 @@ if(MSVC)
     set(FAISCA_WARNINGS /W4 /WX)
 else()
     set(FAISCA_WARNINGS -Wall -Wextra -Wpedantic -Wshadow -Wconversion -Werror)
+endif()
+
+if(FAISCA_NATIVE AND NOT MSVC)
+    add_compile_options(-march=native)
 endif()
 
 if(FAISCA_SANITIZE AND NOT MSVC)
@@ -77,6 +82,10 @@ if(FAISCA_BUILD_TESTS)
     add_executable(runner_dump tests/runner_dump.cpp)
     target_link_libraries(runner_dump PRIVATE faisca_lib)
     target_compile_options(runner_dump PRIVATE ${FAISCA_WARNINGS})
+
+    add_executable(matmul_check tests/matmul_check.cpp)
+    target_link_libraries(matmul_check PRIVATE faisca_lib)
+    target_compile_options(matmul_check PRIVATE ${FAISCA_WARNINGS})
 
     add_executable(gguf_dump tests/gguf_dump.cpp)
     target_link_libraries(gguf_dump PRIVATE faisca_lib)
