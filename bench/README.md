@@ -105,6 +105,56 @@ ggml copies every string into its own heap allocation, faisca keeps views into
 the mapped file. `gguf_find_tensor` is a linear search; llama.cpp's model
 loader builds its own map on top of it, which this does not measure.
 
+## Tokenizer against llama.cpp
+
+`bench_tokenizer` loads the same vocabulary with llama.cpp and with faisca and
+times encode, decode and load on real text. Every round runs both libraries on
+the same input, their outputs are hashed, and the hashes must match.
+
+```
+cmake -S . -B build-bench -DFAISCA_BUILD_BENCH=ON -DFAISCA_LLAMA_DIR=/path/to/llama.cpp
+cmake --build build-bench -j --target bench_tokenizer
+build-bench/bench_tokenizer model.gguf text1.md text2.cpp ... [--rounds N]
+```
+
+Same machine as above (4 cores), GCC 13, `-O3`, llama.cpp at commit b86d2f0
+built with `GGML_NATIVE`, SmolLM2-360M-Instruct vocabulary (49152 tokens),
+six text files of 298 KB in total (llama.cpp's README and build guide,
+`llama-vocab.cpp`, the tokenizer test inputs, a Python script and a chat
+transcript), 99,067 tokens, best of 100 rounds.
+
+| | llama.cpp | faisca | |
+| --- | --- | --- | --- |
+| encode whole files, word cache warm (ns/token) | 1108 | 40 | 27x |
+| encode whole files, word cache cleared before each run (ns/token) | 1097 | 69 | 16x |
+| encode line by line, 6691 calls (ns/token) | 2322 | 41 | 57x |
+| decode whole files (ns/token) | 18.4 | 14.2 | 1.3x |
+| `token_to_piece`, one token at a time (ns/token) | 19.5 | 14.6 | 1.3x |
+| load the vocabulary from the GGUF (ms) | 79 | 13.7 | 5.8x |
+
+Encode throughput on this text: 2.7 MB/s for llama.cpp, 75 MB/s for faisca.
+
+Where the time went, and what changed, measured with callgrind on the same
+text (instructions for the encode path alone, the load excluded):
+
+| Step | Cold cache | Warm cache |
+| --- | --- | --- |
+| starting point: heap based BPE on every word | 147 M | 147 M |
+| word cache: the tokens of every word seen, up to 65,536 words of at most 64 bytes | 147 M | 144 M |
+| Unicode classes looked up once per code point, ASCII fast path in the UTF-8 decode | 128 M | 110 M |
+| merges of words up to 64 bytes found by scanning a small array instead of a heap | 115 M | 110 M |
+
+The word cache changes little in instruction counts within one pass over a
+text, but most of its wins show up in the timings: the pass over a text goes
+from 161 to 69 ns/token cold and 40 ns/token warm. One attempt was reverted:
+pointing the words at the input text instead of re-encoding their code points
+saved a copy but needed two more arrays per code point, and cost 10% more
+instructions.
+
+The decode side got a piece table built at load: the decoded bytes of every
+token back to back, so a token is a `memcpy`. That is what llama.cpp does too,
+and it took faisca from 21.5 to 14.2 ns/token, for 1 ms more at load.
+
 ## What the numbers say
 
 - **Parsing a model does not depend on the containers.** All three land within
@@ -115,6 +165,10 @@ loader builds its own map on top of it, which this does not measure.
   1.1x to 2.6x against ct and more against the standard library.
 - In absolute terms the gain is small: tens of nanoseconds per lookup. It shows
   up in tokenizing long prompts, not in loading a model.
+- The tokenizer's lead over llama.cpp is algorithmic, not container
+  level: llama.cpp rebuilds a `std::forward_list` of fragments, a
+  `std::priority_queue` and several `std::string`s per word, faisca reuses its
+  buffers and remembers words. Most text repeats its words.
 - One measurement was unstable and is left out of the table: `push_back` of
   100,000 records without `reserve` on `std::vector` ranged from 15 to 71 ns
   between runs, depending on how the allocator handled the large blocks.

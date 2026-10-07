@@ -418,6 +418,16 @@ int main(int argc, char** argv)
             {
                 return encode_faisca(whole, true);
             });
+    measure("encode whole, cold word cache", "ns/token", static_cast<double>(whole.tokens),
+            [&]()
+            {
+                return encode_llama(whole, true);
+            },
+            [&]()
+            {
+                tokenizer.clear_word_cache();
+                return encode_faisca(whole, true);
+            });
     measure("encode whole, no specials", "ns/token", static_cast<double>(whole.tokens),
             [&]()
             {

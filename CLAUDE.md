@@ -24,8 +24,8 @@ top. No third party dependencies. Owner: Luís (akadjoker). "faisca" is a workin
 ## Plan
 
 1. GGUF loader: done (validated against gguf-py and ggml, 16x faster than ggml).
-2. Tokenizer: in progress, see below.
-3. CPU runner in float32, validated layer by layer against llama.cpp.
+2. Tokenizer: done, see below.
+3. CPU runner in float32, validated layer by layer against llama.cpp. Next.
 4. CPU optimization: threads, SIMD, quantized weights.
 5. Vulkan compute backend (the owner chose Vulkan over CUDA and OpenGL).
 6. Own cache format with offset tables, KV cache kept between turns and saved to
@@ -36,19 +36,30 @@ Target model: SmolLM2-360M-Instruct GGUF, then 1B to 3B models.
 ## Tokenizer status
 
 Byte level BPE (`tokenizer.ggml.model` = gpt2) with the `gpt-2`, `phi-2` and
-`smollm` pre-tokenizers, written to match llama.cpp token for token.
+`smollm` pre-tokenizers, matching llama.cpp token for token.
 
 - Done: load from GGUF, special token partition, both splitters, BPE merges,
-  decode with llama.cpp's clean_spaces passes.
-- Validated against llama.cpp (commit b86d2f0) with a GPT-2 vocabulary:
-  43633 cases and 1.6 M tokens per pre-tokenizer, 0 mismatches.
-- Not done: the differential test with extra special tokens
-  (`tests/make_tokenizer_gguf.py --special` still adds a text that already
-  exists and llama.cpp rejects duplicates), unit tests, sanitizers, Windows
-  build, speed comparison with llama.cpp, word cache, CLI command, README.
-- Not validated yet: the real SmolLM2 vocabulary. Needs the model file.
+  decode with llama.cpp's clean_spaces passes, unit tests
+  (`tests/tokenizer_unit.cpp`), ASan/UBSan clean, word cache, piece table for
+  decode, linear scan merges for short words, benchmark against llama.cpp
+  (`bench/bench_tokenizer.cpp`, results in bench/README.md: encode 16x to
+  27x faster, decode 1.3x, load 5.8x).
+- Validated against llama.cpp (commit b86d2f0), 0 mismatches, on the final
+  code: the real SmolLM2-360M-Instruct vocabulary (59k cases, 4.2 M tokens,
+  chat template tokens and words longer than 64 bytes included), GPT-2 in six
+  variants (both pre-tokenizers, with and without extra special tokens and
+  BOS/EOS flags, 295k cases, 26.1 M tokens), the unit test vocabulary (49k
+  cases, 6.6 M tokens). Every optimization step was re-validated the same way.
+- Not done: Windows build of the tokenizer (MinGW not available in the last
+  session), CLI `tokenize` command, a run with Clang.
 - Known difference: code points above U+10FFFF from malformed UTF-8 make
   llama.cpp throw; faisca encodes them as U+FFFD.
+- Reference setup: clone llama.cpp at b86d2f0, build `libllama` only
+  (`-DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TOOLS=OFF
+  -DLLAMA_BUILD_SERVER=OFF -DLLAMA_CURL=OFF`), compile
+  `tests/reference/llama_tokenizer_dump.cpp` against it. The GPT-2 files come
+  from huggingface.co/openai-community/gpt2 (vocab.json, merges.txt), the model
+  from huggingface.co/HuggingFaceTB/SmolLM2-360M-Instruct-GGUF (q8_0).
 
 ## Commands
 

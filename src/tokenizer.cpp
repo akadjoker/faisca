@@ -17,6 +17,10 @@ constexpr uint32_t DEAD = 0xffffffffu;
 constexpr uint8_t OUT_OF_RANGE = 0x80;
 constexpr size_t NOT_FOUND = static_cast<size_t>(-1);
 constexpr uint32_t BYTE_CODE_POINTS = 324;
+constexpr size_t CACHE_MAX_WORD_BYTES = 64;
+constexpr size_t SHORT_WORD_BYTES = 64;
+constexpr uint32_t NO_RANK = 0xffffffffu;
+constexpr size_t CACHE_MAX_WORDS = 65536;
 
 // GPT-2 writes each byte as one printable code point
 struct ByteTables
@@ -100,6 +104,68 @@ bool is_special_type(TokenType type)
     return type == TokenType::Control || type == TokenType::Unknown;
 }
 
+// GPT-2 text back to bytes, with llama.cpp's marker for a character outside the byte alphabet
+bool decode_piece(std::string_view text, Array<char>& out)
+{
+    for (size_t offset = 0; offset < text.size();)
+    {
+        const uint32_t code_point = utf8_decode(text.data(), text.size(), offset);
+        if (code_point < BYTE_CODE_POINTS && BYTE_TABLES.byte[code_point] >= 0)
+        {
+            if (!out.push_back(static_cast<char>(BYTE_TABLES.byte[code_point])))
+            {
+                return false;
+            }
+            continue;
+        }
+
+        char encoded[4];
+        const size_t length = utf8_encode(code_point, encoded);
+        char marker[32];
+        int written = std::snprintf(marker, sizeof(marker), "[UNK_BYTE_0x");
+        for (size_t i = 0; i < length; ++i)
+        {
+            written += std::snprintf(marker + written, sizeof(marker) - static_cast<size_t>(written), "%02x",
+                                     static_cast<unsigned>(static_cast<uint8_t>(encoded[i])));
+        }
+        if (!out.append(marker, static_cast<size_t>(written)) || !out.append(text.data(), text.size()) ||
+            !out.push_back(']'))
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+// "<0xNN>"
+char byte_token_value(std::string_view text)
+{
+    unsigned value = 0;
+    for (size_t i = 3; i < 5; ++i)
+    {
+        const char c = text[i];
+        unsigned digit = 0;
+        if (c >= '0' && c <= '9')
+        {
+            digit = static_cast<unsigned>(c - '0');
+        }
+        else if (c >= 'a' && c <= 'f')
+        {
+            digit = static_cast<unsigned>(c - 'a' + 10);
+        }
+        else if (c >= 'A' && c <= 'F')
+        {
+            digit = static_cast<unsigned>(c - 'A' + 10);
+        }
+        else
+        {
+            break;
+        }
+        value = value * 16 + digit;
+    }
+    return static_cast<char>(value);
+}
+
 }
 
 void Tokenizer::release()
@@ -111,6 +177,7 @@ void Tokenizer::release()
     m_merges.release();
     m_merged.release();
     m_special.release();
+    m_pieces.release();
 
     m_pre = PreTokenizer::Gpt2;
     m_clean_spaces = false;
@@ -123,17 +190,25 @@ void Tokenizer::release()
     m_fragments.release();
     m_fragments_next.release();
     m_code_points.release();
+    m_classes.release();
     m_words.release();
     m_words_next.release();
     m_nodes.release();
     m_heap.release();
     m_scratch.release();
+    m_word_bytes.release();
+
+    m_word_cache.release();
+    m_cached_words.release();
+    m_cached_tokens.release();
+    m_cache_arena.release();
 }
 
 bool Tokenizer::load(const GgufFile& file, Error& error)
 {
     release();
-    if (load_tokens(file, error) && load_merges(file, error) && load_special_tokens(file, error))
+    if (load_tokens(file, error) && build_pieces(error) && load_merges(file, error) &&
+        load_special_tokens(file, error))
     {
         return true;
     }
@@ -279,6 +354,8 @@ bool Tokenizer::load_tokens(const GgufFile& file, Error& error)
         Token token;
         token.text = text;
         token.type = types.empty() ? TokenType::Normal : token_type_from(types[i]);
+        token.piece_offset = 0;
+        token.piece_length = 0;
         m_tokens.push_back_unchecked(token);
 
         uint32_t symbol = 0;
@@ -305,6 +382,10 @@ bool Tokenizer::load_tokens(const GgufFile& file, Error& error)
     {
         const char raw = static_cast<char>(byte);
         m_byte_token[byte] = find_token(std::string_view(&raw, 1));
+    }
+    for (uint32_t c = 0; c < 128; ++c)
+    {
+        m_ascii_classes[c] = unicode_class(c);
     }
 
     return true;
@@ -555,14 +636,33 @@ bool Tokenizer::encode(std::string_view text, bool add_special, bool parse_speci
 bool Tokenizer::encode_text(std::string_view text, Array<int32_t>& out)
 {
     m_code_points.clear();
-    if (!m_code_points.reserve(text.size()))
+    m_classes.clear();
+    if (!m_code_points.reserve(text.size()) || !m_classes.reserve(text.size()))
     {
         return false;
     }
+
+    uint32_t* code_points = m_code_points.data();
+    uint8_t* classes = m_classes.data();
+    size_t count = 0;
     for (size_t offset = 0; offset < text.size();)
     {
-        m_code_points.push_back_unchecked(utf8_decode(text.data(), text.size(), offset));
+        const uint8_t byte = static_cast<uint8_t>(text[offset]);
+        if (byte < 0x80)
+        {
+            code_points[count] = byte;
+            classes[count] = m_ascii_classes[byte];
+            ++count;
+            ++offset;
+            continue;
+        }
+        const uint32_t code_point = utf8_decode(text.data(), text.size(), offset);
+        code_points[count] = code_point;
+        classes[count] = unicode_class(code_point);
+        ++count;
     }
+    m_code_points.resize_uninitialized(count);
+    m_classes.resize_uninitialized(count);
 
     m_words.clear();
     if (!m_words.push_back(static_cast<uint32_t>(m_code_points.size())))
@@ -610,7 +710,7 @@ bool Tokenizer::split_numbers(const Array<uint32_t>& in, Array<uint32_t>& out) c
         for (size_t pos = start; pos < end; ++pos)
         {
             const uint32_t code_point = m_code_points[pos];
-            const uint8_t type = unicode_class(code_point);
+            const uint8_t type = m_classes[pos];
             const bool number = (type & UNICODE_NUMBER) != 0 && !(code_point >= 128 && (type & UNICODE_WHITESPACE) != 0);
             if (!number)
             {
@@ -642,6 +742,7 @@ bool Tokenizer::split_gpt2(const Array<uint32_t>& in, Array<uint32_t>& out) cons
     out.clear();
 
     const uint32_t* code_points = m_code_points.data();
+    const uint8_t* classes = m_classes.data();
     const uint8_t word_classes = UNICODE_LETTER | UNICODE_NUMBER | UNICODE_WHITESPACE | OUT_OF_RANGE;
 
     size_t start = 0;
@@ -651,9 +752,9 @@ bool Tokenizer::split_gpt2(const Array<uint32_t>& in, Array<uint32_t>& out) cons
         const size_t end = start + length;
         start = end;
 
-        const auto class_at = [code_points, end](size_t pos) -> uint8_t
+        const auto class_at = [classes, end](size_t pos) -> uint8_t
         {
-            return pos < end ? unicode_class(code_points[pos]) : OUT_OF_RANGE;
+            return pos < end ? classes[pos] : OUT_OF_RANGE;
         };
 
         size_t previous = begin;
@@ -817,32 +918,190 @@ Tokenizer::Bigram Tokenizer::pop_bigram()
 
 bool Tokenizer::encode_word(const uint32_t* code_points, size_t count, Array<int32_t>& out)
 {
-    m_nodes.clear();
-    m_heap.clear();
-
+    // the bytes to tokenize are the re-encoded code points: malformed input becomes U+FFFD, as in llama.cpp
+    m_word_bytes.clear();
+    if (!m_word_bytes.reserve(count * 4))
+    {
+        return false;
+    }
+    char* bytes = m_word_bytes.data();
+    size_t size = 0;
     for (size_t i = 0; i < count; ++i)
     {
-        char bytes[4];
-        const size_t length = utf8_encode(code_points[i], bytes);
-        for (size_t b = 0; b < length; ++b)
+        const uint32_t code_point = code_points[i];
+        if (code_point < 0x80)
         {
-            Node node;
-            node.symbol = m_byte_symbol[static_cast<uint8_t>(bytes[b])];
-            node.prev = static_cast<int32_t>(m_nodes.size()) - 1;
-            node.next = static_cast<int32_t>(m_nodes.size()) + 1;
-            if (!m_nodes.push_back(node))
-            {
-                return false;
-            }
+            bytes[size++] = static_cast<char>(code_point);
+            continue;
         }
+        size += utf8_encode(code_point, bytes + size);
     }
-    if (m_nodes.empty())
+    if (size == 0)
     {
         return true;
     }
-    m_nodes[m_nodes.size() - 1].next = -1;
+    m_word_bytes.resize_uninitialized(size);
+    const std::string_view word(bytes, size);
 
-    for (size_t i = 1; i < m_nodes.size(); ++i)
+    const bool cacheable = word.size() <= CACHE_MAX_WORD_BYTES;
+    uint32_t cached = 0;
+    if (cacheable && m_word_cache.find(word, cached))
+    {
+        const CachedWord& entry = m_cached_words[cached];
+        return out.append(m_cached_tokens.data() + entry.offset, entry.count);
+    }
+
+    const size_t before = out.size();
+    if (!encode_bytes(word, out))
+    {
+        return false;
+    }
+    return !cacheable || remember_word(word, out.data() + before, out.size() - before);
+}
+
+bool Tokenizer::remember_word(std::string_view word, const int32_t* tokens, size_t count)
+{
+    if (m_cached_words.size() >= CACHE_MAX_WORDS)
+    {
+        forget_words();
+    }
+
+    std::string_view key = word;
+    if (key.size() > StringMap::INLINE_BYTES)
+    {
+        const char* stored = m_cache_arena.copy(key.data(), key.size());
+        if (stored == nullptr)
+        {
+            return false;
+        }
+        key = std::string_view(stored, key.size());
+    }
+
+    CachedWord entry;
+    entry.offset = static_cast<uint32_t>(m_cached_tokens.size());
+    entry.count = static_cast<uint32_t>(count);
+    const uint32_t index = static_cast<uint32_t>(m_cached_words.size());
+    return m_cached_tokens.append(tokens, count) && m_cached_words.push_back(entry) &&
+           m_word_cache.insert(key, index) != StringMap::Insert::Failed;
+}
+
+void Tokenizer::forget_words()
+{
+    m_word_cache.clear();
+    m_cached_words.clear();
+    m_cached_tokens.clear();
+    m_cache_arena.release();
+}
+
+bool Tokenizer::emit_symbol(uint32_t symbol_index, Array<int32_t>& out) const
+{
+    const Symbol& symbol = m_symbols[symbol_index];
+    if (symbol.token != TOKEN_NONE)
+    {
+        return out.push_back(symbol.token);
+    }
+
+    // not a token: llama.cpp falls back to the tokens of its single bytes
+    for (const char c : symbol.text)
+    {
+        const int32_t token = m_byte_token[static_cast<uint8_t>(c)];
+        if (token != TOKEN_NONE && !out.push_back(token))
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+// the same merges as encode_bytes, found by scanning a small array instead of a heap
+bool Tokenizer::encode_short(std::string_view word, Array<int32_t>& out)
+{
+    uint32_t symbols[SHORT_WORD_BYTES];
+    uint32_t ranks[SHORT_WORD_BYTES];
+    size_t count = word.size();
+
+    for (size_t i = 0; i < count; ++i)
+    {
+        symbols[i] = m_byte_symbol[static_cast<uint8_t>(word[i])];
+    }
+    for (size_t i = 0; i + 1 < count; ++i)
+    {
+        if (!m_merges.find(pair_key(symbols[i], symbols[i + 1]), ranks[i]))
+        {
+            ranks[i] = NO_RANK;
+        }
+    }
+
+    while (count > 1)
+    {
+        // lowest rank, leftmost on ties
+        uint32_t best = ranks[0];
+        size_t at = 0;
+        for (size_t i = 1; i + 1 < count; ++i)
+        {
+            if (ranks[i] < best)
+            {
+                best = ranks[i];
+                at = i;
+            }
+        }
+        if (best == NO_RANK)
+        {
+            break;
+        }
+
+        symbols[at] = m_merged[best];
+        --count;
+        std::memmove(symbols + at + 1, symbols + at + 2, (count - at - 1) * sizeof(uint32_t));
+        std::memmove(ranks + at, ranks + at + 1, (count - at - 1) * sizeof(uint32_t));
+
+        if (at > 0 && !m_merges.find(pair_key(symbols[at - 1], symbols[at]), ranks[at - 1]))
+        {
+            ranks[at - 1] = NO_RANK;
+        }
+        if (at + 1 < count && !m_merges.find(pair_key(symbols[at], symbols[at + 1]), ranks[at]))
+        {
+            ranks[at] = NO_RANK;
+        }
+    }
+
+    for (size_t i = 0; i < count; ++i)
+    {
+        if (!emit_symbol(symbols[i], out))
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+// byte level BPE, as in llama.cpp's llm_tokenizer_bpe_session
+bool Tokenizer::encode_bytes(std::string_view word, Array<int32_t>& out)
+{
+    if (word.size() <= SHORT_WORD_BYTES)
+    {
+        return encode_short(word, out);
+    }
+
+    m_nodes.clear();
+    m_heap.clear();
+
+    const size_t count = word.size();
+    if (!m_nodes.reserve(count))
+    {
+        return false;
+    }
+    for (size_t i = 0; i < count; ++i)
+    {
+        Node node;
+        node.symbol = m_byte_symbol[static_cast<uint8_t>(word[i])];
+        node.prev = static_cast<int32_t>(i) - 1;
+        node.next = static_cast<int32_t>(i) + 1;
+        m_nodes.push_back_unchecked(node);
+    }
+    m_nodes[count - 1].next = -1;
+
+    for (size_t i = 1; i < count; ++i)
     {
         if (!push_bigram(static_cast<int32_t>(i) - 1, static_cast<int32_t>(i)))
         {
@@ -878,30 +1137,41 @@ bool Tokenizer::encode_word(const uint32_t* code_points, size_t count, Array<int
 
     for (const Node& node : m_nodes)
     {
-        if (node.symbol == DEAD)
+        if (node.symbol != DEAD && !emit_symbol(node.symbol, out))
         {
-            continue;
+            return false;
+        }
+    }
+    return true;
+}
+
+bool Tokenizer::build_pieces(Error& error)
+{
+    m_pieces.clear();
+    for (Token& entry : m_tokens)
+    {
+        const size_t start = m_pieces.size();
+        bool ok = true;
+        if (is_special_type(entry.type) || entry.type == TokenType::UserDefined)
+        {
+            ok = m_pieces.append(entry.text.data(), entry.text.size());
+        }
+        else if (entry.type == TokenType::Normal)
+        {
+            ok = decode_piece(entry.text, m_pieces);
+        }
+        else if (entry.type == TokenType::Byte && entry.text.size() >= 5)
+        {
+            ok = m_pieces.push_back(byte_token_value(entry.text));
         }
 
-        const Symbol& symbol = m_symbols[node.symbol];
-        if (symbol.token != TOKEN_NONE)
+        if (!ok || m_pieces.size() > std::numeric_limits<uint32_t>::max())
         {
-            if (!out.push_back(symbol.token))
-            {
-                return false;
-            }
-            continue;
+            error.set(ok ? "the token pieces do not fit in 4 GiB" : "out of memory while decoding the vocabulary");
+            return false;
         }
-
-        // not a token: llama.cpp falls back to the tokens of its single bytes
-        for (const char c : symbol.text)
-        {
-            const int32_t token = m_byte_token[static_cast<uint8_t>(c)];
-            if (token != TOKEN_NONE && !out.push_back(token))
-            {
-                return false;
-            }
-        }
+        entry.piece_offset = static_cast<uint32_t>(start);
+        entry.piece_length = static_cast<uint32_t>(m_pieces.size() - start);
     }
     return true;
 }
@@ -919,100 +1189,14 @@ bool Tokenizer::append_piece(int32_t token, bool special, bool strip_space, Arra
         return true;
     }
 
-    const size_t start = out.size();
-
-    if (is_special_type(entry.type) || entry.type == TokenType::UserDefined)
+    const char* piece = m_pieces.data() + entry.piece_offset;
+    size_t length = entry.piece_length;
+    if (strip_space && length != 0 && piece[0] == ' ')
     {
-        for (const char c : entry.text)
-        {
-            if (!out.push_back(c))
-            {
-                return false;
-            }
-        }
+        ++piece;
+        --length;
     }
-    else if (entry.type == TokenType::Normal)
-    {
-        for (size_t offset = 0; offset < entry.text.size();)
-        {
-            const uint32_t code_point = utf8_decode(entry.text.data(), entry.text.size(), offset);
-            if (code_point < BYTE_CODE_POINTS && BYTE_TABLES.byte[code_point] >= 0)
-            {
-                if (!out.push_back(static_cast<char>(BYTE_TABLES.byte[code_point])))
-                {
-                    return false;
-                }
-                continue;
-            }
-
-            // same marker llama.cpp writes for a character outside the byte alphabet
-            char encoded[4];
-            const size_t length = utf8_encode(code_point, encoded);
-            char marker[32];
-            int written = std::snprintf(marker, sizeof(marker), "[UNK_BYTE_0x");
-            for (size_t i = 0; i < length; ++i)
-            {
-                written += std::snprintf(marker + written, sizeof(marker) - static_cast<size_t>(written), "%02x",
-                                         static_cast<unsigned>(static_cast<uint8_t>(encoded[i])));
-            }
-            for (int i = 0; i < written; ++i)
-            {
-                if (!out.push_back(marker[i]))
-                {
-                    return false;
-                }
-            }
-            for (const char c : entry.text)
-            {
-                if (!out.push_back(c))
-                {
-                    return false;
-                }
-            }
-            if (!out.push_back(']'))
-            {
-                return false;
-            }
-        }
-    }
-    else if (entry.type == TokenType::Byte && entry.text.size() >= 5)
-    {
-        // "<0xNN>"
-        unsigned value = 0;
-        for (size_t i = 3; i < 5; ++i)
-        {
-            const char c = entry.text[i];
-            unsigned digit = 0;
-            if (c >= '0' && c <= '9')
-            {
-                digit = static_cast<unsigned>(c - '0');
-            }
-            else if (c >= 'a' && c <= 'f')
-            {
-                digit = static_cast<unsigned>(c - 'a' + 10);
-            }
-            else if (c >= 'A' && c <= 'F')
-            {
-                digit = static_cast<unsigned>(c - 'A' + 10);
-            }
-            else
-            {
-                break;
-            }
-            value = value * 16 + digit;
-        }
-        if (!out.push_back(static_cast<char>(value)))
-        {
-            return false;
-        }
-    }
-
-    if (strip_space && out.size() > start && out[start] == ' ')
-    {
-        std::memmove(out.data() + start, out.data() + start + 1, out.size() - start - 1);
-        out.resize_uninitialized(out.size() - 1);
-    }
-    return true;
+    return out.append(piece, length);
 }
 
 bool Tokenizer::token_to_piece(int32_t token, bool special, Array<char>& out) const

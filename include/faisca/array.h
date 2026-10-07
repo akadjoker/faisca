@@ -111,6 +111,21 @@ public:
         m_data[m_size++] = value;
     }
 
+    // values must not point into this array
+    bool append(const T* values, size_t count)
+    {
+        if (count > m_capacity - m_size && !grow_to(m_size + count))
+        {
+            return false;
+        }
+        if (count != 0)
+        {
+            std::memcpy(m_data + m_size, values, count * sizeof(T));
+            m_size += count;
+        }
+        return true;
+    }
+
     bool resize_uninitialized(size_t size)
     {
         if (!reserve(size))
@@ -156,6 +171,21 @@ private:
             return false;
         }
         return reallocate(m_capacity == 0 ? 8 : m_capacity * 2);
+    }
+
+    bool grow_to(size_t needed)
+    {
+        const size_t max_capacity = static_cast<size_t>(-1) / sizeof(T);
+        if (needed > max_capacity)
+        {
+            return false;
+        }
+        size_t capacity = m_capacity == 0 ? 8 : m_capacity;
+        while (capacity < needed)
+        {
+            capacity = capacity > max_capacity / 2 ? needed : capacity * 2;
+        }
+        return reallocate(capacity);
     }
 
     bool reallocate(size_t capacity)

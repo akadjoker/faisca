@@ -198,6 +198,16 @@ public:
         }
     }
 
+    // forgets every key, keeps the table
+    void clear()
+    {
+        if (m_tags != nullptr)
+        {
+            std::memset(m_tags, 0, m_capacity);
+        }
+        m_size = 0;
+    }
+
     void release()
     {
         std::free(m_block);
@@ -209,8 +219,10 @@ public:
         m_size = 0;
     }
 
-private:
+    // keys longer than this are stored by address and must stay valid while in the map
     static constexpr size_t INLINE_BYTES = 16;
+
+private:
     static constexpr uint32_t EMPTY = 0xffffffffu;
     static constexpr size_t MIN_CAPACITY = 16;
 

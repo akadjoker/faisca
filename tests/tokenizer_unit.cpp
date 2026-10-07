@@ -556,6 +556,31 @@ void test_encode_gpt2()
     CHECK(tokenizer.encode(" world", false, false, out));
     CHECK(out.size() == 3 && out[0] == -7 && out[1] == T_HELLO && out[2] == T_SPACE_WORLD);
 
+    // words longer than 64 bytes take the heap based merge loop
+    for (const size_t repeats : {12, 13, 20, 200})
+    {
+        std::string long_word;
+        std::vector<int32_t> expected;
+        for (size_t i = 0; i < repeats; ++i)
+        {
+            long_word += "hello";
+            expected.push_back(T_HELLO);
+        }
+        CHECK_ENCODE(tokenizer, long_word, false, false, expected);
+
+        std::string spaces(repeats * 5, ' ');
+        expected.assign(repeats * 5 / 2, T_TWO_SPACES);
+        if ((repeats * 5) % 2 == 1)
+        {
+            expected.push_back(' ');
+        }
+        CHECK_ENCODE(tokenizer, spaces, false, false, expected);
+
+        std::string letters(repeats * 5, 'a');
+        expected.assign(repeats * 5, 'a');
+        CHECK_ENCODE(tokenizer, letters, false, false, expected);
+    }
+
     std::string long_text;
     for (int i = 0; i < 2000; ++i)
     {
