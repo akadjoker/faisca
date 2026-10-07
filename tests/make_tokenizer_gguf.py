@@ -4,8 +4,8 @@
     python3 tests/make_tokenizer_gguf.py <encoder.json> <vocab.bpe> <out.gguf> --pre gpt-2|smollm [--special] [--bos]
 
 --special adds control and user defined tokens, an empty text and a token
-outside the byte alphabet. --bos sets add_bos_token and
-add_eos_token.
+outside the byte alphabet. Every added text must be new: llama.cpp asserts
+that no two tokens share a text. --bos sets add_bos_token and add_eos_token.
 """
 
 import argparse
@@ -47,14 +47,18 @@ def main() -> int:
             ("<0x41>", BYTE),
             ("", NORMAL),
             ("日本", NORMAL),
-            ("aa", USER_DEFINED),
-            ("ab", USER_DEFINED),
-            ("ba", USER_DEFINED),
+            ("zq", USER_DEFINED),
+            ("qz", USER_DEFINED),
+            ("zqz", USER_DEFINED),
+            ("aab", USER_DEFINED),
             ("ĠĠ", CONTROL),
         ]
         bos = len(tokens)
         eos = len(tokens) + 1
         for text, kind in extra:
+            if text in encoder:
+                print(f"{text!r} is already in the vocabulary", file=sys.stderr)
+                return 1
             tokens.append(text)
             types.append(kind)
 
