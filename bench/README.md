@@ -369,6 +369,46 @@ against llama.cpp's own outputs on its own inputs (`matmul_check`, zero
 error) and the thread splits never change a sum, so these numbers come with
 bit identical results across thread counts.
 
+## Whisper against whisper.cpp
+
+`faisca transcribe` against `whisper-cli` 1.9.5 (stock build, CPU, no flash
+attention) on jfk.wav (11 s, 24 to 26 tokens), the same machine, best of
+3, wall time of the whole process including the model load. faisca runs
+the matrices on Q8_0 quantized at load; whisper-cli with its f16 files and
+with its Q8_0 files.
+
+| | threads | faisca Q8_0 | whisper-cli f16 | whisper-cli Q8_0 |
+| --- | --- | --- | --- | --- |
+| tiny (s) | 1 | 1.74 (load 0.26) | 2.11 | 1.67 |
+| tiny (s) | 4 | 0.74 (load 0.24) | 0.81 | 0.71 |
+| base (s) | 1 | 4.74 (load 0.47) | 4.17 | 3.22 |
+| base (s) | 4 | 1.65 (load 0.48) | 1.48 | 1.14 |
+| small (s) | 1 | 11.1 (load 1.58) | 12.9 | 8.74 |
+| small (s) | 4 | 4.53 (load 1.54) | 4.09 | 2.94 |
+
+Without the load (the time the CLI reports for the audio): tiny 1.47 /
+0.48 s, base 4.35 / 1.14 s, small 9.45 / 3.25 s with 1 / 4 threads, that
+is 7.5 / 23x, 2.5 / 9.7x and 1.2 / 3.4x real time. The load converts the
+f16 file to float32 and quantizes and packs the matrices on one thread,
+0.26 to 1.6 s; whisper-cli reads its files in 0.08 to 0.4 s.
+
+Where the time goes (trace timestamps, jfk.wav, Q8_0, 1 / 4 threads):
+
+| phase | tiny | small |
+| --- | --- | --- |
+| mel spectrogram | 0.028 / 0.027 | 0.027 / 0.028 |
+| conv1 and conv2 | 0.51 / 0.14 | 1.51 / 0.39 |
+| encoder attention and projection | 0.61 / 0.16 | 4.30 / 1.13 |
+| encoder Q K V and FFN matmuls | 0.17 / 0.05 | 1.60 / 0.50 |
+| encoder GELU | 0.20 / 0.05 | 1.14 / 0.33 |
+| cross keys and values | 0.04 / 0.02 | 0.38 / 0.14 |
+| decoder (24 to 26 tokens) | 0.08 / 0.03 | 0.51 / 0.15 |
+
+Before the encoder keys went through the tiled attention kernel the
+attention took 15.0 s of the 20.7 s of small on one thread. The next
+candidates are the convolutions (a scalar loop, 1.5 s) and the GELU
+(tanhf per value, 1.1 s); the matmuls are already the VNNI GEMM.
+
 ## What the numbers say
 
 - **Parsing a model does not depend on the containers.** All three land within

@@ -118,12 +118,27 @@ top. No third party dependencies. Owner: Luís (akadjoker). "faisca" is a workin
    traced tensor at worst 1.4e-5 / 1.8e-5 / 2.2e-5 rel L2 from the f32
    reference, tokens identical in all runs, 1 and 4 threads bit identical,
    ASan/UBSan clean; stock whisper.cpp (f16 cache, GELU table) is 3e-3 from
-   ours with the same tokens. float32 matvecs make it slow (small 0.22x real
-   time with 4 threads): next, Q8_0 packed weights with the existing VNNI
-   GEMM, then the speed table against whisper-cli. Quality (Whisper paper,
-   LibriSpeech WER): tiny 7.6, base 5.0, small 3.4, medium 2.9; on the
-   Portuguese clips only small gets pt_0 exactly, and the training data is
-   mostly Brazilian, so European Portuguese needs our own measurement.
+   ours with the same tokens. The matrices are quantized to Q8_0 and packed
+   at load (`WhisperModel::load(path, error, quantize)`, `--f32` keeps the
+   file's values): noise 1.6e-1 at the last encoder GELU and 8e-2 at the
+   logits, small and base keep the tokens, tiny flips a near tie on jfk
+   ("you, ask"), the same flip whisper-cli makes with its own Q8_0 file
+   (/home/user/models/whisper/ggml-*-q8_0.bin). The encoder and cross
+   attention run through attention_head on keys tiled per head (15 of
+   20.7 s before on small, 1 thread); the causal decoder self attention
+   keeps attention_rows. Speed on jfk.wav (11 s), 1 / 4 threads: tiny 1.47
+   / 0.48 s, base 4.35 / 1.14, small 9.45 / 3.25 (whisper-cli f16 2.09 /
+   0.85, 4.29 / 1.47, 13.1 / 4.03; its Q8_0 files 1.68 / 0.72, 3.19 /
+   1.11, 8.69 / 2.89); the load (f16 to float32, quantize, pack, one
+   thread) is 0.26 to 1.6 s. Phases in bench/README.md: next the scalar
+   conv1d (1.5 s of 9.5 on small) and the tanhf GELU (1.1 s). Not done:
+   timestamp tokens and cutting windows at pauses (now every 30 s), the
+   initial prompt from the previous window, language detection, medium
+   and large files (should load, not tried), WAV only (ffmpeg converts).
+   Quality (Whisper paper, LibriSpeech WER): tiny 7.6, base 5.0, small 3.4,
+   medium 2.9; on the three Portuguese clips only small gets pt_0 exactly,
+   and the training data is mostly Brazilian, so European Portuguese needs
+   our own measurement with the owner's recordings.
 8. Text to speech: pick between OuteTTS (llama LLM + WavTokenizer, decoder
    in libllama as `wavtokenizer-dec`) and Piper (VITS, pt_PT voices, ONNX
    reference) by listening to Portuguese samples, then the audio decoder,

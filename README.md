@@ -21,6 +21,7 @@ or exceptions. It has its own containers (`faisca::Array`, `faisca::StringMap`,
 | CPU optimization: threads, VNNI kernels for Q8_0, Q4_0, Q5_0, Q4_K and Q6_K, batched prompt, f16 KV cache | done, AMX pending |
 | Vulkan compute backend | runs the whole model, validated layer by layer on llvmpipe; speed on a real GPU not measured yet |
 | Own cache format and KV cache on disk | done: sessions with prefix reuse, snapshots and files with an offset table |
+| Whisper (speech to text) | done: tiny, base and small validated layer by layer against whisper.cpp, `transcribe` command, no timestamps yet |
 
 ## Build
 
@@ -45,6 +46,7 @@ faisca info model.gguf --meta       # every metadata key
 faisca info model.gguf --tensors    # every tensor
 faisca generate model.gguf -p "What is the capital of France?" -n 64 -t 4
 faisca chat model.gguf -t 4 --session talk.session
+faisca transcribe ggml-small.bin recording.wav --language pt -t 4
 ```
 
 `chat` reads one user message per line and keeps the conversation in the KV
@@ -67,6 +69,17 @@ Llama 3.2 1B Q8_0: 31 to 37 tokens per second, prompts at 250
 (bench/README.md has the tables against llama.cpp). The quantized weights
 are packed into the kernels' layout by all threads at load. The chat template follows the
 vocabulary: ChatML for SmolLM2, the header tokens for Llama 3.
+
+`transcribe` runs a Whisper model from a whisper.cpp `ggml-*.bin` file on a
+16 kHz 16 bit WAV (`ffmpeg -i in.mp3 -ar 16000 -ac 1 out.wav` makes one) and
+prints the text: greedy, without timestamps, one 30 s window at a time,
+`--language` the two letter code (`pt` for Portuguese). The log mel
+spectrogram is bit identical to whisper.cpp's; the encoder and decoder
+matrices are quantized to Q8_0 at load and run on the VNNI kernels of the
+LLM runner (`--f32` keeps the file's values, the validation path). On the
+same Xeon with 4 threads, 11 s of audio: tiny 0.48 s, base 1.1 s, small
+3.3 s, against 0.85 / 1.5 / 4.0 s for whisper-cli with its f16 files and
+0.72 / 1.1 / 2.9 s with its Q8_0 files (bench/README.md).
 
 ## Library
 
@@ -319,6 +332,21 @@ python3 tests/compare_with_gguf_py.py build/gguf_dump model.gguf
   from the float32 logits (llama.cpp 4.43e-2, faisca 4.42e-2) and 2e-2 from
   each other, with the same argmax at every position and the same 16 greedy
   tokens; on Q4_K_M the two runners are 6.7e-2 apart with the same 16 tokens.
+
+- **Whisper against whisper.cpp.** `tests/make_f32_whisper.py` rewrites a
+  `ggml-*.bin` with every tensor in float32; `whisper_layer_dump`
+  (`-DFAISCA_WHISPER_DIR`, `-DFAISCA_WHISPER_BUILD`, against a copy of
+  whisper.cpp 1.9.5 patched with an eval callback, named tensors and a
+  `WHISPER_F32_REFERENCE` build that keeps the intermediates in float32)
+  writes every tensor of a run, `whisper_dump` does the same for faisca and
+  `tests/compare_whisper.py` compares them. tiny, base and small on
+  jfk.wav and on Portuguese clips from FLEURS: worst rel L2 1.3e-5 / 1.6e-5
+  / 1.6e-5 over 1545 / 2475 / 4893 tensors on the float32 path, tokens
+  identical in every run, 1 and 4 threads bit identical, ASan and UBSan
+  clean. With the Q8_0 matrices the noise reaches 1.6e-1 at the last
+  encoder GELU and 8e-2 at the logits, small and base keep the same
+  tokens, tiny flips one near tie ("you, ask"), the same flip whisper.cpp
+  makes with its own Q8_0 file.
 
 ## Layout
 
