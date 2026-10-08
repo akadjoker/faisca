@@ -20,6 +20,10 @@ set(FAISCA_CT_DIR "" CACHE PATH
     "Checkout of github.com/akadjoker/containers, adds the ct candidates to the benchmarks")
 set(FAISCA_LLAMA_DIR "" CACHE PATH
     "Checkout of github.com/ggml-org/llama.cpp, adds the comparison with its GGUF loader")
+set(FAISCA_WHISPER_DIR "" CACHE PATH
+    "Source tree of whisper.cpp (the patched reference copy) for the whisper_layer_dump tool")
+set(FAISCA_WHISPER_BUILD "" CACHE PATH
+    "Build tree of that whisper.cpp whose bin/ holds libwhisper.so and libggml*.so")
 
 if(MSVC)
     set(FAISCA_WARNINGS /W4 /WX)
@@ -54,6 +58,10 @@ add_library(faisca_lib STATIC
     src/thread.cpp
     src/tokenizer.cpp
     src/unicode.cpp
+    src/audio.cpp
+    src/ops_whisper.cpp
+    src/whisper_model.cpp
+    src/whisper_runner.cpp
 )
 find_package(Threads REQUIRED)
 target_link_libraries(faisca_lib PUBLIC Threads::Threads)
@@ -108,6 +116,8 @@ if(FAISCA_BUILD_TESTS)
     add_test(NAME ops_unit COMMAND ops_unit)
 
     add_executable(runner_dump tests/runner_dump.cpp)
+    add_executable(whisper_dump tests/whisper_dump.cpp)
+    target_link_libraries(whisper_dump PRIVATE faisca_lib)
     target_link_libraries(runner_dump PRIVATE faisca_lib)
     target_compile_options(runner_dump PRIVATE ${FAISCA_WARNINGS})
 
@@ -237,5 +247,12 @@ if(FAISCA_BUILD_BENCH)
         add_executable(llama_layer_dump tests/reference/llama_layer_dump.cpp)
         target_link_libraries(llama_layer_dump PRIVATE llama)
         target_include_directories(llama_layer_dump PRIVATE ${FAISCA_LLAMA_DIR}/include ${FAISCA_LLAMA_DIR}/ggml/include)
+    endif()
+    if(FAISCA_WHISPER_DIR AND FAISCA_WHISPER_BUILD)
+        add_executable(whisper_layer_dump tests/reference/whisper_layer_dump.cpp)
+        target_include_directories(whisper_layer_dump PRIVATE ${FAISCA_WHISPER_DIR}/include ${FAISCA_WHISPER_DIR}/ggml/include)
+        target_link_directories(whisper_layer_dump PRIVATE ${FAISCA_WHISPER_BUILD}/bin)
+        target_link_libraries(whisper_layer_dump PRIVATE whisper ggml ggml-base)
+        set_target_properties(whisper_layer_dump PROPERTIES BUILD_RPATH ${FAISCA_WHISPER_BUILD}/bin)
     endif()
 endif()

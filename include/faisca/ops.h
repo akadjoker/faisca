@@ -217,4 +217,24 @@ void swiglu_scalar(const float* gate, const float* up, size_t n, float* out);
 
 void add(float* x, const float* y, size_t n);
 
+// float32 ops of the Whisper encoder and decoder (src/ops_whisper.cpp)
+
+// mean and variance over n: out = (x - mean) / sqrt(var + eps) * weight + bias
+void layer_norm(const float* x, const float* weight, const float* bias, size_t n, float eps, float* out);
+
+// x = 0.5 x (1 + tanh(sqrt(2 / pi) (x + 0.044715 x^3))), the tanh form the models were trained with
+void gelu(float* x, size_t n);
+
+void add_bias(float* x, const float* bias, size_t n);
+
+// 1-d convolution with a kernel of 3 and one value of zero padding: x holds n_in channels of
+// length values each, w[oc][ic][3]; out gets rows oc in [first, last) of length / stride values
+void conv1d_k3(const float* x, size_t n_in, size_t length, const float* w, const float* bias, size_t stride,
+               size_t first, size_t last, float* out);
+
+// one query of one head against n_kv keys and values whose rows are stride apart: scores
+// are scaled, softmax in float32 with a double sum (as softmax), out gets head_dim values
+void attention_rows(const float* q, const float* k, const float* v, size_t stride, size_t head_dim, size_t n_kv,
+                    float scale, float* scores, float* out);
+
 }

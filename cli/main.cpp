@@ -8,6 +8,9 @@
 #include "faisca/vulkan_runner.h"
 #endif
 #include "faisca/tokenizer.h"
+#include "faisca/audio.h"
+#include "faisca/whisper_model.h"
+#include "faisca/whisper_runner.h"
 
 #include <chrono>
 #include <cinttypes>
@@ -33,6 +36,7 @@ void print_usage()
         "  faisca chat <model.gguf> [-n <tokens>] [-c <context>] [-t <threads>] [--session <file>] [--kv-f32]\n"
         "  faisca generate <model.gguf> -p <prompt> [-n <tokens>] [-c <context>] [-t <threads>] [--raw] [--f32] [--kv-f32]\n"
         "                                [--draft <draft.gguf>] [--draft-n <tokens>] [--vulkan]\n"
+        "  faisca transcribe <model.bin> <audio.wav> [--language <code>] [-t <threads>]\n"
         "  faisca version\n"
         "\n"
         "info options:\n"
@@ -53,7 +57,10 @@ void print_usage()
         "\n"
         "chat reads one user message per line from standard input and keeps the conversation in the\n"
         "KV cache between turns; --session loads the conversation from the file if it exists and\n"
-        "saves it after every reply.\n",
+        "saves it after every reply.\n"
+        "\n"
+        "transcribe runs a Whisper model (whisper.cpp ggml file) on a 16 kHz 16 bit WAV, greedy,\n"
+        "without timestamps; --language is the two letter code (default en, pt for Portuguese).\n",
         FAISCA_VERSION);
 }
 
@@ -927,6 +934,83 @@ int command_chat(int argc, char** argv)
     return 0;
 }
 
+int command_transcribe(int argc, char** argv)
+{
+    const char* language = "en";
+    int threads = 1;
+    const char* positional[2] = {nullptr, nullptr};
+    int n_positional = 0;
+    for (int i = 2; i < argc; ++i)
+    {
+        if (std::strcmp(argv[i], "--language") == 0 && i + 1 < argc)
+        {
+            language = argv[++i];
+        }
+        else if (std::strcmp(argv[i], "-t") == 0 && i + 1 < argc)
+        {
+            threads = std::atoi(argv[++i]);
+        }
+        else if (argv[i][0] == '-')
+        {
+            std::fprintf(stderr, "faisca transcribe: unknown option '%s'\n", argv[i]);
+            return 2;
+        }
+        else if (n_positional < 2)
+        {
+            positional[n_positional++] = argv[i];
+        }
+    }
+    if (n_positional != 2 || threads < 1)
+    {
+        print_usage();
+        return 2;
+    }
+    const int32_t language_id = faisca::WhisperModel::language_id(language);
+    if (language_id < 0)
+    {
+        std::fprintf(stderr, "faisca transcribe: unknown language '%s'\n", language);
+        return 2;
+    }
+
+    faisca::Error error;
+    faisca::WhisperModel model;
+    faisca::ThreadPool pool;
+    faisca::WhisperRunner runner;
+    faisca::Array<float> samples;
+    const auto t0 = std::chrono::steady_clock::now();
+    if (!model.load(positional[0], error) || !pool.start(threads, error) || !runner.init(model, pool, error))
+    {
+        std::fprintf(stderr, "faisca transcribe: %s\n", error.c_str());
+        return 1;
+    }
+    const auto t1 = std::chrono::steady_clock::now();
+    if (!faisca::read_wav(positional[1], samples, error))
+    {
+        std::fprintf(stderr, "faisca transcribe: %s\n", error.c_str());
+        return 1;
+    }
+    faisca::Array<int32_t> tokens;
+    if (!runner.transcribe_audio(samples.data(), samples.size(), language_id, tokens, error))
+    {
+        std::fprintf(stderr, "faisca transcribe: %s\n", error.c_str());
+        return 1;
+    }
+    const auto t2 = std::chrono::steady_clock::now();
+    for (size_t i = 0; i < tokens.size(); ++i)
+    {
+        size_t length = 0;
+        const char* bytes = model.token(tokens[i], length);
+        std::fwrite(bytes, 1, length, stdout);
+    }
+    std::printf("\n");
+    const double load = std::chrono::duration<double>(t1 - t0).count();
+    const double run = std::chrono::duration<double>(t2 - t1).count();
+    const double audio = static_cast<double>(samples.size()) / static_cast<double>(faisca::WHISPER_SAMPLE_RATE);
+    std::fprintf(stderr, "load %.2f s, %.1f s of audio in %.2f s (%.2fx real time), %zu tokens, %d threads\n", load, audio, run,
+                 audio / run, tokens.size(), threads);
+    return 0;
+}
+
 int main(int argc, char** argv)
 {
     if (argc < 2)
@@ -947,6 +1031,10 @@ int main(int argc, char** argv)
     if (std::strcmp(command, "generate") == 0)
     {
         return command_generate(argc, argv);
+    }
+    if (std::strcmp(command, "transcribe") == 0)
+    {
+        return command_transcribe(argc, argv);
     }
     if (std::strcmp(command, "version") == 0 || std::strcmp(command, "--version") == 0)
     {

@@ -97,14 +97,33 @@ top. No third party dependencies. Owner: Luís (akadjoker). "faisca" is a workin
    tiles of 16 positions are stored). The Vulkan runner has no state
    export yet.
 
-7. Whisper (speech to text), the owner's priority over more CPU work: loader
-   for whisper.cpp's ggml model format, mel spectrogram, encoder (conv1d,
-   attention), decoder with cross attention, WAV reading, `transcribe` in the
-   CLI; validated layer by layer against whisper.cpp 1.9.5
-   (/home/user/ref/whisper.cpp) with tiny, base and small. Quality (Whisper
-   paper, LibriSpeech WER): tiny 7.6, base 5.0, small 3.4, medium 2.9; the
-   small models degrade outside English and the training data is mostly
-   Brazilian Portuguese, so European Portuguese needs our own measurement.
+7. Whisper (speech to text), the owner's priority over more CPU work. Done
+   in float32: `WhisperModel` (include/faisca/whisper_model.h: whisper.cpp's
+   ggml file, f16 converted at load, vocabulary as raw bytes, special ids
+   derived from n_vocab as whisper.cpp does, 99 language codes), `read_wav`
+   and `log_mel_spectrogram` (audio.h, bit identical to whisper.cpp: same
+   Hann, sin/cos tables, FFT recursion, double filter sums, clamp),
+   float32 ops (layer_norm, gelu tanh form, conv1d_k3, attention_rows),
+   `WhisperRunner` (encoder, cross K scaled by head_dim^-0.25 and V per
+   decoder layer, decoder with self KV cache, Q and K scaled by
+   head_dim^-0.25, prompt [sot, lang, transcribe, no_timestamps], the
+   logit rules of whisper_process_logits without timestamps, greedy up to
+   n_text_ctx / 2 - 4 tokens, 30 s windows), `faisca transcribe`. Reference:
+   /home/user/ref/whisper.cpp 1.9.5 patched (whisper_set_eval_callback on
+   every sched, named tensors e_*/d_*/cross_*/conv1/logits, and a
+   WHISPER_F32_REFERENCE build: itype F32, no GELU f16 table, conv im2col
+   F32), tests/reference/whisper_layer_dump.cpp, tests/make_f32_whisper.py,
+   tests/whisper_dump.cpp, tests/compare_whisper.py. Validated on jfk.wav
+   and FLEURS pt_br clips (/home/user/ref/audio): tiny / base / small, every
+   traced tensor at worst 1.4e-5 / 1.8e-5 / 2.2e-5 rel L2 from the f32
+   reference, tokens identical in all runs, 1 and 4 threads bit identical,
+   ASan/UBSan clean; stock whisper.cpp (f16 cache, GELU table) is 3e-3 from
+   ours with the same tokens. float32 matvecs make it slow (small 0.22x real
+   time with 4 threads): next, Q8_0 packed weights with the existing VNNI
+   GEMM, then the speed table against whisper-cli. Quality (Whisper paper,
+   LibriSpeech WER): tiny 7.6, base 5.0, small 3.4, medium 2.9; on the
+   Portuguese clips only small gets pt_0 exactly, and the training data is
+   mostly Brazilian, so European Portuguese needs our own measurement.
 8. Text to speech: pick between OuteTTS (llama LLM + WavTokenizer, decoder
    in libllama as `wavtokenizer-dec`) and Piper (VITS, pt_PT voices, ONNX
    reference) by listening to Portuguese samples, then the audio decoder,

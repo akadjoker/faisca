@@ -1069,6 +1069,122 @@ void test_swiglu_and_add()
     CHECK(x[0] == 1.5f && x[1] == 0.0f && x[2] == 13.0f);
 }
 
+void test_whisper_ops()
+{
+    std::mt19937 rng(91);
+    const size_t n = 96;
+    std::vector<float> x = random_values(rng, n, 2.0f);
+    std::vector<float> w = random_values(rng, n, 1.0f);
+    std::vector<float> b = random_values(rng, n, 0.5f);
+    std::vector<float> out(n);
+    layer_norm(x.data(), w.data(), b.data(), n, 1e-5f, out.data());
+    double mean = 0.0;
+    for (float v : x)
+    {
+        mean += v;
+    }
+    mean /= n;
+    double var = 0.0;
+    for (float v : x)
+    {
+        var += (v - mean) * (v - mean);
+    }
+    var /= n;
+    double worst = 0.0;
+    for (size_t i = 0; i < n; ++i)
+    {
+        const double expected = (x[i] - mean) / std::sqrt(var + 1e-5) * w[i] + b[i];
+        worst = std::max(worst, std::fabs(expected - out[i]));
+    }
+    CHECK(worst < 1e-5);
+
+    std::vector<float> g = random_values(rng, n, 4.0f);
+    std::vector<float> g_ref = g;
+    gelu(g.data(), n);
+    worst = 0.0;
+    for (size_t i = 0; i < n; ++i)
+    {
+        const double v = g_ref[i];
+        const double expected = 0.5 * v * (1.0 + std::tanh(std::sqrt(2.0 / M_PI) * (v + 0.044715 * v * v * v)));
+        worst = std::max(worst, std::fabs(expected - g[i]));
+    }
+    CHECK(worst < 1e-5);
+
+    // conv1d with kernel 3 and one zero of padding against a plain double loop, stride 1 and 2
+    const size_t n_in = 5;
+    const size_t n_out = 7;
+    const size_t length = 20;
+    std::vector<float> cx = random_values(rng, n_in * length, 1.0f);
+    std::vector<float> cw = random_values(rng, n_out * n_in * 3, 1.0f);
+    std::vector<float> cb = random_values(rng, n_out, 1.0f);
+    for (size_t stride : {size_t(1), size_t(2)})
+    {
+        std::vector<float> co(n_out * (length / stride), 999.0f);
+        conv1d_k3(cx.data(), n_in, length, cw.data(), cb.data(), stride, 0, n_out, co.data());
+        worst = 0.0;
+        for (size_t oc = 0; oc < n_out; ++oc)
+        {
+            for (size_t t = 0; t < length / stride; ++t)
+            {
+                double sum = cb[oc];
+                for (size_t ic = 0; ic < n_in; ++ic)
+                {
+                    for (size_t k = 0; k < 3; ++k)
+                    {
+                        const long pos = static_cast<long>(t * stride + k) - 1;
+                        if (pos >= 0 && pos < static_cast<long>(length))
+                        {
+                            sum += static_cast<double>(cw[(oc * n_in + ic) * 3 + k]) * cx[ic * length + static_cast<size_t>(pos)];
+                        }
+                    }
+                }
+                worst = std::max(worst, std::fabs(sum - co[oc * (length / stride) + t]));
+            }
+        }
+        CHECK(worst < 1e-5);
+    }
+
+    // one attention row against a double softmax
+    const size_t head_dim = 8;
+    const size_t n_kv = 13;
+    const size_t stride = 24;
+    std::vector<float> q = random_values(rng, head_dim, 1.0f);
+    std::vector<float> k = random_values(rng, n_kv * stride, 1.0f);
+    std::vector<float> v = random_values(rng, n_kv * stride, 1.0f);
+    std::vector<float> scores(n_kv);
+    std::vector<float> ao(head_dim);
+    attention_rows(q.data(), k.data(), v.data(), stride, head_dim, n_kv, 0.35f, scores.data(), ao.data());
+    std::vector<double> p(n_kv);
+    double pmax = -1e30;
+    for (size_t j = 0; j < n_kv; ++j)
+    {
+        double s = 0.0;
+        for (size_t d = 0; d < head_dim; ++d)
+        {
+            s += static_cast<double>(q[d]) * k[j * stride + d];
+        }
+        p[j] = s * 0.35;
+        pmax = std::max(pmax, p[j]);
+    }
+    double psum = 0.0;
+    for (size_t j = 0; j < n_kv; ++j)
+    {
+        p[j] = std::exp(p[j] - pmax);
+        psum += p[j];
+    }
+    worst = 0.0;
+    for (size_t d = 0; d < head_dim; ++d)
+    {
+        double expected = 0.0;
+        for (size_t j = 0; j < n_kv; ++j)
+        {
+            expected += p[j] / psum * v[j * stride + d];
+        }
+        worst = std::max(worst, std::fabs(expected - ao[d]));
+    }
+    CHECK(worst < 1e-5);
+}
+
 }
 
 int main()
@@ -1088,6 +1204,7 @@ int main()
     test_f16_cache();
     test_vector_quantizers_and_swiglu();
     test_swiglu_and_add();
+    test_whisper_ops();
 
     std::printf("%s ops_unit: %d checks, %d failed\n", g_failures == 0 ? "ok  " : "FAIL", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;
