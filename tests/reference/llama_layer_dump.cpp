@@ -22,8 +22,9 @@ namespace
 {
 
 const std::set<std::string> WANTED = {
-    "inp_embd", "attn_norm", "Qcur", "Kcur", "Vcur", "attn_out", "ffn_inp", "ffn_norm", "ffn_gate",
-    "ffn_up", "ffn_swiglu", "ffn_out", "l_out", "result_norm", "result_output",
+    "inp_embd", "inp_scaled", "attn_norm", "Qcur", "Kcur", "Vcur", "Qcur_normed", "Kcur_normed", "attn_out",
+    "attn_post_norm", "sa_out", "ffn_inp", "ffn_norm", "ffn_gate", "ffn_up", "ffn_swiglu", "ffn_gelu", "ffn_out",
+    "ffn_post_norm", "l_out", "result_norm", "result_output",
 };
 
 struct Capture

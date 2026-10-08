@@ -175,6 +175,12 @@ void Tokenizer::release()
     m_symbols.release();
     m_symbol_index.release();
     m_merges.release();
+    m_scores.release();
+    m_spm_text.release();
+    m_spm_symbols.release();
+    m_spm_heap.release();
+    m_model = Model::Bpe;
+    m_unk = TOKEN_NONE;
     m_merged.release();
     m_special.release();
     m_pieces.release();
@@ -263,20 +269,26 @@ bool Tokenizer::load_tokens(const GgufFile& file, Error& error)
         error.set("tokenizer.ggml.model is missing");
         return false;
     }
-    if (model != "gpt2")
+    if (model != "gpt2" && model != "llama")
     {
-        error.set("tokenizer model '%.*s' is not supported, only 'gpt2' (byte level BPE)", static_cast<int>(model.size()),
-                  model.data());
+        error.set("tokenizer model '%.*s' is not supported, only 'gpt2' (byte level BPE) and 'llama' (SentencePiece)",
+                  static_cast<int>(model.size()), model.data());
         return false;
     }
+    m_model = model == "llama" ? Model::Spm : Model::Bpe;
 
     std::string_view pre;
-    if (!file.get_string("tokenizer.ggml.pre", pre))
+    if (!file.get_string("tokenizer.ggml.pre", pre) && m_model == Model::Bpe)
     {
         error.set("tokenizer.ggml.pre is missing");
         return false;
     }
-    if (pre == "gpt-2" || pre == "phi-2")
+    if (m_model == Model::Spm)
+    {
+        m_add_bos = true;
+        m_add_space_prefix = true;
+    }
+    else if (pre == "gpt-2" || pre == "phi-2")
     {
         m_pre = PreTokenizer::Gpt2;
         m_clean_spaces = true;
@@ -284,6 +296,11 @@ bool Tokenizer::load_tokens(const GgufFile& file, Error& error)
     else if (pre == "smollm")
     {
         m_pre = PreTokenizer::SmolLm;
+        m_clean_spaces = false;
+    }
+    else if (pre == "qwen2")
+    {
+        m_pre = PreTokenizer::Qwen2;
         m_clean_spaces = false;
     }
     else if (pre == "llama-bpe" || pre == "llama3" || pre == "llama-v3")
@@ -395,11 +412,43 @@ bool Tokenizer::load_tokens(const GgufFile& file, Error& error)
         m_ascii_classes[c] = unicode_class(c);
     }
 
+    if (m_model == Model::Spm)
+    {
+        const GgufArray* score_array = file.get_array("tokenizer.ggml.scores");
+        if (score_array == nullptr || score_array->elem_type != GgufType::Float32 || score_array->count < count ||
+            !score_array->copy_to(m_scores))
+        {
+            error.set("tokenizer.ggml.scores is missing or is not a float array with one entry per token");
+            return false;
+        }
+        for (uint32_t byte = 0; byte < 256; ++byte)
+        {
+            m_byte_token[byte] = TOKEN_NONE;
+        }
+        for (size_t i = 0; i < count; ++i)
+        {
+            const Token& token = m_tokens[i];
+            if (token.type == TokenType::Byte && token.text.size() >= 5)
+            {
+                m_byte_token[static_cast<uint8_t>(byte_token_value(token.text))] = static_cast<int32_t>(i);
+            }
+        }
+        uint64_t id = 0;
+        if (file.get_uint("tokenizer.ggml.unknown_token_id", id) && id < count)
+        {
+            m_unk = static_cast<int32_t>(id);
+        }
+    }
+
     return true;
 }
 
 bool Tokenizer::load_merges(const GgufFile& file, Error& error)
 {
+    if (m_model == Model::Spm)
+    {
+        return true;
+    }
     const GgufArray* merge_array = file.get_array("tokenizer.ggml.merges");
     if (merge_array == nullptr || merge_array->elem_type != GgufType::String)
     {
@@ -483,9 +532,27 @@ bool Tokenizer::load_special_tokens(const GgufFile& file, Error& error)
     file.get_bool("tokenizer.ggml.add_eos_token", m_add_eos);
     file.get_bool("tokenizer.ggml.add_space_prefix", m_add_space_prefix);
 
+    // llama.cpp makes these end of generation texts control tokens whatever the file says
+    static const char* const EOG_TEXTS[] = {"<|eot_id|>", "<|im_end|>", "<|end|>", "<|return|>", "<|call|>", "<|flush|>",
+                                            "<|calls|>", "<end_of_turn>", "<|endoftext|>", "</s>", "<|eom_id|>", "<EOT>",
+                                            "_<EOT>", "[EOT]", "[EOS]", "<|end_of_text|>", "<end_of_utterance>", "<eos>",
+                                            "<turn|>", "<|tool_response>", "<\xef\xbd\x9c" "end\xe2\x96\x81of\xe2\x96\x81sentence\xef\xbd\x9c>",
+                                            "[e~[", "<|ifm|im_end|>"};
     for (size_t i = 0; i < m_tokens.size(); ++i)
     {
-        const TokenType type = m_tokens[i].type;
+        TokenType& type = m_tokens[i].type;
+        if (type != TokenType::Control)
+        {
+            const std::string_view text = token_text(static_cast<int32_t>(i));
+            for (const char* eog : EOG_TEXTS)
+            {
+                if (text == eog)
+                {
+                    type = TokenType::Control;
+                    break;
+                }
+            }
+        }
         if (type != TokenType::Control && type != TokenType::UserDefined && type != TokenType::Unknown)
         {
             continue;
@@ -617,6 +684,7 @@ bool Tokenizer::encode(std::string_view text, bool add_special, bool parse_speci
         return false;
     }
 
+    bool previous_special = true;
     for (size_t i = 0; i < m_fragments.size(); ++i)
     {
         const Fragment fragment = m_fragments[i];
@@ -626,6 +694,15 @@ bool Tokenizer::encode(std::string_view text, bool add_special, bool parse_speci
             {
                 return false;
             }
+            previous_special = true;
+        }
+        else if (m_model == Model::Spm)
+        {
+            if (!encode_spm(text.substr(fragment.offset, fragment.length), m_add_space_prefix && previous_special, out))
+            {
+                return false;
+            }
+            previous_special = false;
         }
         else if (!encode_text(text.substr(fragment.offset, fragment.length), out))
         {
@@ -685,7 +762,8 @@ bool Tokenizer::encode_text(std::string_view text, Array<int32_t>& out)
         }
         m_words.swap(m_words_next);
     }
-    if (m_pre == PreTokenizer::Llama3 ? !split_llama3(m_words, m_words_next) : !split_gpt2(m_words, m_words_next))
+    const bool llama3 = m_pre == PreTokenizer::Llama3 || m_pre == PreTokenizer::Qwen2;
+    if (llama3 ? !split_llama3(m_words, m_words_next, m_pre == PreTokenizer::Llama3 ? 3 : 1) : !split_gpt2(m_words, m_words_next))
     {
         return false;
     }
@@ -856,7 +934,8 @@ bool Tokenizer::split_gpt2(const Array<uint32_t>& in, Array<uint32_t>& out) cons
 // the llama 3 regex, matched the way llama.cpp's unicode_regex_split_custom_llama3 does:
 // (?i:'s|'t|'re|'ve|'m|'ll|'d) | [^\r\n\p{L}\p{N}]?\p{L}+ | \p{N}{1,3} |
 //  ?[^\s\p{L}\p{N}]+[\r\n]* | \s*[\r\n]+ | \s+(?!\S) | \s+
-bool Tokenizer::split_llama3(const Array<uint32_t>& in, Array<uint32_t>& out) const
+// qwen2's regex is the same with \p{N} (one digit per piece)
+bool Tokenizer::split_llama3(const Array<uint32_t>& in, Array<uint32_t>& out, size_t max_digits) const
 {
     out.clear();
 
@@ -925,7 +1004,7 @@ bool Tokenizer::split_llama3(const Array<uint32_t>& in, Array<uint32_t>& out) co
             if (next == 0 && (type & UNICODE_NUMBER) != 0)
             {
                 size_t scan = pos;
-                while ((class_at(scan) & UNICODE_NUMBER) != 0 && scan - pos < 3)
+                while ((class_at(scan) & UNICODE_NUMBER) != 0 && scan - pos < max_digits)
                 {
                     ++scan;
                 }
@@ -990,6 +1069,173 @@ bool Tokenizer::split_llama3(const Array<uint32_t>& in, Array<uint32_t>& out) co
         }
     }
     return true;
+}
+
+// llama.cpp's llm_tokenizer_spm_session: one symbol per UTF-8 character, the pair of
+// neighbours whose joined text is the piece with the highest score merged first (ties to the
+// leftmost), what is left as pieces or, for a character no piece covers, as its bytes
+bool Tokenizer::encode_spm(std::string_view text, bool space_prefix, Array<int32_t>& out)
+{
+    m_spm_text.clear();
+    if (space_prefix && !m_spm_text.push_back(' '))
+    {
+        return false;
+    }
+    if (!m_spm_text.append(text.data(), text.size()))
+    {
+        return false;
+    }
+    Array<char>& escaped = m_scratch;
+    escaped.clear();
+    for (size_t i = 0; i < m_spm_text.size(); ++i)
+    {
+        const char c = m_spm_text[i];
+        if (c == ' ' ? !escaped.append("\xe2\x96\x81", 3) : !escaped.push_back(c))
+        {
+            return false;
+        }
+    }
+
+    m_spm_symbols.clear();
+    m_spm_heap.clear();
+    static const uint8_t UTF8_LENGTH[16] = {1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 3, 4};
+    for (size_t offset = 0; offset < escaped.size();)
+    {
+        const size_t length = UTF8_LENGTH[static_cast<uint8_t>(escaped[offset]) >> 4];
+        const size_t n = offset + length <= escaped.size() ? length : escaped.size() - offset;
+        const int32_t index = static_cast<int32_t>(m_spm_symbols.size());
+        SpmSymbol symbol{static_cast<uint32_t>(offset), static_cast<uint32_t>(n), index - 1,
+                         offset + n == escaped.size() ? -1 : index + 1};
+        if (!m_spm_symbols.push_back(symbol))
+        {
+            return false;
+        }
+        offset += n;
+    }
+    for (size_t i = 1; i < m_spm_symbols.size(); ++i)
+    {
+        if (!spm_try_bigram(static_cast<int32_t>(i) - 1, static_cast<int32_t>(i)))
+        {
+            return false;
+        }
+    }
+
+    while (!m_spm_heap.empty())
+    {
+        const SpmBigram bigram = spm_pop();
+        SpmSymbol& left = m_spm_symbols[static_cast<size_t>(bigram.left)];
+        SpmSymbol& right = m_spm_symbols[static_cast<size_t>(bigram.right)];
+        if (left.length == 0 || right.length == 0 || left.length + right.length != bigram.size)
+        {
+            continue;
+        }
+        left.length += right.length;
+        right.length = 0;
+        left.next = right.next;
+        if (right.next >= 0)
+        {
+            m_spm_symbols[static_cast<size_t>(right.next)].prev = bigram.left;
+        }
+        if (!spm_try_bigram(left.prev, bigram.left) || !spm_try_bigram(bigram.left, left.next))
+        {
+            return false;
+        }
+    }
+
+    for (int32_t i = m_spm_symbols.empty() ? -1 : 0; i != -1; i = m_spm_symbols[static_cast<size_t>(i)].next)
+    {
+        const SpmSymbol& symbol = m_spm_symbols[static_cast<size_t>(i)];
+        const std::string_view piece(escaped.data() + symbol.offset, symbol.length);
+        const int32_t token = find_token(piece);
+        if (token != TOKEN_NONE)
+        {
+            if (!out.push_back(token))
+            {
+                return false;
+            }
+            continue;
+        }
+        for (size_t j = 0; j < piece.size(); ++j)
+        {
+            const int32_t byte = m_byte_token[static_cast<uint8_t>(piece[j])];
+            if (!out.push_back(byte != TOKEN_NONE ? byte : m_unk))
+            {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+bool Tokenizer::spm_try_bigram(int32_t left, int32_t right)
+{
+    if (left < 0 || right < 0)
+    {
+        return true;
+    }
+    const SpmSymbol& l = m_spm_symbols[static_cast<size_t>(left)];
+    const SpmSymbol& r = m_spm_symbols[static_cast<size_t>(right)];
+    const std::string_view piece(m_scratch.data() + l.offset, l.length + r.length);
+    const int32_t token = find_token(piece);
+    if (token == TOKEN_NONE)
+    {
+        return true;
+    }
+    const SpmBigram bigram{m_scores[static_cast<size_t>(token)], left, right, static_cast<uint32_t>(piece.size())};
+    if (!m_spm_heap.push_back(bigram))
+    {
+        return false;
+    }
+    size_t at = m_spm_heap.size() - 1;
+    while (at > 0)
+    {
+        const size_t parent = (at - 1) / 2;
+        const SpmBigram p = m_spm_heap[parent];
+        const SpmBigram c = m_spm_heap[at];
+        if (p.score > c.score || (p.score == c.score && p.left < c.left))
+        {
+            break;
+        }
+        m_spm_heap[at] = p;
+        m_spm_heap[parent] = c;
+        at = parent;
+    }
+    return true;
+}
+
+Tokenizer::SpmBigram Tokenizer::spm_pop()
+{
+    const SpmBigram top = m_spm_heap[0];
+    const SpmBigram last = m_spm_heap[m_spm_heap.size() - 1];
+    m_spm_heap.resize_uninitialized(m_spm_heap.size() - 1);
+    if (m_spm_heap.empty())
+    {
+        return top;
+    }
+    size_t at = 0;
+    m_spm_heap[0] = last;
+    const size_t n = m_spm_heap.size();
+    for (;;)
+    {
+        size_t best = at;
+        for (size_t child = 2 * at + 1; child <= 2 * at + 2 && child < n; ++child)
+        {
+            const SpmBigram& b = m_spm_heap[best];
+            const SpmBigram& c = m_spm_heap[child];
+            if (c.score > b.score || (c.score == b.score && c.left < b.left))
+            {
+                best = child;
+            }
+        }
+        if (best == at)
+        {
+            return top;
+        }
+        const SpmBigram swap = m_spm_heap[at];
+        m_spm_heap[at] = m_spm_heap[best];
+        m_spm_heap[best] = swap;
+        at = best;
+    }
 }
 
 bool Tokenizer::push_bigram(int32_t left, int32_t right)
@@ -1325,6 +1571,23 @@ bool Tokenizer::build_pieces(Error& error)
         if (is_special_type(entry.type) || entry.type == TokenType::UserDefined)
         {
             ok = m_pieces.append(entry.text.data(), entry.text.size());
+        }
+        else if (entry.type == TokenType::Normal && m_model == Model::Spm)
+        {
+            const std::string_view text = entry.text;
+            for (size_t i = 0; i < text.size() && ok; ++i)
+            {
+                if (i + 3 <= text.size() && static_cast<uint8_t>(text[i]) == 0xe2 && static_cast<uint8_t>(text[i + 1]) == 0x96 &&
+                    static_cast<uint8_t>(text[i + 2]) == 0x81)
+                {
+                    ok = m_pieces.push_back(' ');
+                    i += 2;
+                }
+                else
+                {
+                    ok = m_pieces.push_back(text[i]);
+                }
+            }
         }
         else if (entry.type == TokenType::Normal)
         {

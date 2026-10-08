@@ -104,10 +104,14 @@ private:
 
     typedef void (Runner::*TokenStep)(const LlamaLayer* layer, uint32_t pos, size_t token);
     void for_tokens(TokenStep step, const LlamaLayer* layer, uint32_t pos, size_t n_tokens);
+    void step_scale_embd(const LlamaLayer* layer, uint32_t pos, size_t token);
     void step_attn_norm(const LlamaLayer* layer, uint32_t pos, size_t token);
+    void step_qk_norm(const LlamaLayer* layer, uint32_t pos, size_t token);
     void step_rope_store(const LlamaLayer* layer, uint32_t pos, size_t token);
+    void step_attn_post_norm(const LlamaLayer* layer, uint32_t pos, size_t token);
     void step_ffn_inp(const LlamaLayer* layer, uint32_t pos, size_t token);
     void step_swiglu(const LlamaLayer* layer, uint32_t pos, size_t token);
+    void step_ffn_post_norm(const LlamaLayer* layer, uint32_t pos, size_t token);
     void step_residual(const LlamaLayer* layer, uint32_t pos, size_t token);
     void step_output_norm(const LlamaLayer* layer, uint32_t pos, size_t token);
     static void token_task(void* user, int thread_index, int thread_count);
@@ -120,6 +124,7 @@ private:
     size_t m_quantize_tokens = 0;
 
     bool init_buffers(const LlamaModel& model, uint32_t n_ctx, bool kv_f16, Error& error);
+    void softcap(float* logits, size_t count) const;
     void forward_batch(const int32_t* tokens, size_t count, uint32_t pos, float* logits, bool all_logits);
     void quantize_inputs(const float* x, size_t stride, size_t n_tokens, size_t n, Activation kind);
     void matmul(const Weight& w, const float* x, size_t x_stride, size_t n_tokens, float* out, size_t out_stride);

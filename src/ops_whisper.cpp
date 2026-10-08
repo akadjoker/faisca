@@ -1,6 +1,7 @@
 #include "faisca/ops.h"
 
 #include <cmath>
+#include <cstring>
 
 namespace faisca
 {
@@ -36,6 +37,16 @@ void gelu(float* x, size_t n)
     {
         const float v = x[i];
         x[i] = 0.5f * v * (1.0f + tanhf(sqrt_2_over_pi * v * (1.0f + coef_a * v * v)));
+    }
+}
+
+void geglu(const float* gate, const float* up, size_t n, float* out)
+{
+    std::memcpy(out, gate, n * sizeof(float));
+    gelu(out, n);
+    for (size_t i = 0; i < n; ++i)
+    {
+        out[i] *= up[i];
     }
 }
 

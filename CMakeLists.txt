@@ -130,6 +130,9 @@ if(FAISCA_BUILD_TESTS)
     add_executable(matmul_check tests/matmul_check.cpp)
     target_link_libraries(matmul_check PRIVATE faisca_lib)
 
+    add_executable(bench_runner bench/bench_runner.cpp)
+    target_link_libraries(bench_runner PRIVATE faisca_lib)
+
     add_executable(speculative_check tests/speculative_check.cpp)
     target_link_libraries(speculative_check PRIVATE faisca_lib)
 

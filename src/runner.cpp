@@ -359,10 +359,50 @@ void Runner::for_tokens(TokenStep step, const LlamaLayer* layer, uint32_t pos, s
     m_pool->run(token_task, &job);
 }
 
+void Runner::step_scale_embd(const LlamaLayer*, uint32_t, size_t token)
+{
+    const LlamaHparams& h = m_model->hparams();
+    float* x = m_x.data() + token * h.n_embd;
+    for (size_t i = 0; i < h.n_embd; ++i)
+    {
+        x[i] *= h.embd_scale;
+    }
+}
+
 void Runner::step_attn_norm(const LlamaLayer* layer, uint32_t, size_t token)
 {
     const LlamaHparams& h = m_model->hparams();
     rms_norm(m_x.data() + token * h.n_embd, layer->attn_norm, h.n_embd, h.rms_eps, m_h.data() + token * h.n_embd);
+}
+
+void Runner::step_qk_norm(const LlamaLayer* layer, uint32_t, size_t token)
+{
+    const LlamaHparams& h = m_model->hparams();
+    const size_t head_dim = h.head_dim;
+    float* q = m_q.data() + token * h.n_head * head_dim;
+    float* k = m_k_batch.data() + token * h.n_head_kv * head_dim;
+    for (size_t i = 0; i < h.n_head; ++i)
+    {
+        rms_norm(q + i * head_dim, layer->attn_q_norm, head_dim, h.rms_eps, q + i * head_dim);
+    }
+    for (size_t i = 0; i < h.n_head_kv; ++i)
+    {
+        rms_norm(k + i * head_dim, layer->attn_k_norm, head_dim, h.rms_eps, k + i * head_dim);
+    }
+}
+
+void Runner::step_attn_post_norm(const LlamaLayer* layer, uint32_t, size_t token)
+{
+    const LlamaHparams& h = m_model->hparams();
+    float* row = m_h.data() + token * h.n_embd;
+    rms_norm(row, layer->attn_post_norm, h.n_embd, h.rms_eps, row);
+}
+
+void Runner::step_ffn_post_norm(const LlamaLayer* layer, uint32_t, size_t token)
+{
+    const LlamaHparams& h = m_model->hparams();
+    float* row = m_h.data() + token * h.n_embd;
+    rms_norm(row, layer->ffn_post_norm, h.n_embd, h.rms_eps, row);
 }
 
 void Runner::step_ffn_inp(const LlamaLayer* layer, uint32_t, size_t token)
@@ -375,6 +415,11 @@ void Runner::step_ffn_inp(const LlamaLayer* layer, uint32_t, size_t token)
 void Runner::step_swiglu(const LlamaLayer*, uint32_t, size_t token)
 {
     const LlamaHparams& h = m_model->hparams();
+    if (h.gelu_ffn)
+    {
+        geglu(m_gate.data() + token * h.n_ff, m_up.data() + token * h.n_ff, h.n_ff, m_act.data() + token * h.n_ff);
+        return;
+    }
     swiglu(m_gate.data() + token * h.n_ff, m_up.data() + token * h.n_ff, h.n_ff, m_act.data() + token * h.n_ff);
 }
 
@@ -442,22 +487,35 @@ void Runner::attention_unit(int il, uint32_t pos, size_t token, size_t head, flo
     const size_t n_kv = static_cast<size_t>(h.n_head_kv) * head_dim;
     const size_t n_q = static_cast<size_t>(h.n_head) * head_dim;
     const size_t kv_head = head / (h.n_head / h.n_head_kv);
-    const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+    const float scale = h.attn_scale != 0.0f ? 1.0f : 1.0f / std::sqrt(static_cast<float>(head_dim));
 
     const size_t tiles = (static_cast<size_t>(m_n_ctx) + 15) / 16;
     const size_t k_offset = (static_cast<size_t>(il) * h.n_head_kv + kv_head) * tiles * head_dim * KEY_TILE;
     const size_t v_offset = static_cast<size_t>(il) * m_n_ctx * n_kv + kv_head * head_dim;
     const float* q = m_q.data() + token * n_q + head * head_dim;
     float* out = m_attn.data() + token * n_q + head * head_dim;
-    const size_t n_past = static_cast<size_t>(pos) + token + 1;
+    size_t n_past = static_cast<size_t>(pos) + token + 1;
+    // a local layer sees the last n_swa positions: the window starts at a whole tile and
+    // the kernel skips the positions before the start inside it
+    size_t start_tile = 0;
+    size_t skip = 0;
+    if (h.local_layer(static_cast<uint32_t>(il)) && n_past > h.n_swa)
+    {
+        const size_t start = n_past - h.n_swa;
+        start_tile = start / KEY_TILE;
+        skip = start % KEY_TILE;
+        n_past -= start_tile * KEY_TILE;
+    }
+    const size_t k_start = k_offset + start_tile * head_dim * KEY_TILE;
+    const size_t v_start = v_offset + start_tile * KEY_TILE * n_kv;
     if (m_kv_f16)
     {
-        attention_head_f16(q, m_k16.data() + k_offset, m_v16.data() + v_offset, n_kv, head_dim, n_past, scale, scores,
-                           out);
+        attention_head_f16(q, m_k16.data() + k_start, m_v16.data() + v_start, n_kv, head_dim, n_past, scale, scores, out,
+                           skip);
     }
     else
     {
-        attention_head(q, m_k.data() + k_offset, m_v.data() + v_offset, n_kv, head_dim, n_past, scale, scores, out);
+        attention_head(q, m_k.data() + k_start, m_v.data() + v_start, n_kv, head_dim, n_past, scale, scores, out, skip);
     }
 }
 
@@ -469,9 +527,19 @@ void Runner::step_rope_store(const LlamaLayer*, uint32_t pos, size_t token)
     const size_t n_q = static_cast<size_t>(h.n_head) * head_dim;
     const uint32_t p = pos + static_cast<uint32_t>(token);
     float* k_cur = m_k_batch.data() + token * n_kv;
+    float* q = m_q.data() + token * n_q;
     const float* factors = m_model->rope_factors();
-    rope_norm(m_q.data() + token * n_q, h.n_head, head_dim, h.n_rot, p, h.rope_freq_base, factors);
-    rope_norm(k_cur, h.n_head_kv, head_dim, h.n_rot, p, h.rope_freq_base, factors);
+    const float freq_base = h.local_layer(static_cast<uint32_t>(m_layer)) ? h.rope_freq_base_swa : h.rope_freq_base;
+    if (h.rope_neox)
+    {
+        rope_neox(q, h.n_head, head_dim, h.n_rot, p, freq_base);
+        rope_neox(k_cur, h.n_head_kv, head_dim, h.n_rot, p, freq_base);
+    }
+    else
+    {
+        rope_norm(q, h.n_head, head_dim, h.n_rot, p, freq_base, factors);
+        rope_norm(k_cur, h.n_head_kv, head_dim, h.n_rot, p, freq_base, factors);
+    }
 
     const size_t tiles = (static_cast<size_t>(m_n_ctx) + 15) / 16;
     const size_t layer_offset = static_cast<size_t>(m_layer) * h.n_head_kv * tiles * head_dim * KEY_TILE;
@@ -505,18 +573,46 @@ void Runner::attention(const LlamaLayer& layer, int il, uint32_t pos, size_t n_t
     matmul(layer.wq, m_h.data(), h.n_embd, n_tokens, m_q.data(), n_q);
     matmul(layer.wk, m_h.data(), h.n_embd, n_tokens, k_cur, n_kv);
     matmul(layer.wv, m_h.data(), h.n_embd, n_tokens, v_cur, n_kv);
+    if (layer.bq != nullptr)
+    {
+        for (size_t t = 0; t < n_tokens; ++t)
+        {
+            add_bias(m_q.data() + t * n_q, layer.bq, n_q);
+            add_bias(k_cur + t * n_kv, layer.bk, n_kv);
+            add_bias(v_cur + t * n_kv, layer.bv, n_kv);
+        }
+    }
 
     m_layer = static_cast<size_t>(il);
+    if (h.qk_norm)
+    {
+        for_tokens(&Runner::step_qk_norm, &layer, pos, n_tokens);
+        trace_rows("Qcur_normed", il, m_q.data(), n_q, n_tokens, n_q);
+        trace_rows("Kcur_normed", il, k_cur, n_kv, n_tokens, n_kv);
+    }
     for_tokens(&Runner::step_rope_store, &layer, pos, n_tokens);
     trace_rows("Qcur", il, m_q.data(), n_q, n_tokens, n_q);
     trace_rows("Kcur", il, k_cur, n_kv, n_tokens, n_kv);
     trace_rows("Vcur", il, v_cur, n_kv, n_tokens, n_kv);
+    if (h.attn_scale != 0.0f)
+    {
+        float* q = m_q.data();
+        for (size_t i = 0; i < n_tokens * n_q; ++i)
+        {
+            q[i] *= h.attn_scale;
+        }
+    }
 
     AttentionJob job{this, il, pos, n_tokens};
     m_pool->run(attention_task, &job);
 
     matmul(layer.wo, m_attn.data(), n_q, n_tokens, m_h.data(), h.n_embd);
     trace_rows("attn_out", il, m_h.data(), h.n_embd, n_tokens, h.n_embd);
+    if (h.post_norms)
+    {
+        for_tokens(&Runner::step_attn_post_norm, &layer, pos, n_tokens);
+        trace_rows("attn_post_norm", il, m_h.data(), h.n_embd, n_tokens, h.n_embd);
+    }
 }
 
 void Runner::forward_batch(const int32_t* tokens, size_t count, uint32_t pos, float* logits, bool all_logits)
@@ -529,6 +625,11 @@ void Runner::forward_batch(const int32_t* tokens, size_t count, uint32_t pos, fl
         m_model->token_embd().row(static_cast<size_t>(tokens[t]), m_x.data() + t * n_embd);
     }
     trace_rows("inp_embd", -1, m_x.data(), n_embd, count, n_embd);
+    if (h.embd_scale != 1.0f)
+    {
+        for_tokens(&Runner::step_scale_embd, nullptr, pos, count);
+        trace_rows("inp_scaled", -1, m_x.data(), n_embd, count, n_embd);
+    }
 
     for (uint32_t l = 0; l < h.n_layer; ++l)
     {
@@ -540,7 +641,7 @@ void Runner::forward_batch(const int32_t* tokens, size_t count, uint32_t pos, fl
 
         attention(layer, il, pos, count);
         for_tokens(&Runner::step_ffn_inp, &layer, pos, count);
-        trace_rows("ffn_inp", il, m_x.data(), n_embd, count, n_embd);
+        trace_rows(h.post_norms ? "sa_out" : "ffn_inp", il, m_x.data(), n_embd, count, n_embd);
         trace_rows("ffn_norm", il, m_h.data(), n_embd, count, n_embd);
 
         matmul(layer.ffn_gate, m_h.data(), n_embd, count, m_gate.data(), h.n_ff);
@@ -548,9 +649,14 @@ void Runner::forward_batch(const int32_t* tokens, size_t count, uint32_t pos, fl
         trace_rows("ffn_gate", il, m_gate.data(), h.n_ff, count, h.n_ff);
         trace_rows("ffn_up", il, m_up.data(), h.n_ff, count, h.n_ff);
         for_tokens(&Runner::step_swiglu, &layer, pos, count);
-        trace_rows("ffn_swiglu", il, m_act.data(), h.n_ff, count, h.n_ff);
+        trace_rows(h.gelu_ffn ? "ffn_geglu" : "ffn_swiglu", il, m_act.data(), h.n_ff, count, h.n_ff);
         matmul(layer.ffn_down, m_act.data(), h.n_ff, count, m_h.data(), n_embd);
         trace_rows("ffn_out", il, m_h.data(), n_embd, count, n_embd);
+        if (h.post_norms)
+        {
+            for_tokens(&Runner::step_ffn_post_norm, &layer, pos, count);
+            trace_rows("ffn_post_norm", il, m_h.data(), n_embd, count, n_embd);
+        }
 
         for_tokens(&Runner::step_residual, &layer, pos, count);
         trace_rows("l_out", il, m_x.data(), n_embd, count, n_embd);
@@ -562,6 +668,7 @@ void Runner::forward_batch(const int32_t* tokens, size_t count, uint32_t pos, fl
         for_tokens(&Runner::step_output_norm, nullptr, pos, count);
         trace_rows("result_norm", -1, m_h.data(), n_embd, count, n_embd);
         matmul(m_model->output(), m_h.data(), n_embd, count, rows, h.n_vocab);
+        softcap(rows, count * h.n_vocab);
         trace_rows("result_output", -1, rows, h.n_vocab, count, h.n_vocab);
         if (!all_logits)
         {
@@ -573,6 +680,20 @@ void Runner::forward_batch(const int32_t* tokens, size_t count, uint32_t pos, fl
     const float* last = m_x.data() + (count - 1) * n_embd;
     rms_norm(last, m_model->output_norm(), n_embd, h.rms_eps, m_h.data());
     matmul(m_model->output(), m_h.data(), n_embd, 1, logits, h.n_vocab);
+    softcap(logits, h.n_vocab);
+}
+
+void Runner::softcap(float* logits, size_t count) const
+{
+    const float cap = m_model->hparams().final_softcap;
+    if (cap == 0.0f)
+    {
+        return;
+    }
+    for (size_t i = 0; i < count; ++i)
+    {
+        logits[i] = cap * std::tanh(logits[i] / cap);
+    }
 }
 
 }

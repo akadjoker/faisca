@@ -369,6 +369,37 @@ against llama.cpp's own outputs on its own inputs (`matmul_check`, zero
 error) and the thread splits never change a sum, so these numbers come with
 bit identical results across thread counts.
 
+## Qwen and Gemma against llama.cpp
+
+`bench_runner` (bench/bench_runner.cpp: the first 512 tokens of a text
+through `Runner::forward`, then 32 greedy tokens, best of 3) against
+`llama-bench` pp512 and tg32, same machine, the Q8_0 files of Qwen2.5-0.5B-
+Instruct, Qwen3-0.6B and gemma-3-1b-it. llama.cpp b86d2f0's CPU backend
+repacks Q8_0 into an AMX buffer and that path aborts on this VM ("AMX is
+not ready to be used"), so it was built with GGML_AMX_INT8, GGML_AMX_TILE
+and GGML_AMX_BF16 off; the SmolLM2 tables above used its AMX build.
+
+| | threads | llama.cpp | faisca |
+| --- | --- | --- | --- |
+| Qwen2.5-0.5B generation (tok/s) | 1 | 13.7 | 17.9 |
+| Qwen2.5-0.5B generation (tok/s) | 4 | 41.7 | 54.5 |
+| Qwen2.5-0.5B prompt (tok/s) | 1 | 95 | 165 |
+| Qwen2.5-0.5B prompt (tok/s) | 4 | 328 | 458 |
+| Qwen3-0.6B generation (tok/s) | 1 | 11.5 | 12.5 |
+| Qwen3-0.6B generation (tok/s) | 4 | 32.1 | 38.2 |
+| Qwen3-0.6B prompt (tok/s) | 1 | 72 | 96 |
+| Qwen3-0.6B prompt (tok/s) | 4 | 245 | 279 |
+| Gemma 3 1B generation (tok/s) | 1 | 6.5 | 8.7 |
+| Gemma 3 1B generation (tok/s) | 4 | 20.2 | 24.1 |
+| Gemma 3 1B prompt (tok/s) | 1 | 43 | 61 |
+| Gemma 3 1B prompt (tok/s) | 4 | 135 | 192 |
+
+Qwen2.5-0.5B reads 500 MiB of weights per token, 136 of them the
+151936 x 896 output matrix; Gemma 3 1B reads 1013 MiB, 302 of them the
+262144 x 1152 output matrix, which bounds its generation. The load of the
+Qwen2.5 file takes 4 s on one thread and 0.2 s with four (packing into
+huge pages).
+
 ## Whisper against whisper.cpp
 
 `faisca transcribe` against `whisper-cli` 1.9.5 (stock build, CPU, no flash

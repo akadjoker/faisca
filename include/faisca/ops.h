@@ -180,6 +180,9 @@ void rms_norm(const float* x, const float* weight, size_t n, float eps, float* o
 void rope_norm(float* x, size_t n_head, size_t head_dim, size_t n_rot, uint32_t pos, float freq_base,
                const float* factors = nullptr);
 
+// the same with pairs (i, i + n_rot / 2), ggml's NEOX mode (Qwen, Gemma)
+void rope_neox(float* x, size_t n_head, size_t head_dim, size_t n_rot, uint32_t pos, float freq_base);
+
 void softmax(float* x, size_t n);
 
 // e^x for every value, within 2 ulp of the libm result; the scalar one is the reference
@@ -198,18 +201,20 @@ inline size_t key_index(size_t head_dim, size_t p, size_t d)
 
 // one query against the cache of one head: v holds position p at v + p * v_stride; out
 // gets head_dim values and scores is scratch for n_past values rounded up to 16; the
-// AVX-512 and AVX2 kernels give the same bits (same sums, same softmax reduction tree)
+// AVX-512 and AVX2 kernels give the same bits (same sums, same softmax reduction tree).
+// skip (less than 16) leaves out the first positions, for a window that starts inside
+// the first tile
 void attention_head(const float* q, const float* k_tiles, const float* v, size_t v_stride, size_t head_dim,
-                    size_t n_past, float scale, float* scores, float* out);
+                    size_t n_past, float scale, float* scores, float* out, size_t skip = 0);
 void attention_head_scalar(const float* q, const float* k_tiles, const float* v, size_t v_stride, size_t head_dim,
-                           size_t n_past, float scale, float* scores, float* out);
+                           size_t n_past, float scale, float* scores, float* out, size_t skip = 0);
 
 // the same over keys and values stored as f16, computed in float32: the result is
 // bit identical to attention_head over the float32 values those halves hold
 void attention_head_f16(const float* q, const uint16_t* k_tiles, const uint16_t* v, size_t v_stride, size_t head_dim,
-                        size_t n_past, float scale, float* scores, float* out);
+                        size_t n_past, float scale, float* scores, float* out, size_t skip = 0);
 void attention_head_f16_scalar(const float* q, const uint16_t* k_tiles, const uint16_t* v, size_t v_stride,
-                               size_t head_dim, size_t n_past, float scale, float* scores, float* out);
+                               size_t head_dim, size_t n_past, float scale, float* scores, float* out, size_t skip = 0);
 
 // out = silu(gate) * up; the vector one uses exp_values, within a few ulp of the scalar one
 void swiglu(const float* gate, const float* up, size_t n, float* out);
@@ -226,6 +231,9 @@ void layer_norm(const float* x, const float* weight, const float* bias, size_t n
 void gelu(float* x, size_t n);
 
 void add_bias(float* x, const float* bias, size_t n);
+
+// out = gelu(gate) * up, the tanh form
+void geglu(const float* gate, const float* up, size_t n, float* out);
 
 // 1-d convolution with a kernel of 3 and one value of zero padding: x holds n_in channels of
 // length values each, w[oc][ic][3]; out gets rows oc in [first, last) of length / stride values

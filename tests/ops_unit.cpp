@@ -1187,6 +1187,64 @@ void test_whisper_ops()
 
 }
 
+void test_attention_skip()
+{
+    std::mt19937 rng(23);
+    const size_t head_dim = 64;
+    const size_t n_kv = 2 * head_dim;
+    const size_t n_past = 45;
+    std::vector<float> q = random_values(rng, head_dim, 1.0f);
+    std::vector<float> k = random_values(rng, n_past * head_dim, 1.0f);
+    std::vector<float> v = random_values(rng, (n_past + 1) * n_kv, 1.0f);
+    std::vector<float> k_t(((n_past + 15) / 16) * 16 * head_dim, 0.0f);
+    for (size_t p = 0; p < n_past; ++p)
+    {
+        for (size_t d = 0; d < head_dim; ++d)
+        {
+            k_t[key_index(head_dim, p, d)] = k[p * head_dim + d];
+        }
+    }
+    double worst = 0.0;
+    for (size_t skip = 0; skip < 16; ++skip)
+    {
+        std::vector<float> scores_a(64), scores_b(64), out_a(head_dim), out_b(head_dim);
+        attention_head_scalar(q.data(), k_t.data(), v.data() + 64, n_kv, head_dim, n_past, 0.125f, scores_a.data(),
+                              out_a.data(), skip);
+        attention_head(q.data(), k_t.data(), v.data() + 64, n_kv, head_dim, n_past, 0.125f, scores_b.data(), out_b.data(),
+                       skip);
+        std::vector<double> w(n_past, 0.0);
+        double max = -1e30;
+        for (size_t p = skip; p < n_past; ++p)
+        {
+            double s = 0.0;
+            for (size_t d = 0; d < head_dim; ++d)
+            {
+                s += static_cast<double>(q[d]) * k[p * head_dim + d];
+            }
+            w[p] = s * 0.125;
+            max = std::max(max, w[p]);
+        }
+        double sum = 0.0;
+        for (size_t p = skip; p < n_past; ++p)
+        {
+            w[p] = std::exp(w[p] - max);
+            sum += w[p];
+        }
+        for (size_t d = 0; d < head_dim; ++d)
+        {
+            double expected = 0.0;
+            for (size_t p = skip; p < n_past; ++p)
+            {
+                expected += w[p] / sum * v[64 + p * n_kv + d];
+            }
+            worst = std::max(worst, std::fabs(expected - out_a[d]));
+            worst = std::max(worst, std::fabs(expected - out_b[d]));
+        }
+    }
+    CHECK(worst < 1e-5);
+    std::printf("attention_head with skip: worst error %.2e\n", worst);
+}
+
 void test_conv1d_rows()
 {
     std::mt19937 rng(77);
@@ -1250,6 +1308,7 @@ int main()
     test_swiglu_and_add();
     test_whisper_ops();
     test_conv1d_rows();
+    test_attention_skip();
 
     std::printf("%s ops_unit: %d checks, %d failed\n", g_failures == 0 ? "ok  " : "FAIL", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;

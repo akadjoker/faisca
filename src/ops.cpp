@@ -2264,6 +2264,27 @@ void rope_norm(float* x, size_t n_head, size_t head_dim, size_t n_rot, uint32_t 
     }
 }
 
+void rope_neox(float* x, size_t n_head, size_t head_dim, size_t n_rot, uint32_t pos, float freq_base)
+{
+    const float theta_scale = std::pow(freq_base, -2.0f / static_cast<float>(n_rot));
+    const size_t half = n_rot / 2;
+    for (size_t h = 0; h < n_head; ++h)
+    {
+        float* head = x + h * head_dim;
+        float theta = static_cast<float>(pos);
+        for (size_t i = 0; i < half; ++i)
+        {
+            const float cos_theta = std::cos(theta);
+            const float sin_theta = std::sin(theta);
+            const float x0 = head[i];
+            const float x1 = head[i + half];
+            head[i] = x0 * cos_theta - x1 * sin_theta;
+            head[i + half] = x0 * sin_theta + x1 * cos_theta;
+            theta *= theta_scale;
+        }
+    }
+}
+
 void softmax(float* x, size_t n)
 {
     if (n == 0)
@@ -2319,7 +2340,7 @@ inline float to_f32(uint16_t bits)
 
 template <typename Value>
 void attention_head_scalar_impl(const float* q, const Value* k_tiles, const Value* v, size_t v_stride, size_t head_dim,
-                                size_t n_past, float scale, float* scores, float* out)
+                                size_t n_past, float scale, float* scores, float* out, size_t skip)
 {
     for (size_t p = 0; p < n_past; ++p)
     {
@@ -2328,7 +2349,7 @@ void attention_head_scalar_impl(const float* q, const Value* k_tiles, const Valu
         {
             s += q[d] * to_f32(k_tiles[key_index(head_dim, p, d)]);
         }
-        scores[p] = s * scale;
+        scores[p] = p < skip ? -INFINITY : s * scale;
     }
     softmax(scores, n_past);
     for (size_t d = 0; d < head_dim; ++d)
@@ -2349,15 +2370,15 @@ void attention_head_scalar_impl(const float* q, const Value* k_tiles, const Valu
 }
 
 void attention_head_scalar(const float* q, const float* k_tiles, const float* v, size_t v_stride, size_t head_dim,
-                           size_t n_past, float scale, float* scores, float* out)
+                           size_t n_past, float scale, float* scores, float* out, size_t skip)
 {
-    attention_head_scalar_impl(q, k_tiles, v, v_stride, head_dim, n_past, scale, scores, out);
+    attention_head_scalar_impl(q, k_tiles, v, v_stride, head_dim, n_past, scale, scores, out, skip);
 }
 
 void attention_head_f16_scalar(const float* q, const uint16_t* k_tiles, const uint16_t* v, size_t v_stride,
-                               size_t head_dim, size_t n_past, float scale, float* scores, float* out)
+                               size_t head_dim, size_t n_past, float scale, float* scores, float* out, size_t skip)
 {
-    attention_head_scalar_impl(q, k_tiles, v, v_stride, head_dim, n_past, scale, scores, out);
+    attention_head_scalar_impl(q, k_tiles, v, v_stride, head_dim, n_past, scale, scores, out, skip);
 }
 
 #if defined(FAISCA_AVX2)
@@ -2665,20 +2686,21 @@ namespace
 
 template <typename Value>
 void attention_head_impl(const float* q, const Value* k_tiles, const Value* v, size_t v_stride, size_t head_dim,
-                         size_t n_past, float scale, float* scores, float* out)
+                         size_t n_past, float scale, float* scores, float* out, size_t skip)
 {
     if (head_dim % 16 != 0)
     {
-        attention_head_scalar_impl(q, k_tiles, v, v_stride, head_dim, n_past, scale, scores, out);
+        attention_head_scalar_impl(q, k_tiles, v, v_stride, head_dim, n_past, scale, scores, out, skip);
         return;
     }
 
     // scores for 16 positions at a time: head_dim broadcast FMAs over one contiguous tile, no reductions
     const __m512 vscale = _mm512_set1_ps(scale);
+    const __mmask16 skipped = static_cast<__mmask16>((1u << skip) - 1u);
     __m512 vmax = _mm512_set1_ps(-INFINITY);
     for (size_t p = 0; p < n_past; p += 16)
     {
-        const __mmask16 mask = static_cast<__mmask16>(p + 16 <= n_past ? 0xffffu : (1u << (n_past - p)) - 1u);
+        __mmask16 mask = static_cast<__mmask16>(p + 16 <= n_past ? 0xffffu : (1u << (n_past - p)) - 1u);
         const Value* tile = k_tiles + (p / KEY_TILE) * head_dim * KEY_TILE;
         __m512 s = _mm512_setzero_ps();
         for (size_t d = 0; d < head_dim; ++d)
@@ -2686,6 +2708,11 @@ void attention_head_impl(const float* q, const Value* k_tiles, const Value* v, s
             s = _mm512_fmadd_ps(_mm512_set1_ps(q[d]), load_16(tile + d * KEY_TILE), s);
         }
         s = _mm512_mul_ps(s, vscale);
+        if (p == 0)
+        {
+            mask = static_cast<__mmask16>(mask & ~skipped);
+            s = _mm512_mask_mov_ps(s, skipped, _mm512_set1_ps(-INFINITY));
+        }
         _mm512_storeu_ps(scores + p, s);
         vmax = _mm512_mask_max_ps(vmax, mask, vmax, s);
     }
@@ -2694,7 +2721,11 @@ void attention_head_impl(const float* q, const Value* k_tiles, const Value* v, s
     __m512 vsum = _mm512_setzero_ps();
     for (size_t p = 0; p < n_past; p += 16)
     {
-        const __mmask16 mask = static_cast<__mmask16>(p + 16 <= n_past ? 0xffffu : (1u << (n_past - p)) - 1u);
+        __mmask16 mask = static_cast<__mmask16>(p + 16 <= n_past ? 0xffffu : (1u << (n_past - p)) - 1u);
+        if (p == 0)
+        {
+            mask = static_cast<__mmask16>(mask & ~skipped);
+        }
         const __m512 e = exp_avx512(_mm512_sub_ps(_mm512_loadu_ps(scores + p), _mm512_set1_ps(max)));
         _mm512_storeu_ps(scores + p, e);
         vsum = _mm512_mask_add_ps(vsum, mask, vsum, e);
@@ -2731,11 +2762,11 @@ namespace
 
 template <typename Value>
 void attention_head_impl(const float* q, const Value* k_tiles, const Value* v, size_t v_stride, size_t head_dim,
-                         size_t n_past, float scale, float* scores, float* out)
+                         size_t n_past, float scale, float* scores, float* out, size_t skip)
 {
     if (head_dim % 8 != 0)
     {
-        attention_head_scalar_impl(q, k_tiles, v, v_stride, head_dim, n_past, scale, scores, out);
+        attention_head_scalar_impl(q, k_tiles, v, v_stride, head_dim, n_past, scale, scores, out, skip);
         return;
     }
 
@@ -2751,6 +2782,10 @@ void attention_head_impl(const float* q, const Value* k_tiles, const Value* v, s
             s = _mm256_fmadd_ps(_mm256_set1_ps(q[d]), load_8(tile + d * KEY_TILE), s);
         }
         _mm256_storeu_ps(scores + p, _mm256_mul_ps(s, vscale));
+    }
+    for (size_t p = 0; p < skip; ++p)
+    {
+        scores[p] = -INFINITY;
     }
     float max = scores[0];
     for (size_t p = 1; p < n_past; ++p)
@@ -2797,15 +2832,15 @@ void attention_head_impl(const float* q, const Value* k_tiles, const Value* v, s
 #endif
 
 void attention_head(const float* q, const float* k_tiles, const float* v, size_t v_stride, size_t head_dim,
-                    size_t n_past, float scale, float* scores, float* out)
+                    size_t n_past, float scale, float* scores, float* out, size_t skip)
 {
-    attention_head_impl(q, k_tiles, v, v_stride, head_dim, n_past, scale, scores, out);
+    attention_head_impl(q, k_tiles, v, v_stride, head_dim, n_past, scale, scores, out, skip);
 }
 
 void attention_head_f16(const float* q, const uint16_t* k_tiles, const uint16_t* v, size_t v_stride, size_t head_dim,
-                        size_t n_past, float scale, float* scores, float* out)
+                        size_t n_past, float scale, float* scores, float* out, size_t skip)
 {
-    attention_head_impl(q, k_tiles, v, v_stride, head_dim, n_past, scale, scores, out);
+    attention_head_impl(q, k_tiles, v, v_stride, head_dim, n_past, scale, scores, out, skip);
 }
 
 #else

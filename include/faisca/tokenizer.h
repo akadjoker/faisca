@@ -27,7 +27,9 @@ enum class TokenType : int32_t
 
 constexpr int32_t TOKEN_NONE = -1;
 
-// token texts are views into the GGUF file, which must stay open.
+// token texts are views into the GGUF file, which must stay open. Two models: byte level
+// BPE (tokenizer.ggml.model gpt2) and SentencePiece (llama: the vocabulary's pieces merged
+// by score, spaces as U+2581, bytes <0xXX> for what no piece covers).
 // encode() uses scratch buffers and a word cache of the object: one Tokenizer per thread
 class Tokenizer
 {
@@ -103,6 +105,29 @@ private:
         Gpt2,
         SmolLm,
         Llama3,
+        Qwen2,
+    };
+
+    enum class Model
+    {
+        Bpe,
+        Spm,
+    };
+
+    struct SpmSymbol
+    {
+        uint32_t offset;
+        uint32_t length;
+        int32_t prev;
+        int32_t next;
+    };
+
+    struct SpmBigram
+    {
+        float score;
+        int32_t left;
+        int32_t right;
+        uint32_t size;
     };
 
     struct Token
@@ -159,7 +184,8 @@ private:
     bool encode_text(std::string_view text, Array<int32_t>& out);
     bool split_numbers(const Array<uint32_t>& in, Array<uint32_t>& out) const;
     bool split_gpt2(const Array<uint32_t>& in, Array<uint32_t>& out) const;
-    bool split_llama3(const Array<uint32_t>& in, Array<uint32_t>& out) const;
+    // max_digits: 3 for the llama 3 regex, 1 for qwen2's
+    bool split_llama3(const Array<uint32_t>& in, Array<uint32_t>& out, size_t max_digits) const;
     bool encode_word(const uint32_t* code_points, size_t count, Array<int32_t>& out);
     bool encode_bytes(std::string_view word, Array<int32_t>& out);
     bool encode_short(std::string_view word, Array<int32_t>& out);
@@ -168,6 +194,9 @@ private:
     void forget_words();
     bool push_bigram(int32_t left, int32_t right);
     Bigram pop_bigram();
+    bool encode_spm(std::string_view text, bool space_prefix, Array<int32_t>& out);
+    bool spm_try_bigram(int32_t left, int32_t right);
+    SpmBigram spm_pop();
 
     Arena m_arena;
     Array<Token> m_tokens;
@@ -183,6 +212,12 @@ private:
     uint8_t m_ascii_classes[128] = {};
 
     PreTokenizer m_pre = PreTokenizer::Gpt2;
+    Model m_model = Model::Bpe;
+    Array<float> m_scores;
+    int32_t m_unk = TOKEN_NONE;
+    Array<char> m_spm_text;
+    Array<SpmSymbol> m_spm_symbols;
+    Array<SpmBigram> m_spm_heap;
     bool m_ignore_merges = false;
     Array<char> m_mapped_word;
     bool m_clean_spaces = false;

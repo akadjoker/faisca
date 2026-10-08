@@ -222,6 +222,12 @@ bool VulkanRunner::init(VulkanDevice& device, const GgufFile& file, uint32_t n_c
         release();
         return false;
     }
+    if (m_hparams.arch != Arch::Llama)
+    {
+        error.set("the Vulkan runner only runs the llama architecture yet");
+        release();
+        return false;
+    }
     const LlamaHparams& h = m_hparams;
     m_n_ctx = n_ctx;
 

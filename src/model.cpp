@@ -5,6 +5,7 @@
 
 #include <cinttypes>
 #include <cstdio>
+#include <cmath>
 #include <cstring>
 
 namespace faisca
@@ -200,38 +201,87 @@ bool LlamaModel::load_hparams(const GgufFile& file, Error& error)
         error.set("general.architecture is missing");
         return false;
     }
-    if (architecture != "llama")
+    LlamaHparams& h = m_hparams;
+    h = LlamaHparams();
+    if (architecture == "llama")
     {
-        error.set("architecture '%.*s' is not supported, only 'llama'", static_cast<int>(architecture.size()),
+        h.arch = Arch::Llama;
+    }
+    else if (architecture == "qwen2")
+    {
+        h.arch = Arch::Qwen2;
+        h.rope_neox = true;
+    }
+    else if (architecture == "qwen3")
+    {
+        h.arch = Arch::Qwen3;
+        h.rope_neox = true;
+        h.qk_norm = true;
+    }
+    else if (architecture == "gemma3")
+    {
+        h.arch = Arch::Gemma3;
+        h.rope_neox = true;
+        h.qk_norm = true;
+        h.post_norms = true;
+        h.gelu_ffn = true;
+    }
+    else
+    {
+        error.set("architecture '%.*s' is not supported (llama, qwen2, qwen3, gemma3)", static_cast<int>(architecture.size()),
                   architecture.data());
         return false;
     }
 
-    LlamaHparams& h = m_hparams;
-    if (!get_u32(file, "llama.embedding_length", h.n_embd, true, error) ||
-        !get_u32(file, "llama.block_count", h.n_layer, true, error) ||
-        !get_u32(file, "llama.feed_forward_length", h.n_ff, true, error) ||
-        !get_u32(file, "llama.attention.head_count", h.n_head, true, error) ||
-        !get_u32(file, "llama.context_length", h.n_ctx_train, true, error))
+    char key[96];
+    const auto named = [&](const char* name)
+    {
+        std::snprintf(key, sizeof(key), "%.*s.%s", static_cast<int>(architecture.size()), architecture.data(), name);
+        return key;
+    };
+    if (!get_u32(file, named("embedding_length"), h.n_embd, true, error) ||
+        !get_u32(file, named("block_count"), h.n_layer, true, error) ||
+        !get_u32(file, named("feed_forward_length"), h.n_ff, true, error) ||
+        !get_u32(file, named("attention.head_count"), h.n_head, true, error) ||
+        !get_u32(file, named("context_length"), h.n_ctx_train, true, error))
     {
         return false;
     }
 
     h.n_head_kv = h.n_head;
-    if (!get_u32(file, "llama.attention.head_count_kv", h.n_head_kv, false, error))
+    if (!get_u32(file, named("attention.head_count_kv"), h.n_head_kv, false, error))
     {
         return false;
     }
-    if (h.n_embd % h.n_head != 0 || h.n_head % h.n_head_kv != 0)
+    if (h.n_head == 0 || h.n_head_kv == 0 || h.n_head % h.n_head_kv != 0)
     {
-        error.set("embedding length %" PRIu32 ", %" PRIu32 " heads and %" PRIu32 " kv heads do not divide", h.n_embd,
-                  h.n_head, h.n_head_kv);
+        error.set("%" PRIu32 " heads and %" PRIu32 " kv heads do not divide", h.n_head, h.n_head_kv);
         return false;
     }
-    h.head_dim = h.n_embd / h.n_head;
+    h.head_dim = 0;
+    uint32_t value_length = 0;
+    if (!get_u32(file, named("attention.key_length"), h.head_dim, false, error) ||
+        !get_u32(file, named("attention.value_length"), value_length, false, error))
+    {
+        return false;
+    }
+    if (h.head_dim == 0)
+    {
+        if (h.n_embd % h.n_head != 0)
+        {
+            error.set("embedding length %" PRIu32 " and %" PRIu32 " heads do not divide", h.n_embd, h.n_head);
+            return false;
+        }
+        h.head_dim = h.n_embd / h.n_head;
+    }
+    if (value_length != 0 && value_length != h.head_dim)
+    {
+        error.set("value length %" PRIu32 " differs from the key length %" PRIu32, value_length, h.head_dim);
+        return false;
+    }
 
     h.n_rot = h.head_dim;
-    if (!get_u32(file, "llama.rope.dimension_count", h.n_rot, false, error))
+    if (!get_u32(file, named("rope.dimension_count"), h.n_rot, false, error))
     {
         return false;
     }
@@ -243,7 +293,7 @@ bool LlamaModel::load_hparams(const GgufFile& file, Error& error)
 
     const GgufArray* tokens = file.get_array("tokenizer.ggml.tokens");
     uint64_t vocab = tokens != nullptr ? tokens->count : 0;
-    file.get_uint("llama.vocab_size", vocab);
+    file.get_uint(named("vocab_size"), vocab);
     if (vocab == 0 || vocab > 0xffffffffu)
     {
         error.set("the vocabulary size is missing");
@@ -252,41 +302,67 @@ bool LlamaModel::load_hparams(const GgufFile& file, Error& error)
     h.n_vocab = static_cast<uint32_t>(vocab);
 
     double value = 0.0;
-    if (file.get_float("llama.attention.layer_norm_rms_epsilon", value))
+    if (file.get_float(named("attention.layer_norm_rms_epsilon"), value))
     {
         h.rms_eps = static_cast<float>(value);
     }
-    if (file.get_float("llama.rope.freq_base", value))
+    if (file.get_float(named("rope.freq_base"), value))
     {
         h.rope_freq_base = static_cast<float>(value);
     }
 
     std::string_view scaling;
-    if (file.get_string("llama.rope.scaling.type", scaling) && !scaling.empty() && scaling != "none" &&
+    if (file.get_string(named("rope.scaling.type"), scaling) && !scaling.empty() && scaling != "none" &&
         scaling != "linear")
     {
         error.set("rope scaling '%.*s' is not supported yet", static_cast<int>(scaling.size()), scaling.data());
         return false;
     }
-    if (file.get_float("llama.rope.scaling.factor", value) && value != 1.0)
+    if (file.get_float(named("rope.scaling.factor"), value) && value != 1.0)
     {
         error.set("rope scaling factor %g is not supported yet", value);
         return false;
+    }
+
+    if (h.arch == Arch::Gemma3)
+    {
+        h.embd_scale = std::sqrt(static_cast<float>(h.n_embd));
+        h.attn_scale = 1.0f / std::sqrt(static_cast<float>(h.head_dim));
+        if (!get_u32(file, named("attention.sliding_window"), h.n_swa, false, error))
+        {
+            return false;
+        }
+        if (h.n_swa != 0)
+        {
+            h.swa_pattern = 6;
+            if (!get_u32(file, named("attention.sliding_window_pattern"), h.swa_pattern, false, error))
+            {
+                return false;
+            }
+            if (file.get_float(named("rope.freq_base_swa"), value))
+            {
+                h.rope_freq_base_swa = static_cast<float>(value);
+            }
+        }
+        if (file.get_float(named("final_logit_softcapping"), value))
+        {
+            h.final_softcap = static_cast<float>(value);
+        }
     }
     return true;
 }
 
 const GgufTensor* LlamaModel::find(const GgufFile& file, const char* name, int layer, uint64_t n0, uint64_t n1,
-                                   bool required, Error& error) const
+                                   bool required, Error& error, const char* suffix) const
 {
     char full[128];
     if (layer >= 0)
     {
-        std::snprintf(full, sizeof(full), "blk.%d.%s.weight", layer, name);
+        std::snprintf(full, sizeof(full), "blk.%d.%s.%s", layer, name, suffix);
     }
     else
     {
-        std::snprintf(full, sizeof(full), "%s.weight", name);
+        std::snprintf(full, sizeof(full), "%s.%s", name, suffix);
     }
 
     const GgufTensor* tensor = file.find_tensor(full);
@@ -540,6 +616,7 @@ bool LlamaModel::load(const GgufFile& file, Error& error, bool dequantize, Threa
     struct LayerTensors
     {
         const GgufTensor* tensors[9];
+        const GgufTensor* optional[7]; // bq, bk, bv, attn_q_norm, attn_k_norm, attn_post_norm, ffn_post_norm
     };
 
     const GgufTensor* token_embd = find(file, "token_embd", -1, n_embd, h.n_vocab, true, error);
@@ -585,6 +662,30 @@ bool LlamaModel::load(const GgufFile& file, Error& error, bool dequantize, Threa
         for (const GgufTensor* tensor : t.tensors)
         {
             if (tensor == nullptr || !count_storage(tensor, elements, error))
+            {
+                return false;
+            }
+        }
+        const bool biases = h.arch == Arch::Qwen2;
+        t.optional[0] = find(file, "attn_q", il, n_q, 0, false, error, "bias");
+        t.optional[1] = find(file, "attn_k", il, n_kv, 0, false, error, "bias");
+        t.optional[2] = find(file, "attn_v", il, n_kv, 0, false, error, "bias");
+        t.optional[3] = find(file, "attn_q_norm", il, h.head_dim, 0, h.qk_norm, error);
+        t.optional[4] = find(file, "attn_k_norm", il, h.head_dim, 0, h.qk_norm, error);
+        t.optional[5] = find(file, "post_attention_norm", il, n_embd, 0, h.post_norms, error);
+        t.optional[6] = find(file, "post_ffw_norm", il, n_embd, 0, h.post_norms, error);
+        if (!error.empty())
+        {
+            return false;
+        }
+        if (!biases && (t.optional[0] != nullptr || t.optional[1] != nullptr || t.optional[2] != nullptr))
+        {
+            error.set("layer %d has attention biases, which this architecture does not take", il);
+            return false;
+        }
+        for (const GgufTensor* tensor : t.optional)
+        {
+            if (!count_storage(tensor, elements, error))
             {
                 return false;
             }
@@ -657,6 +758,13 @@ bool LlamaModel::load(const GgufFile& file, Error& error, bool dequantize, Threa
         layer.ffn_gate = materialize(t.tensors[6]);
         layer.ffn_up = materialize(t.tensors[7]);
         layer.ffn_down = materialize(t.tensors[8]);
+        layer.bq = materialize(t.optional[0]).f32();
+        layer.bk = materialize(t.optional[1]).f32();
+        layer.bv = materialize(t.optional[2]).f32();
+        layer.attn_q_norm = materialize(t.optional[3]).f32();
+        layer.attn_k_norm = materialize(t.optional[4]).f32();
+        layer.attn_post_norm = materialize(t.optional[5]).f32();
+        layer.ffn_post_norm = materialize(t.optional[6]).f32();
         m_layers.push_back_unchecked(layer);
     }
     if (!m_pack_jobs.empty())

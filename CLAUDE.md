@@ -190,9 +190,59 @@ top. No third party dependencies. Owner: Luís (akadjoker). "faisca" is a workin
    encoder weights load, the encoder does not run), streaming output,
    `--temperature` and the other pocket-tts knobs, `pt_PT` quality
    (precisamos de gravações do owner para medir).
-9. Qwen2.5 and Qwen3 text models (`qwen2`: Q, K, V biases and its own
-   pre-tokenizer; `qwen3`: per head Q and K norms), then Gemma 3 and the
-   SentencePiece tokenizer (Llama 2, Mistral).
+9. Qwen2.5, Qwen3 and Gemma 3: done. `LlamaHparams::arch` (llama, qwen2,
+   qwen3, gemma3) with the flags the runner reads: rope_neox (pairs i and
+   i + n_rot / 2, `rope_neox` in ops), qk_norm (RMS norm of every Q and K
+   head before rope, qwen3 and gemma3), post_norms (gemma3's
+   post_attention_norm and post_ffw_norm before the residual adds),
+   gelu_ffn (`geglu`), embd_scale (sqrt(n_embd)), attn_scale (gemma3: Q
+   scaled by 1 / sqrt(head_dim) after rope, traced before, scores not
+   scaled), n_swa / swa_pattern (gemma3: 512, layer il local when il % 6
+   != 5, rope base 10000 on the local layers), final_softcap (0 on the 1B
+   file); head_dim from attention.key_length (qwen3: 128 with n_embd 1024,
+   gemma3: 256); Q, K and V biases on qwen2 (`LlamaLayer::bq`); the keys
+   are read under the architecture's prefix. The sliding window reuses
+   the tiled attention kernels: the window starts at a whole key tile and
+   a `skip` argument (0 to 15) masks the positions before the start inside
+   it, with the kernels bit identical when skip is 0 (ops_unit checks the
+   skip against a double precision softmax). Tokenizers: `qwen2`
+   pre-tokenizer (the llama 3 regex with one digit per piece, clean_spaces
+   off; `split_llama3(max_digits)`), llama.cpp's promotion of the end of
+   generation texts (<|im_end|>, </s>, <end_of_turn>, <eos>, ...) to
+   control tokens whatever the file says, and SentencePiece
+   (`tokenizer.ggml.model` llama: one symbol per UTF-8 character, the
+   neighbouring pair whose joined text is the piece of highest score
+   merged first, ties to the leftmost, what no piece covers as <0xXX>
+   bytes; spaces as U+2581, add_space_prefix from the file, BOS by
+   default, pieces unescaped on decode; `Tokenizer::Model`). The CLI
+   picks the chat template by architecture: ChatML with Qwen2.5's default
+   system prompt, plain ChatML for Qwen3 (it thinks before answering),
+   <start_of_turn> for Gemma. The Vulkan runner refuses the new
+   architectures. Models in /home/user/models/qwen and gemma
+   (Qwen2.5-0.5B-Instruct Q8_0 from Qwen, Qwen3-0.6B Q8_0 from Qwen,
+   gemma-3-1b-it Q8_0 from unsloth, float32 copies by make_f32_gguf.py).
+   Reference llama.cpp b86d2f0 (2026-10-07) with the GELU f16 table
+   commented out in ggml-cpu/vec.h (the stock build would put 1e-3 of
+   noise in Gemma's FFN); `llama_layer_dump` also keeps inp_scaled,
+   Qcur_normed, Kcur_normed, attn_post_norm, sa_out and ffn_post_norm.
+   Validation: tokenizers 0 mismatches over 40062 cases (2.86 M tokens on
+   the Qwen vocabulary, 3.26 M on Gemma's), SmolLM2 and Llama 3.2 still
+   0; float32 path against llama.cpp: Qwen2.5-0.5B 266 tensors at worst
+   5.5e-6, Qwen3-0.6B 366 at 1.9e-6, Gemma 3 1B 367 at 4.1e-6 on a 16
+   token chat prompt and 3.6e-6 on a 600 token prompt (the window active
+   on the local layers), 16 greedy tokens identical in every run; the
+   Q8_0 files give the same 16 tokens as the float32 reference, 1 and 4
+   threads bit identical, ASan/UBSan clean. llama.cpp's own Q8_0 path
+   cannot run on this VM any more (its AMX repack aborts with "AMX is not
+   ready to be used", SIGILL), so the quantized comparison is against the
+   float32 reference only, and the speed table uses a llama.cpp built
+   with GGML_AMX_INT8 off (bench/README.md): faisca is 1.1 to 1.7x faster
+   on generation and prompts on the three models. Not done: Qwen2.5 and
+   Qwen3 larger than 0.6B (should load, not tried; the 1.7B and 4B files
+   need the disk), Gemma 3 4B and up (rope scaling factor 8 on the global
+   layers is still rejected), the Vulkan runner for these architectures.
+   Next: Mistral / Llama 2 with the SentencePiece tokenizer (needs the
+   add_space_prefix path, which Gemma does not exercise), rope scaling.
 
 Target model: SmolLM2-360M-Instruct GGUF, then 1B to 3B models. SmolLM2-1.7B
 Q4_K_M (/home/user/models/1.7b/, official file, its float32 copy and the

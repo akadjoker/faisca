@@ -410,6 +410,10 @@ void test_load_errors()
 
     spec = Spec();
     spec.model = "llama";
+    CHECK_REJECTED(spec, "tokenizer.ggml.scores is missing");
+
+    spec = Spec();
+    spec.model = "wordpiece";
     CHECK_REJECTED(spec, "not supported");
 
     spec = Spec();
@@ -488,7 +492,8 @@ void test_vocabulary()
     spec = Spec();
     spec.with_types = false;
     Loaded untyped{spec};
-    CHECK(untyped.tokenizer.token_type(T_EOT) == TokenType::Normal);
+    // <|endoftext|> becomes a control token whatever the file says, as in llama.cpp
+    CHECK(untyped.tokenizer.token_type(T_EOT) == TokenType::Control);
     CHECK(untyped.tokenizer.token_type(T_BYTE_A) == TokenType::Normal);
 
     Spec flags;

@@ -11,8 +11,20 @@
 namespace faisca
 {
 
+// the llama family: llama (SmolLM2, Llama 3), qwen2 (Q, K and V biases, NEOX rope), qwen3
+// (per head Q and K norms) and gemma3 (scaled embeddings, Q and K norms, norms after the
+// attention and the FFN, GELU gate, sliding window on the local layers)
+enum class Arch
+{
+    Llama,
+    Qwen2,
+    Qwen3,
+    Gemma3,
+};
+
 struct LlamaHparams
 {
+    Arch arch = Arch::Llama;
     uint32_t n_vocab = 0;
     uint32_t n_embd = 0;
     uint32_t n_layer = 0;
@@ -24,6 +36,21 @@ struct LlamaHparams
     uint32_t n_ctx_train = 0;
     float rms_eps = 1e-5f;
     float rope_freq_base = 10000.0f;
+    bool rope_neox = false; // pairs (i, i + n_rot / 2) instead of (2i, 2i + 1)
+    bool qk_norm = false; // RMS norm of every Q and K head before rope
+    bool post_norms = false; // RMS norms on the attention and FFN outputs before the residual adds
+    bool gelu_ffn = false; // GELU on the gate instead of SiLU
+    float embd_scale = 1.0f;
+    float attn_scale = 0.0f; // when not 0: Q scaled by it after rope and the scores not scaled
+    uint32_t n_swa = 0; // sliding window of the local layers, 0 for none
+    uint32_t swa_pattern = 0; // layer il is local when il % swa_pattern != swa_pattern - 1
+    float rope_freq_base_swa = 10000.0f;
+    float final_softcap = 0.0f;
+
+    bool local_layer(uint32_t il) const
+    {
+        return n_swa != 0 && swa_pattern != 0 && il % swa_pattern != swa_pattern - 1;
+    }
 };
 
 // a matrix of n_out rows of n_in values: F32, Q8_0 in the file's own layout, or
@@ -91,6 +118,14 @@ struct LlamaLayer
     Weight ffn_gate;
     Weight ffn_up;
     Weight ffn_down;
+    // null unless the architecture has them
+    const float* bq;
+    const float* bk;
+    const float* bv;
+    const float* attn_q_norm;
+    const float* attn_k_norm;
+    const float* attn_post_norm;
+    const float* ffn_post_norm;
 };
 
 // the llama architecture. F32 tensors are used in place in the mapped file, F16
@@ -170,7 +205,7 @@ public:
 private:
     bool load_hparams(const GgufFile& file, Error& error);
     const GgufTensor* find(const GgufFile& file, const char* name, int layer, uint64_t n0, uint64_t n1, bool required,
-                           Error& error) const;
+                           Error& error, const char* suffix = "weight") const;
     bool count_storage(const GgufTensor* tensor, size_t& elements, Error& error) const;
     Weight materialize(const GgufTensor* tensor);
     bool packs(GgmlType type) const;

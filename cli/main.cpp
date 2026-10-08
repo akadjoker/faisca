@@ -456,7 +456,8 @@ double seconds_since(std::chrono::steady_clock::time_point start)
     return std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
 }
 
-// the chat template the vocabulary asks for: ChatML (SmolLM2) or Llama 3
+// the chat template the model asks for: ChatML (SmolLM2, Qwen3), ChatML with Qwen2.5's
+// default system prompt, Llama 3 or Gemma
 struct ChatTemplate
 {
     const char* first_user;
@@ -464,8 +465,19 @@ struct ChatTemplate
     const char* assistant;
 };
 
-ChatTemplate chat_template(Tokenizer& tokenizer)
+ChatTemplate chat_template(const GgufFile& file, Tokenizer& tokenizer)
 {
+    std::string_view architecture;
+    file.get_string("general.architecture", architecture);
+    if (architecture == "gemma3")
+    {
+        return {"<start_of_turn>user\n", "<end_of_turn>\n<start_of_turn>user\n", "<end_of_turn>\n<start_of_turn>model\n"};
+    }
+    if (architecture == "qwen2")
+    {
+        return {"<|im_start|>system\nYou are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>\n<|im_start|>user\n",
+                "<|im_end|>\n<|im_start|>user\n", "<|im_end|>\n<|im_start|>assistant\n"};
+    }
     Array<int32_t> probe;
     if (tokenizer.encode("<|start_header_id|>", false, true, probe) && probe.size() == 1 &&
         tokenizer.token_type(probe[0]) == TokenType::Control)
@@ -638,7 +650,7 @@ int command_generate(int argc, char** argv)
     }
     else
     {
-        const ChatTemplate chat = chat_template(tokenizer);
+        const ChatTemplate chat = chat_template(file, tokenizer);
         append_text(text, chat.first_user);
         append_text(text, prompt);
         append_text(text, chat.assistant);
@@ -869,7 +881,7 @@ int command_chat(int argc, char** argv)
         // the turn as tokens appended to what the cache holds, never re-tokenizing the past
         text.clear();
         const bool first = session.tokens().empty();
-        const ChatTemplate chat = chat_template(tokenizer);
+        const ChatTemplate chat = chat_template(file, tokenizer);
         append_text(text, first ? chat.first_user : chat.next_user);
         append_text(text, line);
         append_text(text, chat.assistant);
