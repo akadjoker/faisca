@@ -43,6 +43,12 @@ size_t Weight::row_bytes() const
             return n_in / Q8_0_BLOCK * Q8_0_BLOCK_BYTES;
         case GgmlType::Q4_0:
             return n_in / Q4_0_BLOCK * Q4_0_BLOCK_BYTES;
+        case GgmlType::Q5_0:
+            return n_in / Q5_0_BLOCK * Q5_0_BLOCK_BYTES;
+        case GgmlType::Q4_K:
+            return n_in / Q4_K_BLOCK * Q4_K_BLOCK_BYTES;
+        case GgmlType::Q6_K:
+            return n_in / Q6_K_BLOCK * Q6_K_BLOCK_BYTES;
         default:
             return n_in * sizeof(float);
     }
@@ -52,28 +58,47 @@ void Weight::row(size_t index, float* out) const
 {
     if (packed)
     {
-        if (type == GgmlType::Q4_0)
+        switch (type)
         {
-            row_q4_0_packed(data, n_in, index, out);
+            case GgmlType::Q4_0:
+                row_q4_0_packed(data, n_in, index, out);
+                return;
+            case GgmlType::Q5_0:
+                row_q5_0_packed(data, n_in, index, out);
+                return;
+            case GgmlType::Q4_K:
+                row_q4_k_packed(data, n_in, index, out);
+                return;
+            case GgmlType::Q6_K:
+                row_q6_k_packed(data, n_in, index, out);
+                return;
+            default:
+                row_q8_0_packed(data, n_in, index, out);
+                return;
         }
-        else
-        {
-            row_q8_0_packed(data, n_in, index, out);
-        }
-        return;
     }
     const uint8_t* source = data + index * row_bytes();
-    if (type == GgmlType::Q8_0)
+    switch (type)
     {
-        dequantize_q8_0(source, n_in, out);
-        return;
+        case GgmlType::Q8_0:
+            dequantize_q8_0(source, n_in, out);
+            return;
+        case GgmlType::Q4_0:
+            dequantize_q4_0(source, n_in, out);
+            return;
+        case GgmlType::Q5_0:
+            dequantize_q5_0(source, n_in, out);
+            return;
+        case GgmlType::Q4_K:
+            dequantize_q4_k(source, n_in, out);
+            return;
+        case GgmlType::Q6_K:
+            dequantize_q6_k(source, n_in, out);
+            return;
+        default:
+            std::memcpy(out, source, n_in * sizeof(float));
+            return;
     }
-    if (type == GgmlType::Q4_0)
-    {
-        dequantize_q4_0(source, n_in, out);
-        return;
-    }
-    std::memcpy(out, source, n_in * sizeof(float));
 }
 
 void Weight::matvec(const float* x, const uint8_t* xq, const int32_t* x_sums, size_t first, size_t last,
@@ -85,13 +110,13 @@ void Weight::matvec(const float* x, const uint8_t* xq, const int32_t* x_sums, si
     }
     if (packed)
     {
-        if (type == GgmlType::Q4_0)
+        if (type == GgmlType::Q8_0)
         {
-            matmul_q4_0_packed(data, xq, 0, x_sums, 0, 1, n_in, n_out, first, last, out, 0);
+            matvec_q8_0_packed(data, xq, x_sums, n_in, n_out, first, last, out);
         }
         else
         {
-            matvec_q8_0_packed(data, xq, x_sums, n_in, n_out, first, last, out);
+            matmul(x, 0, xq, 0, x_sums, 0, 1, first, last, out, 0);
         }
         return;
     }
@@ -112,15 +137,24 @@ void Weight::matmul(const float* x, size_t x_stride, const uint8_t* xq, size_t x
     }
     if (packed)
     {
-        if (type == GgmlType::Q4_0)
+        switch (type)
         {
-            matmul_q4_0_packed(data, xq, xq_stride, x_sums, sums_stride, n_tokens, n_in, n_out, first, last, out, out_stride);
+            case GgmlType::Q4_0:
+                matmul_q4_0_packed(data, xq, xq_stride, x_sums, sums_stride, n_tokens, n_in, n_out, first, last, out, out_stride);
+                return;
+            case GgmlType::Q5_0:
+                matmul_q5_0_packed(data, xq, xq_stride, x_sums, sums_stride, n_tokens, n_in, n_out, first, last, out, out_stride);
+                return;
+            case GgmlType::Q4_K:
+                matmul_q4_k_packed(data, xq, xq_stride, x_sums, sums_stride, n_tokens, n_in, n_out, first, last, out, out_stride);
+                return;
+            case GgmlType::Q6_K:
+                matmul_q6_k_packed(data, xq, xq_stride, x_sums, sums_stride, n_tokens, n_in, n_out, first, last, out, out_stride);
+                return;
+            default:
+                matmul_q8_0_packed(data, xq, xq_stride, x_sums, sums_stride, n_tokens, n_in, n_out, first, last, out, out_stride);
+                return;
         }
-        else
-        {
-            matmul_q8_0_packed(data, xq, xq_stride, x_sums, sums_stride, n_tokens, n_in, n_out, first, last, out, out_stride);
-        }
-        return;
     }
     for (size_t t = 0; t < n_tokens; ++t)
     {
@@ -272,10 +306,12 @@ const GgufTensor* LlamaModel::find(const GgufFile& file, const char* name, int l
                   tensor->dims[0], tensor->n_dims > 1 ? tensor->dims[1] : 0, n0, n1);
         return nullptr;
     }
-    if (tensor->type != GgmlType::F32 && tensor->type != GgmlType::F16 && tensor->type != GgmlType::Q8_0 &&
-        tensor->type != GgmlType::Q4_0)
+    const bool k_quant = tensor->type == GgmlType::Q4_K || tensor->type == GgmlType::Q6_K;
+    const bool small_block = tensor->type == GgmlType::Q8_0 || tensor->type == GgmlType::Q4_0 || tensor->type == GgmlType::Q5_0;
+    if (tensor->type != GgmlType::F32 && tensor->type != GgmlType::F16 && !small_block && !k_quant)
     {
-        error.set("tensor %s is %s, the runner reads F32, F16, Q8_0 and Q4_0", full, ggml_type_info(tensor->type)->name);
+        error.set("tensor %s is %s, the runner reads F32, F16, Q8_0, Q4_0, Q5_0, Q4_K and Q6_K", full,
+                  ggml_type_info(tensor->type)->name);
         return nullptr;
     }
     if (dims == 1 && tensor->type != GgmlType::F32 && tensor->type != GgmlType::F16)
@@ -283,9 +319,10 @@ const GgufTensor* LlamaModel::find(const GgufFile& file, const char* name, int l
         error.set("tensor %s is %s, a norm must be F32 or F16", full, ggml_type_info(tensor->type)->name);
         return nullptr;
     }
-    if ((tensor->type == GgmlType::Q8_0 || tensor->type == GgmlType::Q4_0) && tensor->dims[0] % Q8_0_BLOCK != 0)
+    const size_t block = k_quant ? Q4_K_BLOCK : Q8_0_BLOCK;
+    if ((small_block || k_quant) && tensor->dims[0] % block != 0)
     {
-        error.set("tensor %s has a row of %" PRIu64 " values, not a multiple of %zu", full, tensor->dims[0], Q8_0_BLOCK);
+        error.set("tensor %s has a row of %" PRIu64 " values, not a multiple of %zu", full, tensor->dims[0], block);
         return nullptr;
     }
     return tensor;
@@ -297,12 +334,13 @@ bool LlamaModel::count_storage(const GgufTensor* tensor, size_t& elements, Error
     {
         return true;
     }
-    // Q8_0 computes in place or packed; Q4_0 packed or, without VNNI kernels, as float32
+    // Q8_0 computes in place or packed; the other quantized types packed or, without the
+    // VNNI kernels for them, as float32
     if (tensor->type == GgmlType::Q8_0 && !m_dequantize)
     {
         return true;
     }
-    if (tensor->type == GgmlType::Q4_0 && m_pack)
+    if (packs(tensor->type))
     {
         return true;
     }
@@ -325,21 +363,30 @@ Weight LlamaModel::materialize(const GgufTensor* tensor)
     weight.n_in = static_cast<size_t>(tensor->dims[0]);
     weight.n_out = tensor->n_dims > 1 ? static_cast<size_t>(tensor->dims[1]) : 1;
 
-    if ((tensor->type == GgmlType::Q8_0 || tensor->type == GgmlType::Q4_0) && m_pack)
+    if (packs(tensor->type))
     {
         weight.type = tensor->type;
         weight.packed = true;
         weight.data = m_packed + m_packed_used;
-        if (tensor->type == GgmlType::Q4_0)
+        switch (tensor->type)
         {
-            pack_q4_0(tensor->data, weight.n_in, weight.n_out, m_packed + m_packed_used);
-            m_packed_used += q4_0_packed_bytes(weight.n_in, weight.n_out);
+            case GgmlType::Q4_0:
+                pack_q4_0(tensor->data, weight.n_in, weight.n_out, m_packed + m_packed_used);
+                break;
+            case GgmlType::Q5_0:
+                pack_q5_0(tensor->data, weight.n_in, weight.n_out, m_packed + m_packed_used);
+                break;
+            case GgmlType::Q4_K:
+                pack_q4_k(tensor->data, weight.n_in, weight.n_out, m_packed + m_packed_used);
+                break;
+            case GgmlType::Q6_K:
+                pack_q6_k(tensor->data, weight.n_in, weight.n_out, m_packed + m_packed_used);
+                break;
+            default:
+                pack_q8_0(tensor->data, weight.n_in, weight.n_out, m_packed + m_packed_used);
+                break;
         }
-        else
-        {
-            pack_q8_0(tensor->data, weight.n_in, weight.n_out, m_packed + m_packed_used);
-            m_packed_used += q8_0_packed_bytes(weight.n_in, weight.n_out);
-        }
+        m_packed_used += packed_bytes(tensor);
         return weight;
     }
     if (tensor->type == GgmlType::F32 || (tensor->type == GgmlType::Q8_0 && !m_dequantize))
@@ -367,13 +414,60 @@ Weight LlamaModel::materialize(const GgufTensor* tensor)
         return weight;
     }
 
-    if (tensor->type == GgmlType::Q4_0)
+    switch (tensor->type)
     {
-        dequantize_q4_0(tensor->data, count, out);
-        return weight;
+        case GgmlType::Q4_0:
+            dequantize_q4_0(tensor->data, count, out);
+            break;
+        case GgmlType::Q5_0:
+            dequantize_q5_0(tensor->data, count, out);
+            break;
+        case GgmlType::Q4_K:
+            dequantize_q4_k(tensor->data, count, out);
+            break;
+        case GgmlType::Q6_K:
+            dequantize_q6_k(tensor->data, count, out);
+            break;
+        default:
+            dequantize_q8_0(tensor->data, count, out);
+            break;
     }
-    dequantize_q8_0(tensor->data, count, out);
     return weight;
+}
+
+bool LlamaModel::packs(GgmlType type) const
+{
+    switch (type)
+    {
+        case GgmlType::Q8_0:
+        case GgmlType::Q4_0:
+            return m_pack;
+        case GgmlType::Q5_0:
+        case GgmlType::Q4_K:
+        case GgmlType::Q6_K:
+            return m_pack_k;
+        default:
+            return false;
+    }
+}
+
+size_t LlamaModel::packed_bytes(const GgufTensor* tensor) const
+{
+    const size_t n_in = static_cast<size_t>(tensor->dims[0]);
+    const size_t n_out = static_cast<size_t>(tensor->dims[1]);
+    switch (tensor->type)
+    {
+        case GgmlType::Q4_0:
+            return q4_0_packed_bytes(n_in, n_out);
+        case GgmlType::Q5_0:
+            return q5_0_packed_bytes(n_in, n_out);
+        case GgmlType::Q4_K:
+            return q4_k_packed_bytes(n_in, n_out);
+        case GgmlType::Q6_K:
+            return q6_k_packed_bytes(n_in, n_out);
+        default:
+            return q8_0_packed_bytes(n_in, n_out);
+    }
 }
 
 bool LlamaModel::load(const GgufFile& file, Error& error, bool dequantize)
@@ -381,6 +475,7 @@ bool LlamaModel::load(const GgufFile& file, Error& error, bool dequantize)
     release();
     m_dequantize = dequantize;
     m_pack = !dequantize && q8_0_packed_supported();
+    m_pack_k = !dequantize && k_quants_packed_supported();
     if (!load_hparams(file, error))
     {
         return false;
@@ -451,18 +546,14 @@ bool LlamaModel::load(const GgufFile& file, Error& error, bool dequantize)
         return false;
     }
 
-    if (m_pack)
+    if (m_pack || m_pack_k)
     {
         size_t packed_bytes = 0;
-        const auto count_packed = [&packed_bytes](const GgufTensor* tensor)
+        const auto count_packed = [this, &packed_bytes](const GgufTensor* tensor)
         {
-            if (tensor != nullptr && tensor->type == GgmlType::Q8_0)
+            if (tensor != nullptr && packs(tensor->type))
             {
-                packed_bytes += q8_0_packed_bytes(static_cast<size_t>(tensor->dims[0]), static_cast<size_t>(tensor->dims[1]));
-            }
-            else if (tensor != nullptr && tensor->type == GgmlType::Q4_0)
-            {
-                packed_bytes += q4_0_packed_bytes(static_cast<size_t>(tensor->dims[0]), static_cast<size_t>(tensor->dims[1]));
+                packed_bytes += this->packed_bytes(tensor);
             }
         };
         count_packed(token_embd);
@@ -487,6 +578,7 @@ bool LlamaModel::load(const GgufFile& file, Error& error, bool dequantize)
         else
         {
             m_pack = false;
+            m_pack_k = false;
         }
     }
 

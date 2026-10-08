@@ -95,12 +95,13 @@ private:
     static void quantize_task(void* user, int thread_index, int thread_count);
     size_t m_layer = 0;
     size_t m_quantize_n = 0;
+    Activation m_quantize_kind = Activation::Q8_0;
     const float* m_quantize_x = nullptr;
     size_t m_quantize_stride = 0;
     size_t m_quantize_tokens = 0;
 
     void forward_batch(const int32_t* tokens, size_t count, uint32_t pos, float* logits);
-    void quantize_inputs(const float* x, size_t stride, size_t n_tokens, size_t n);
+    void quantize_inputs(const float* x, size_t stride, size_t n_tokens, size_t n, Activation kind);
     void matmul(const Weight& w, const float* x, size_t x_stride, size_t n_tokens, float* out, size_t out_stride);
     void attention(const LlamaLayer& layer, int il, uint32_t pos, size_t n_tokens);
     void attention_unit(int il, uint32_t pos, size_t token, size_t head, float* scores);
@@ -135,8 +136,8 @@ private:
     Array<float> m_scores; // [thread][n_ctx rounded up to 16]
     Array<float> m_logits; // [token][n_vocab], only while tracing
 
-    Array<uint8_t> m_xq; // [token][Q8_0 row]
-    Array<int32_t> m_sums; // [token][block]
+    Array<uint8_t> m_xq; // [token][Q8_0 or Q8_K row]
+    Array<int32_t> m_sums; // [token][block of 32 or 16]
     size_t m_xq_stride = 0;
     size_t m_sums_stride = 0;
 };

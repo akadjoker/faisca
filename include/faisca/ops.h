@@ -83,6 +83,86 @@ void matmul_q8_0_packed(const uint8_t* packed, const uint8_t* xq, size_t xq_stri
                         size_t sums_stride, size_t n_tokens, size_t n_in, size_t n_out, size_t first, size_t last,
                         float* out, size_t out_stride);
 
+// Q5_0: blocks of 32 values, f16 scale, 4 bytes of high bits (bit j for value j), 16
+// bytes of low nibbles as Q4_0; value = (q - 16) * scale
+constexpr size_t Q5_0_BLOCK = 32;
+constexpr size_t Q5_0_BLOCK_BYTES = 22;
+constexpr size_t Q5_0_GROUP_BLOCK_BYTES = Q8_0_GROUP * Q5_0_BLOCK_BYTES;
+
+void dequantize_q5_0(const uint8_t* blocks, size_t n, float* out);
+
+// Packed Q5_0: the Q4_0 group block (16 f16 scales, 4 chunks of nibbles) followed by
+// 64 bytes of high bits: byte 4r + i holds bit m for value i + 4m of row r
+size_t q5_0_packed_bytes(size_t n_in, size_t n_out);
+void pack_q5_0(const uint8_t* rows, size_t n_in, size_t n_out, uint8_t* out);
+void row_q5_0_packed(const uint8_t* packed, size_t n_in, size_t row, float* out);
+void matvec_q5_0_packed_scalar(const uint8_t* packed, const uint8_t* xq, const int32_t* x_sums, size_t n_in,
+                               size_t n_out, size_t first, size_t last, float* out);
+void matmul_q5_0_packed(const uint8_t* packed, const uint8_t* xq, size_t xq_stride, const int32_t* x_sums,
+                        size_t sums_stride, size_t n_tokens, size_t n_in, size_t n_out, size_t first, size_t last,
+                        float* out, size_t out_stride);
+
+// Q8_K: the activations the K-quant kernels take, as llama.cpp quantizes them: blocks
+// of 256 values, float32 scale then 256 int8, scale = max / -127 with max the value
+// of largest magnitude, values rounded to nearest even and clamped to 127
+constexpr size_t Q8_K_BLOCK = 256;
+constexpr size_t Q8_K_BLOCK_BYTES = 4 + Q8_K_BLOCK;
+
+void quantize_q8_k(const float* x, size_t n, uint8_t* out);
+void dequantize_q8_k(const uint8_t* blocks, size_t n, float* out);
+
+// sum of every 16 quantized values, n / 16 sums
+void q8_k_block_sums(const uint8_t* xq, size_t n, int32_t* out);
+
+// Q4_K: super blocks of 256 values, f16 d and dmin, 12 bytes of 6 bit scales and mins
+// for 8 sub blocks of 32, 128 bytes of nibbles; value = d * scale * q - dmin * min
+constexpr size_t Q4_K_BLOCK = 256;
+constexpr size_t Q4_K_BLOCK_BYTES = 144;
+
+// Q6_K: super blocks of 256 values, 128 bytes of low nibbles, 64 bytes of high bit pairs,
+// 16 int8 scales for sub blocks of 16, f16 d; value = d * scale * (q - 32)
+constexpr size_t Q6_K_BLOCK = 256;
+constexpr size_t Q6_K_BLOCK_BYTES = 210;
+
+void dequantize_q4_k(const uint8_t* blocks, size_t n, float* out);
+void dequantize_q6_k(const uint8_t* blocks, size_t n, float* out);
+
+// Packed Q4_K group block of 16 rows: 16 f16 d, 16 f16 dmin, 8 sub blocks x 16 rows of
+// scales, the same of mins, then 32 chunks of 64 bytes of nibbles: chunk c, bytes
+// 4r..4r+3, holds values 8c..8c+3 of row r in the low nibbles and 8c+4..8c+7 in the high
+constexpr size_t Q4_K_GROUP_BLOCK_BYTES = 2 * 2 * Q8_0_GROUP + 2 * 8 * Q8_0_GROUP + Q8_0_GROUP * Q4_K_BLOCK / 2;
+
+// Packed Q6_K group block: 16 f16 d, 16 sub blocks x 16 rows of int8 scales, 32 chunks of
+// low nibbles as Q4_K, then 16 chunks of 64 bytes of high bits: chunk h, byte 4r + i,
+// holds the two high bits of value 16h + i + 4m of row r at bits 2m and 2m + 1
+constexpr size_t Q6_K_GROUP_BLOCK_BYTES = 2 * Q8_0_GROUP + 16 * Q8_0_GROUP + Q8_0_GROUP * Q6_K_BLOCK / 2 +
+                                          Q8_0_GROUP * Q6_K_BLOCK / 4;
+
+// true when this build has VNNI kernels for the packed K-quant layouts
+bool k_quants_packed_supported();
+
+size_t q4_k_packed_bytes(size_t n_in, size_t n_out);
+void pack_q4_k(const uint8_t* rows, size_t n_in, size_t n_out, uint8_t* out);
+void row_q4_k_packed(const uint8_t* packed, size_t n_in, size_t row, float* out);
+size_t q6_k_packed_bytes(size_t n_in, size_t n_out);
+void pack_q6_k(const uint8_t* rows, size_t n_in, size_t n_out, uint8_t* out);
+void row_q6_k_packed(const uint8_t* packed, size_t n_in, size_t row, float* out);
+
+// K-quant products take Q8_K inputs and their sums of 16 (q8_k_block_sums). Every
+// super block is summed exactly in integers with the sub block scales, then two fused
+// multiply adds (quants, then mins for Q4_K) accumulate it in float32, which is the
+// structure of llama.cpp's AMX and VNNI kernels
+void matvec_q4_k_packed_scalar(const uint8_t* packed, const uint8_t* xq, const int32_t* x_sums, size_t n_in,
+                               size_t n_out, size_t first, size_t last, float* out);
+void matmul_q4_k_packed(const uint8_t* packed, const uint8_t* xq, size_t xq_stride, const int32_t* x_sums,
+                        size_t sums_stride, size_t n_tokens, size_t n_in, size_t n_out, size_t first, size_t last,
+                        float* out, size_t out_stride);
+void matvec_q6_k_packed_scalar(const uint8_t* packed, const uint8_t* xq, const int32_t* x_sums, size_t n_in,
+                               size_t n_out, size_t first, size_t last, float* out);
+void matmul_q6_k_packed(const uint8_t* packed, const uint8_t* xq, size_t xq_stride, const int32_t* x_sums,
+                        size_t sums_stride, size_t n_tokens, size_t n_in, size_t n_out, size_t first, size_t last,
+                        float* out, size_t out_stride);
+
 const char* simd_name();
 
 // out[o] = sum over i of w[o * n_in + i] * x[i]

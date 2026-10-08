@@ -27,6 +27,15 @@ struct LlamaHparams
 
 // a matrix of n_out rows of n_in values: F32, Q8_0 in the file's own layout, or
 // Q8_0 packed in groups of 16 rows (see ops.h)
+// what the quantized kernels take as input: Q8_0 blocks of 32 or, for the K-quants,
+// Q8_K blocks of 256 (see ops.h), each with its block sums
+enum class Activation
+{
+    F32,
+    Q8_0,
+    Q8_K,
+};
+
 struct Weight
 {
     GgmlType type = GgmlType::F32;
@@ -34,6 +43,15 @@ struct Weight
     const uint8_t* data = nullptr;
     size_t n_in = 0;
     size_t n_out = 0;
+
+    Activation activation() const
+    {
+        if (type == GgmlType::F32)
+        {
+            return Activation::F32;
+        }
+        return type == GgmlType::Q4_K || type == GgmlType::Q6_K ? Activation::Q8_K : Activation::Q8_0;
+    }
 
     const float* f32() const
     {
@@ -46,8 +64,8 @@ struct Weight
     // one row as float32
     void row(size_t index, float* out) const;
 
-    // out[o] for o in [first, last): x is the float32 input, xq its Q8_0 form with the
-    // block sums from q8_0_block_sums; the quantized forms may be null for F32 weights
+    // out[o] for o in [first, last): x is the float32 input, xq its quantized form as
+    // activation() says, with its block sums; the quantized forms may be null for F32 weights
     void matvec(const float* x, const uint8_t* xq, const int32_t* x_sums, size_t first, size_t last, float* out) const;
 
     // the same for n_tokens inputs, input t at x + t * x_stride (xq, x_sums alike), output t at out + t * out_stride
@@ -144,10 +162,13 @@ private:
                            Error& error) const;
     bool count_storage(const GgufTensor* tensor, size_t& elements, Error& error) const;
     Weight materialize(const GgufTensor* tensor);
+    bool packs(GgmlType type) const;
+    size_t packed_bytes(const GgufTensor* tensor) const;
 
     LlamaHparams m_hparams;
     bool m_dequantize = false;
     bool m_pack = false;
+    bool m_pack_k = false;
     Array<float> m_storage;
     uint8_t* m_packed = nullptr;
     size_t m_packed_bytes = 0;

@@ -94,8 +94,10 @@ bool Runner::init(const LlamaModel& model, uint32_t n_ctx, int n_threads, Error&
     }
 
     const size_t widest = h.n_ff > h.n_embd ? h.n_ff : h.n_embd;
-    m_xq_stride = (widest / Q8_0_BLOCK) * Q8_0_BLOCK_BYTES;
-    m_sums_stride = widest / Q8_0_BLOCK;
+    const size_t q8_0_row = (widest / Q8_0_BLOCK) * Q8_0_BLOCK_BYTES;
+    const size_t q8_k_row = (widest / Q8_K_BLOCK) * Q8_K_BLOCK_BYTES;
+    m_xq_stride = q8_0_row > q8_k_row ? q8_0_row : q8_k_row;
+    m_sums_stride = widest / 16;
     const size_t threads = static_cast<size_t>(m_pool.size());
     const size_t scores = (static_cast<size_t>(n_ctx) + 15) / 16 * 16;
     const size_t k_cache = static_cast<size_t>(h.n_layer) * h.n_head_kv * (scores * h.head_dim);
@@ -203,19 +205,29 @@ void Runner::quantize_task(void* user, int thread_index, int thread_count)
     const size_t last = runner.m_quantize_tokens * static_cast<size_t>(thread_index + 1) / static_cast<size_t>(thread_count);
     for (size_t t = first; t < last; ++t)
     {
-        quantize_q8_0(runner.m_quantize_x + t * runner.m_quantize_stride, runner.m_quantize_n,
-                      runner.m_xq.data() + t * runner.m_xq_stride);
-        q8_0_block_sums(runner.m_xq.data() + t * runner.m_xq_stride, runner.m_quantize_n,
-                        runner.m_sums.data() + t * runner.m_sums_stride);
+        const float* x = runner.m_quantize_x + t * runner.m_quantize_stride;
+        uint8_t* xq = runner.m_xq.data() + t * runner.m_xq_stride;
+        int32_t* sums = runner.m_sums.data() + t * runner.m_sums_stride;
+        if (runner.m_quantize_kind == Activation::Q8_K)
+        {
+            quantize_q8_k(x, runner.m_quantize_n, xq);
+            q8_k_block_sums(xq, runner.m_quantize_n, sums);
+        }
+        else
+        {
+            quantize_q8_0(x, runner.m_quantize_n, xq);
+            q8_0_block_sums(xq, runner.m_quantize_n, sums);
+        }
     }
 }
 
-void Runner::quantize_inputs(const float* x, size_t stride, size_t n_tokens, size_t n)
+void Runner::quantize_inputs(const float* x, size_t stride, size_t n_tokens, size_t n, Activation kind)
 {
     m_quantize_x = x;
     m_quantize_stride = stride;
     m_quantize_tokens = n_tokens;
     m_quantize_n = n;
+    m_quantize_kind = kind;
     m_pool.run(quantize_task, this);
 }
 
@@ -288,9 +300,9 @@ void Runner::matmul_task(void* user, int thread_index, int thread_count)
 
 void Runner::matmul(const Weight& w, const float* x, size_t x_stride, size_t n_tokens, float* out, size_t out_stride)
 {
-    if (w.type != GgmlType::F32)
+    if (w.activation() != Activation::F32)
     {
-        quantize_inputs(x, x_stride, n_tokens, w.n_in);
+        quantize_inputs(x, x_stride, n_tokens, w.n_in, w.activation());
     }
     MatmulJob job{this, &w, x, x_stride, n_tokens, out, out_stride};
     m_pool.run(matmul_task, &job);

@@ -18,7 +18,7 @@ or exceptions. It has its own containers (`faisca::Array`, `faisca::StringMap`,
 | GGUF loader (memory mapped, zero-copy) | done |
 | Tokenizer (byte level BPE, validated against llama.cpp) | done |
 | CPU runner, float32, validated layer by layer against llama.cpp | done |
-| CPU optimization: threads, VNNI kernels for Q8_0 and Q4_0, batched prompt, f16 KV cache | done, K-quants pending |
+| CPU optimization: threads, VNNI kernels for Q8_0, Q4_0, Q5_0, Q4_K and Q6_K, batched prompt, f16 KV cache | done, AMX pending |
 | Vulkan compute backend | planned |
 | Own cache format and KV cache on disk | planned |
 
@@ -119,13 +119,18 @@ runner.forward(tokens.data(), tokens.size(), logits, error); // logits of the la
 
 `LlamaModel` reads the `llama` architecture (SmolLM2, Llama 2 and 3 style
 models without rope scaling). F32 tensors are used in place in the mapped
-file, F16 tensors are converted to float32 at load. Q8_0 and Q4_0 tensors are
-repacked at load into groups of 16 interleaved rows in anonymous memory (huge
-pages where the system allows), the layout the VNNI kernels want: one
-`vpdpbusd` advances 16 output rows, and the weights are read once per batch of
-32 tokens. Activations are quantized to Q8_0 per block of 32, the way llama.cpp
-does on x86. Builds without VNNI keep Q8_0 in place with an AVX2 kernel and
-convert Q4_0 to float32.
+file, F16 tensors are converted to float32 at load. Q8_0, Q4_0, Q5_0, Q4_K
+and Q6_K tensors (the types a Q4_K_M file holds) are repacked at load into
+groups of 16 interleaved rows in anonymous memory (huge pages where the
+system allows), the layout the VNNI kernels want: one `vpdpbusd` advances 16
+output rows, and the weights are read once per batch of 32 tokens.
+Activations are quantized the way llama.cpp does on x86: Q8_0 per block of 32
+for the Q8_0, Q4_0 and Q5_0 kernels, Q8_K per block of 256 (float32 scale,
+sums of 16) for the K-quants, whose kernels sum every super block exactly in
+integers with the sub block scales before two fused multiply adds in float32.
+Builds with AVX-VNNI but no AVX-512 have kernels for Q8_0 and Q4_0 only and
+convert the other types to float32; builds without VNNI keep Q8_0 in place
+with an AVX2 kernel and convert the rest.
 
 `Runner` holds the KV cache (`n_ctx` positions, keys and values in f16 unless
 `init` is told otherwise, keys in tiles of 16 positions) and a thread pool.
@@ -220,19 +225,28 @@ python3 tests/compare_with_gguf_py.py build/gguf_dump model.gguf
   cache (`--reference-flags=--kv-f16`) sits at 2.2e-3 and 2.50e-3 from its
   float32 run.
 
-  The Q8_0 model converted to float32 by faisca gives bit identical tensors
-  and tokens to the float32 copy, so the dequantization matches gguf-py.
+  The Q8_0 and Q4_K_M models converted to float32 by faisca give bit
+  identical tensors and tokens to the float32 copies made by gguf-py, so the
+  dequantization of Q8_0, Q5_0, Q4_K and Q6_K matches it. The Q4_K_M model
+  computed in float32 on both sides: 386 tensors, worst 3.3e-6, 16 tokens
+  identical.
 - `matmul_check`: the quantized kernels on their own. It feeds every matrix of
   every block with the exact input llama.cpp computed (from a
   `llama_layer_dump` of the quantized model) and compares the products. On
   SmolLM2 Q8_0 and Q4_0, all 193 matrices match llama.cpp's outputs with zero
   error: the integer block sums are exact and the float accumulation has the
-  same structure as llama.cpp's VNNI kernels. A full pass with quantized
+  same structure as llama.cpp's VNNI kernels. On the Q4_K_M file the 16 Q4_K
+  and 16 Q6_K matrices match with zero error too (the sub block scales are
+  applied in integers and the super block is accumulated with the same two
+  fused multiply adds as llama.cpp's AMX and VNNI kernels); the 144 Q5_0
+  matrices are within 1.8e-7, because llama.cpp runs Q5_0 through its generic
+  AVX kernel, which accumulates eight float partial sums across blocks, while
+  faisca sums every block exactly in integers. A full pass with quantized
   activations cannot be compared that tightly: differences of 1e-7 before the
   quantization round to different integers, and both runners sit about 4e-2
   from the float32 logits (llama.cpp 4.43e-2, faisca 4.42e-2) and 2e-2 from
   each other, with the same argmax at every position and the same 16 greedy
-  tokens.
+  tokens; on Q4_K_M the two runners are 6.7e-2 apart with the same 16 tokens.
 
 ## Layout
 

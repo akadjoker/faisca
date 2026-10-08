@@ -75,6 +75,14 @@ int g_checks = 0;
 double g_worst = 0.0;
 std::string g_worst_name;
 
+struct PerType
+{
+    int count = 0;
+    double worst = 0.0;
+};
+
+std::map<std::string, PerType> g_per_type;
+
 void check(const faisca::Weight& w, const Tensor& input, const Tensor& output, const char* label, double limit,
            bool verbose)
 {
@@ -86,15 +94,21 @@ void check(const faisca::Weight& w, const Tensor& input, const Tensor& output, c
         return;
     }
 
-    std::vector<uint8_t> xq((w.n_in / faisca::Q8_0_BLOCK) * faisca::Q8_0_BLOCK_BYTES);
-    std::vector<int32_t> sums(w.n_in / faisca::Q8_0_BLOCK);
+    std::vector<uint8_t> xq((w.n_in / faisca::Q8_0_BLOCK) * faisca::Q8_0_BLOCK_BYTES +
+                            (w.n_in / faisca::Q8_K_BLOCK) * faisca::Q8_K_BLOCK_BYTES);
+    std::vector<int32_t> sums(w.n_in / 16);
     std::vector<float> out(w.n_out);
     double error = 0.0;
     double norm = 0.0;
     for (size_t t = 0; t < n_tokens; ++t)
     {
         const float* x = input.values.data() + t * w.n_in;
-        if (w.type != faisca::GgmlType::F32)
+        if (w.activation() == faisca::Activation::Q8_K)
+        {
+            faisca::quantize_q8_k(x, w.n_in, xq.data());
+            faisca::q8_k_block_sums(xq.data(), w.n_in, sums.data());
+        }
+        else if (w.activation() == faisca::Activation::Q8_0)
         {
             faisca::quantize_q8_0(x, w.n_in, xq.data());
             faisca::q8_0_block_sums(xq.data(), w.n_in, sums.data());
@@ -117,9 +131,13 @@ void check(const faisca::Weight& w, const Tensor& input, const Tensor& output, c
         g_worst = rel;
         g_worst_name = label;
     }
+    const char* type_name = faisca::ggml_type_info(w.type)->name;
+    PerType& per_type = g_per_type[type_name];
+    ++per_type.count;
+    per_type.worst = rel > per_type.worst ? rel : per_type.worst;
     if (bad || verbose)
     {
-        std::printf("  %-28s %zu tokens  rel L2 %.3e%s\n", label, n_tokens, rel, bad ? "  FAIL" : "");
+        std::printf("  %-28s %-5s %zu tokens  rel L2 %.3e%s\n", label, type_name, n_tokens, rel, bad ? "  FAIL" : "");
     }
 }
 
@@ -204,6 +222,10 @@ int main(int argc, char** argv)
         check(model.output(), *result_norm, *result_output, "output", limit, verbose);
     }
 
+    for (const auto& entry : g_per_type)
+    {
+        std::printf("  %-5s %3d matrices, worst rel L2 %.3e\n", entry.first.c_str(), entry.second.count, entry.second.worst);
+    }
     std::printf("%s %s (%s): %d matrices checked with llama.cpp's inputs, worst rel L2 %.3e (%s), %d failures\n",
                 g_failures == 0 ? "ok  " : "FAIL", argv[1], model.packed() ? "packed" : "rows", g_checks,
                 g_worst, g_worst_name.c_str(), g_failures);

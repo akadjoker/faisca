@@ -434,6 +434,233 @@ void test_q4_0_packed()
     }
 }
 
+void test_q8_k()
+{
+    std::mt19937 rng(43);
+    const size_t n = 5 * Q8_K_BLOCK;
+    std::vector<float> x = random_values(rng, n, 2.0f);
+    for (size_t i = 0; i < Q8_K_BLOCK; ++i)
+    {
+        x[2 * Q8_K_BLOCK + i] = 0.0f;
+    }
+    x[3 * Q8_K_BLOCK + 7] = -9.0f; // the largest magnitude of its block is negative
+    std::vector<uint8_t> xq(n / Q8_K_BLOCK * Q8_K_BLOCK_BYTES);
+    std::vector<int32_t> sums(n / 16);
+    std::vector<float> back(n);
+    quantize_q8_k(x.data(), n, xq.data());
+    q8_k_block_sums(xq.data(), n, sums.data());
+    dequantize_q8_k(xq.data(), n, back.data());
+    bool scales_ok = true;
+    bool values_ok = true;
+    bool extreme_ok = true;
+    bool sums_ok = true;
+    for (size_t b = 0; b < n / Q8_K_BLOCK; ++b)
+    {
+        const uint8_t* block = xq.data() + b * Q8_K_BLOCK_BYTES;
+        const int8_t* q = reinterpret_cast<const int8_t*>(block + 4);
+        float d = 0.0f;
+        std::memcpy(&d, block, 4);
+        float max = 0.0f;
+        for (size_t j = 0; j < Q8_K_BLOCK; ++j)
+        {
+            max = std::fabs(x[b * Q8_K_BLOCK + j]) > std::fabs(max) ? x[b * Q8_K_BLOCK + j] : max;
+        }
+        // llama.cpp: scale = 1 / (-127 / max), the extreme value becomes -127
+        scales_ok = scales_ok && (max == 0.0f ? d == 0.0f : d == 1.0f / (-127.0f / max));
+        for (size_t j = 0; j < Q8_K_BLOCK; ++j)
+        {
+            const float value = x[b * Q8_K_BLOCK + j];
+            values_ok = values_ok && (max != 0.0f && value == max ? q[j] == -127 : std::fabs(back[b * Q8_K_BLOCK + j] - value) <= std::fabs(d) * 0.5f + 1e-6f);
+            extreme_ok = extreme_ok && q[j] != -128;
+        }
+        for (size_t s = 0; s < Q8_K_BLOCK / 16; ++s)
+        {
+            int32_t sum = 0;
+            for (size_t k = 0; k < 16; ++k)
+            {
+                sum += q[s * 16 + k];
+            }
+            sums_ok = sums_ok && sums[b * (Q8_K_BLOCK / 16) + s] == sum;
+        }
+    }
+    CHECK(scales_ok);
+    CHECK(values_ok);
+    CHECK(extreme_ok);
+    CHECK(sums_ok);
+    CHECK(back[2 * Q8_K_BLOCK + 5] == 0.0f);
+    CHECK(sums[2 * Q8_K_BLOCK / 16 + 3] == 0);
+}
+
+struct PackedFormat
+{
+    const char* name;
+    size_t block;
+    size_t block_bytes;
+    bool k_input;
+    void (*make_block)(std::mt19937&, uint8_t*);
+    void (*dequantize)(const uint8_t*, size_t, float*);
+    size_t (*packed_bytes)(size_t, size_t);
+    void (*pack)(const uint8_t*, size_t, size_t, uint8_t*);
+    void (*row)(const uint8_t*, size_t, size_t, float*);
+    void (*matvec_scalar)(const uint8_t*, const uint8_t*, const int32_t*, size_t, size_t, size_t, size_t, float*);
+    void (*matmul)(const uint8_t*, const uint8_t*, size_t, const int32_t*, size_t, size_t, size_t, size_t, size_t,
+                   size_t, float*, size_t);
+};
+
+uint8_t random_byte(std::mt19937& rng)
+{
+    return static_cast<uint8_t>(std::uniform_int_distribution<int>(0, 255)(rng));
+}
+
+uint16_t random_half(std::mt19937& rng, float scale, bool positive)
+{
+    float value = std::normal_distribution<float>(0.0f, scale)(rng);
+    value = positive ? std::fabs(value) : value;
+    return f32_to_f16(value);
+}
+
+void make_q5_0_block(std::mt19937& rng, uint8_t* block)
+{
+    const uint16_t d = random_half(rng, 0.05f, false);
+    std::memcpy(block, &d, 2);
+    for (size_t i = 2; i < Q5_0_BLOCK_BYTES; ++i)
+    {
+        block[i] = random_byte(rng);
+    }
+}
+
+void make_q4_k_block(std::mt19937& rng, uint8_t* block)
+{
+    const uint16_t d = random_half(rng, 0.01f, true);
+    const uint16_t dmin = random_half(rng, 0.01f, true);
+    std::memcpy(block, &d, 2);
+    std::memcpy(block + 2, &dmin, 2);
+    for (size_t i = 4; i < Q4_K_BLOCK_BYTES; ++i)
+    {
+        block[i] = random_byte(rng);
+    }
+}
+
+void make_q6_k_block(std::mt19937& rng, uint8_t* block)
+{
+    for (size_t i = 0; i < 208; ++i)
+    {
+        block[i] = random_byte(rng);
+    }
+    const uint16_t d = random_half(rng, 0.002f, false);
+    std::memcpy(block + 208, &d, 2);
+}
+
+void check_packed_format(const PackedFormat& f)
+{
+    std::mt19937 rng(47);
+    const size_t n_in = 1280;
+    for (const size_t n_out : {16, 37})
+    {
+        const size_t blocks = n_in / f.block;
+        const size_t row_bytes = blocks * f.block_bytes;
+        std::vector<uint8_t> rows(n_out * row_bytes);
+        for (size_t i = 0; i < n_out * blocks; ++i)
+        {
+            f.make_block(rng, rows.data() + i * f.block_bytes);
+        }
+        std::vector<float> dense(n_out * n_in);
+        for (size_t o = 0; o < n_out; ++o)
+        {
+            f.dequantize(rows.data() + o * row_bytes, n_in, dense.data() + o * n_in);
+        }
+
+        std::vector<uint8_t> packed(f.packed_bytes(n_in, n_out));
+        f.pack(rows.data(), n_in, n_out, packed.data());
+        bool rows_back = true;
+        std::vector<float> row(n_in);
+        for (size_t o = 0; o < n_out; ++o)
+        {
+            f.row(packed.data(), n_in, o, row.data());
+            rows_back = rows_back && std::memcmp(row.data(), dense.data() + o * n_in, n_in * sizeof(float)) == 0;
+        }
+        if (!rows_back)
+        {
+            std::fprintf(stderr, "  %s: packed rows differ from the dequantized rows\n", f.name);
+        }
+        CHECK(rows_back);
+
+        const size_t n_tokens = 19;
+        const size_t xq_stride = f.k_input ? n_in / Q8_K_BLOCK * Q8_K_BLOCK_BYTES : n_in / Q8_0_BLOCK * Q8_0_BLOCK_BYTES;
+        const size_t sums_stride = f.k_input ? n_in / 16 : n_in / Q8_0_BLOCK;
+        std::vector<uint8_t> xqs(n_tokens * xq_stride);
+        std::vector<int32_t> sums(n_tokens * sums_stride);
+        std::vector<float> xs_back(n_tokens * n_in);
+        for (size_t t = 0; t < n_tokens; ++t)
+        {
+            const std::vector<float> x = random_values(rng, n_in, 1.0f);
+            if (f.k_input)
+            {
+                quantize_q8_k(x.data(), n_in, xqs.data() + t * xq_stride);
+                q8_k_block_sums(xqs.data() + t * xq_stride, n_in, sums.data() + t * sums_stride);
+                dequantize_q8_k(xqs.data() + t * xq_stride, n_in, xs_back.data() + t * n_in);
+            }
+            else
+            {
+                quantize_q8_0(x.data(), n_in, xqs.data() + t * xq_stride);
+                q8_0_block_sums(xqs.data() + t * xq_stride, n_in, sums.data() + t * sums_stride);
+                dequantize_q8_0(xqs.data() + t * xq_stride, n_in, xs_back.data() + t * n_in);
+            }
+        }
+        std::vector<float> scalar(n_tokens * n_out), fast(n_tokens * n_out, 999.0f);
+        for (size_t t = 0; t < n_tokens; ++t)
+        {
+            f.matvec_scalar(packed.data(), xqs.data() + t * xq_stride, sums.data() + t * sums_stride, n_in, n_out, 0,
+                            n_out, scalar.data() + t * n_out);
+        }
+        f.matmul(packed.data(), xqs.data(), xq_stride, sums.data(), sums_stride, n_tokens, n_in, n_out, 0, n_out,
+                 fast.data(), n_out);
+        bool scalar_close = true;
+        bool same_bits = true;
+        double worst = 0.0;
+        for (size_t t = 0; t < n_tokens; ++t)
+        {
+            for (size_t o = 0; o < n_out; ++o)
+            {
+                double expected = 0.0;
+                double norm = 0.0;
+                for (size_t i = 0; i < n_in; ++i)
+                {
+                    expected += static_cast<double>(dense[o * n_in + i]) * xs_back[t * n_in + i];
+                    norm += std::fabs(static_cast<double>(dense[o * n_in + i]) * xs_back[t * n_in + i]);
+                }
+                const double rel = std::fabs(scalar[t * n_out + o] - expected) / (norm + 1e-30);
+                worst = rel > worst ? rel : worst;
+                scalar_close = scalar_close && rel < 1e-6;
+                same_bits = same_bits && bits_of(fast[t * n_out + o]) == bits_of(scalar[t * n_out + o]);
+            }
+        }
+        if (!scalar_close || !same_bits)
+        {
+            std::fprintf(stderr, "  %s n_out %zu: worst scalar error %.3e, vector %s\n", f.name, n_out, worst,
+                         same_bits ? "identical" : "DIFFERENT");
+        }
+        CHECK(scalar_close);
+        CHECK(same_bits);
+    }
+}
+
+void test_k_quants_packed()
+{
+    const PackedFormat formats[] = {
+        {"Q5_0", Q5_0_BLOCK, Q5_0_BLOCK_BYTES, false, make_q5_0_block, dequantize_q5_0, q5_0_packed_bytes, pack_q5_0,
+         row_q5_0_packed, matvec_q5_0_packed_scalar, matmul_q5_0_packed},
+        {"Q4_K", Q4_K_BLOCK, Q4_K_BLOCK_BYTES, true, make_q4_k_block, dequantize_q4_k, q4_k_packed_bytes, pack_q4_k,
+         row_q4_k_packed, matvec_q4_k_packed_scalar, matmul_q4_k_packed},
+        {"Q6_K", Q6_K_BLOCK, Q6_K_BLOCK_BYTES, true, make_q6_k_block, dequantize_q6_k, q6_k_packed_bytes, pack_q6_k,
+         row_q6_k_packed, matvec_q6_k_packed_scalar, matmul_q6_k_packed},
+    };
+    for (const PackedFormat& f : formats)
+    {
+        check_packed_format(f);
+    }
+}
+
 void test_dot_and_matvec()
 {
     std::mt19937 rng(7);
@@ -792,6 +1019,8 @@ int main()
     test_q8_0();
     test_q8_0_packed();
     test_q4_0_packed();
+    test_q8_k();
+    test_k_quants_packed();
     test_dot_and_matvec();
     test_rms_norm();
     test_rope();

@@ -302,6 +302,570 @@ void matvec_q8_0_packed_scalar(const uint8_t* packed, const uint8_t* xq, const i
     (void)n_out;
 }
 
+namespace
+{
+
+// value k of a Q5_0 block: nibbles as Q4_0, bit k of the 4 high bit bytes
+inline uint8_t q5_0_value(const uint8_t* block, size_t k)
+{
+    uint32_t high = 0;
+    std::memcpy(&high, block + 2, 4);
+    const uint8_t byte = block[6 + (k % 16)];
+    const uint8_t low = k < 16 ? static_cast<uint8_t>(byte & 0x0f) : static_cast<uint8_t>(byte >> 4);
+    return static_cast<uint8_t>(low | (((high >> k) & 1u) << 4));
+}
+
+// byte of the packed high bits of value k of row r and the bit it lives at
+inline size_t q5_0_packed_high_byte(size_t r, size_t k, unsigned& bit)
+{
+    bit = static_cast<unsigned>(k / 4);
+    return 2 * Q8_0_GROUP + 4 * 64 + r * 4 + (k % 4);
+}
+
+// scale and min of sub block j of a Q4_K super block, 6 bits each from 12 bytes
+inline void q4_k_scale_min(const uint8_t* scales, size_t j, uint8_t& scale, uint8_t& min)
+{
+    if (j < 4)
+    {
+        scale = static_cast<uint8_t>(scales[j] & 63);
+        min = static_cast<uint8_t>(scales[j + 4] & 63);
+    }
+    else
+    {
+        scale = static_cast<uint8_t>((scales[j + 4] & 0x0f) | ((scales[j - 4] >> 6) << 4));
+        min = static_cast<uint8_t>((scales[j + 4] >> 4) | ((scales[j] >> 6) << 4));
+    }
+}
+
+// value i of a Q4_K super block: 64 values per 32 bytes, low nibbles then high
+inline uint8_t q4_k_value(const uint8_t* block, size_t i)
+{
+    const uint8_t byte = block[16 + (i / 64) * 32 + (i % 32)];
+    return (i / 32) % 2 == 0 ? static_cast<uint8_t>(byte & 0x0f) : static_cast<uint8_t>(byte >> 4);
+}
+
+// value i of a Q6_K super block, 0 to 63, as ggml's dequantize_row_q6_K reads it
+inline uint8_t q6_k_value(const uint8_t* block, size_t i)
+{
+    const uint8_t* ql = block + (i / 128) * 64;
+    const uint8_t* qh = block + 128 + (i / 128) * 32;
+    const size_t l = i % 32;
+    const size_t part = (i % 128) / 32;
+    const uint8_t low = part < 2 ? static_cast<uint8_t>(ql[l + 32 * part] & 0x0f)
+                                 : static_cast<uint8_t>(ql[l + 32 * (part - 2)] >> 4);
+    const uint8_t high = static_cast<uint8_t>((qh[l] >> (2 * part)) & 3);
+    return static_cast<uint8_t>(low | (high << 4));
+}
+
+inline float half_at(const uint8_t* at)
+{
+    uint16_t bits = 0;
+    std::memcpy(&bits, at, 2);
+    return f16_to_f32(bits);
+}
+
+// ggml's nearest_int: round to nearest even for |x| < 2^22
+inline int32_t nearest_int(float value)
+{
+    const float shifted = value + 12582912.0f;
+    int32_t bits = 0;
+    std::memcpy(&bits, &shifted, 4);
+    return (bits & 0x007fffff) - 0x00400000;
+}
+
+// where value k (0 to 255) of row r lives in the nibble chunks of a packed K-quant block
+inline size_t k_packed_nibble_byte(size_t r, size_t k, bool& high)
+{
+    const size_t chunk = k / 8;
+    const size_t within = k % 8;
+    high = within >= 4;
+    return chunk * 64 + r * 4 + (within % 4);
+}
+
+}
+
+void dequantize_q5_0(const uint8_t* blocks, size_t n, float* out)
+{
+    for (size_t i = 0; i < n; i += Q5_0_BLOCK)
+    {
+        const float d = half_at(blocks);
+        for (size_t k = 0; k < Q5_0_BLOCK; ++k)
+        {
+            out[i + k] = static_cast<float>(static_cast<int>(q5_0_value(blocks, k)) - 16) * d;
+        }
+        blocks += Q5_0_BLOCK_BYTES;
+    }
+}
+
+size_t q5_0_packed_bytes(size_t n_in, size_t n_out)
+{
+    return q8_0_padded_rows(n_out) / Q8_0_GROUP * (n_in / Q5_0_BLOCK) * Q5_0_GROUP_BLOCK_BYTES;
+}
+
+void pack_q5_0(const uint8_t* rows, size_t n_in, size_t n_out, uint8_t* out)
+{
+    const size_t blocks = n_in / Q5_0_BLOCK;
+    const size_t row_bytes = blocks * Q5_0_BLOCK_BYTES;
+    const size_t groups = q8_0_padded_rows(n_out) / Q8_0_GROUP;
+
+    for (size_t g = 0; g < groups; ++g)
+    {
+        for (size_t b = 0; b < blocks; ++b)
+        {
+            std::memset(out, 0, Q5_0_GROUP_BLOCK_BYTES);
+            for (size_t r = 0; r < Q8_0_GROUP; ++r)
+            {
+                const size_t row = g * Q8_0_GROUP + r;
+                for (size_t k = 0; k < Q5_0_BLOCK; ++k)
+                {
+                    // padding rows get the value 16, which is 0 after the offset, and a zero scale
+                    uint8_t value = 16;
+                    if (row < n_out)
+                    {
+                        const uint8_t* block = rows + row * row_bytes + b * Q5_0_BLOCK_BYTES;
+                        out[2 * r] = block[0];
+                        out[2 * r + 1] = block[1];
+                        value = q5_0_value(block, k);
+                    }
+                    bool high = false;
+                    const size_t at = 2 * Q8_0_GROUP + k_packed_nibble_byte(r, k, high);
+                    out[at] = static_cast<uint8_t>(out[at] | (high ? (value & 0x0f) << 4 : (value & 0x0f)));
+                    unsigned bit = 0;
+                    const size_t high_at = q5_0_packed_high_byte(r, k, bit);
+                    out[high_at] = static_cast<uint8_t>(out[high_at] | ((value >> 4) << bit));
+                }
+            }
+            out += Q5_0_GROUP_BLOCK_BYTES;
+        }
+    }
+}
+
+namespace
+{
+
+inline int q5_0_packed_value(const uint8_t* block, size_t r, size_t k)
+{
+    bool high = false;
+    const size_t at = 2 * Q8_0_GROUP + k_packed_nibble_byte(r, k, high);
+    unsigned bit = 0;
+    const size_t high_at = q5_0_packed_high_byte(r, k, bit);
+    const int low = high ? block[at] >> 4 : block[at] & 0x0f;
+    return low | (((block[high_at] >> bit) & 1) << 4);
+}
+
+}
+
+void row_q5_0_packed(const uint8_t* packed, size_t n_in, size_t row, float* out)
+{
+    const size_t blocks = n_in / Q5_0_BLOCK;
+    const size_t g = row / Q8_0_GROUP;
+    const size_t r = row % Q8_0_GROUP;
+    const uint8_t* group = packed + g * blocks * Q5_0_GROUP_BLOCK_BYTES;
+    for (size_t b = 0; b < blocks; ++b)
+    {
+        const uint8_t* block = group + b * Q5_0_GROUP_BLOCK_BYTES;
+        const float d = half_at(block + 2 * r);
+        for (size_t k = 0; k < Q5_0_BLOCK; ++k)
+        {
+            out[b * Q5_0_BLOCK + k] = static_cast<float>(q5_0_packed_value(block, r, k) - 16) * d;
+        }
+    }
+}
+
+void matvec_q5_0_packed_scalar(const uint8_t* packed, const uint8_t* xq, const int32_t* x_sums, size_t n_in,
+                               size_t n_out, size_t first, size_t last, float* out)
+{
+    const size_t blocks = n_in / Q5_0_BLOCK;
+    for (size_t g = first / Q8_0_GROUP; g * Q8_0_GROUP < last; ++g)
+    {
+        const uint8_t* group = packed + g * blocks * Q5_0_GROUP_BLOCK_BYTES;
+        float acc[Q8_0_GROUP] = {};
+        for (size_t b = 0; b < blocks; ++b)
+        {
+            const uint8_t* block = group + b * Q5_0_GROUP_BLOCK_BYTES;
+            const int8_t* x = reinterpret_cast<const int8_t*>(xq + b * Q8_0_BLOCK_BYTES + 2);
+            const float dx = half_at(xq + b * Q8_0_BLOCK_BYTES);
+            for (size_t r = 0; r < Q8_0_GROUP; ++r)
+            {
+                int32_t sum = 0;
+                for (size_t k = 0; k < Q5_0_BLOCK; ++k)
+                {
+                    sum += q5_0_packed_value(block, r, k) * x[k];
+                }
+                sum -= 16 * x_sums[b];
+                const float d = half_at(block + 2 * r) * dx;
+                acc[r] = std::fma(static_cast<float>(sum), d, acc[r]);
+            }
+        }
+        for (size_t r = 0; r < Q8_0_GROUP && g * Q8_0_GROUP + r < last; ++r)
+        {
+            out[g * Q8_0_GROUP + r] = acc[r];
+        }
+    }
+    (void)n_out;
+}
+
+void quantize_q8_k(const float* x, size_t n, uint8_t* out)
+{
+    for (size_t i = 0; i < n; i += Q8_K_BLOCK)
+    {
+        float amax = 0.0f;
+        float max = 0.0f;
+        for (size_t j = 0; j < Q8_K_BLOCK; ++j)
+        {
+            const float a = std::fabs(x[i + j]);
+            if (a > amax)
+            {
+                amax = a;
+                max = x[i + j];
+            }
+        }
+        int8_t* q = reinterpret_cast<int8_t*>(out + 4);
+        if (amax == 0.0f)
+        {
+            const float zero = 0.0f;
+            std::memcpy(out, &zero, 4);
+            std::memset(q, 0, Q8_K_BLOCK);
+            out += Q8_K_BLOCK_BYTES;
+            continue;
+        }
+        const float iscale = -127.0f / max;
+        for (size_t j = 0; j < Q8_K_BLOCK; ++j)
+        {
+            const int32_t v = nearest_int(iscale * x[i + j]);
+            q[j] = static_cast<int8_t>(v < 127 ? v : 127);
+        }
+        const float d = 1.0f / iscale;
+        std::memcpy(out, &d, 4);
+        out += Q8_K_BLOCK_BYTES;
+    }
+}
+
+void dequantize_q8_k(const uint8_t* blocks, size_t n, float* out)
+{
+    for (size_t i = 0; i < n; i += Q8_K_BLOCK)
+    {
+        float d = 0.0f;
+        std::memcpy(&d, blocks, 4);
+        const int8_t* q = reinterpret_cast<const int8_t*>(blocks + 4);
+        for (size_t j = 0; j < Q8_K_BLOCK; ++j)
+        {
+            out[i + j] = d * static_cast<float>(q[j]);
+        }
+        blocks += Q8_K_BLOCK_BYTES;
+    }
+}
+
+void q8_k_block_sums(const uint8_t* xq, size_t n, int32_t* out)
+{
+    for (size_t b = 0; b < n / Q8_K_BLOCK; ++b)
+    {
+        const int8_t* q = reinterpret_cast<const int8_t*>(xq + b * Q8_K_BLOCK_BYTES + 4);
+        for (size_t s = 0; s < Q8_K_BLOCK / 16; ++s)
+        {
+            int32_t sum = 0;
+            for (size_t k = 0; k < 16; ++k)
+            {
+                sum += q[s * 16 + k];
+            }
+            out[b * (Q8_K_BLOCK / 16) + s] = sum;
+        }
+    }
+}
+
+void dequantize_q4_k(const uint8_t* blocks, size_t n, float* out)
+{
+    for (size_t i = 0; i < n; i += Q4_K_BLOCK)
+    {
+        const float d = half_at(blocks);
+        const float dmin = half_at(blocks + 2);
+        for (size_t j = 0; j < Q4_K_BLOCK / 32; ++j)
+        {
+            uint8_t scale = 0;
+            uint8_t min = 0;
+            q4_k_scale_min(blocks + 4, j, scale, min);
+            const float dj = d * static_cast<float>(scale);
+            const float mj = dmin * static_cast<float>(min);
+            for (size_t l = 0; l < 32; ++l)
+            {
+                out[i + j * 32 + l] = dj * static_cast<float>(q4_k_value(blocks, j * 32 + l)) - mj;
+            }
+        }
+        blocks += Q4_K_BLOCK_BYTES;
+    }
+}
+
+void dequantize_q6_k(const uint8_t* blocks, size_t n, float* out)
+{
+    for (size_t i = 0; i < n; i += Q6_K_BLOCK)
+    {
+        const float d = half_at(blocks + 208);
+        const int8_t* scales = reinterpret_cast<const int8_t*>(blocks + 192);
+        for (size_t k = 0; k < Q6_K_BLOCK; ++k)
+        {
+            const int q = static_cast<int>(q6_k_value(blocks, k)) - 32;
+            out[i + k] = d * static_cast<float>(scales[k / 16]) * static_cast<float>(q);
+        }
+        blocks += Q6_K_BLOCK_BYTES;
+    }
+}
+
+bool k_quants_packed_supported()
+{
+#if defined(FAISCA_AVX512_VNNI)
+    return true;
+#else
+    return false;
+#endif
+}
+
+size_t q4_k_packed_bytes(size_t n_in, size_t n_out)
+{
+    return q8_0_padded_rows(n_out) / Q8_0_GROUP * (n_in / Q4_K_BLOCK) * Q4_K_GROUP_BLOCK_BYTES;
+}
+
+size_t q6_k_packed_bytes(size_t n_in, size_t n_out)
+{
+    return q8_0_padded_rows(n_out) / Q8_0_GROUP * (n_in / Q6_K_BLOCK) * Q6_K_GROUP_BLOCK_BYTES;
+}
+
+namespace
+{
+
+constexpr size_t Q4_K_PACKED_SCALES = 4 * Q8_0_GROUP;
+constexpr size_t Q4_K_PACKED_MINS = Q4_K_PACKED_SCALES + 8 * Q8_0_GROUP;
+constexpr size_t Q4_K_PACKED_QUANTS = Q4_K_PACKED_MINS + 8 * Q8_0_GROUP;
+constexpr size_t Q6_K_PACKED_SCALES = 2 * Q8_0_GROUP;
+constexpr size_t Q6_K_PACKED_QUANTS = Q6_K_PACKED_SCALES + 16 * Q8_0_GROUP;
+constexpr size_t Q6_K_PACKED_HIGH = Q6_K_PACKED_QUANTS + Q8_0_GROUP * Q6_K_BLOCK / 2;
+
+inline int q4_k_packed_value(const uint8_t* block, size_t r, size_t k)
+{
+    bool high = false;
+    const size_t at = Q4_K_PACKED_QUANTS + k_packed_nibble_byte(r, k, high);
+    return high ? block[at] >> 4 : block[at] & 0x0f;
+}
+
+inline int q6_k_packed_value(const uint8_t* block, size_t r, size_t k)
+{
+    bool high = false;
+    const size_t at = Q6_K_PACKED_QUANTS + k_packed_nibble_byte(r, k, high);
+    const int low = high ? block[at] >> 4 : block[at] & 0x0f;
+    const size_t high_at = Q6_K_PACKED_HIGH + (k / 16) * 64 + r * 4 + (k % 4);
+    const unsigned shift = 2 * static_cast<unsigned>((k % 16) / 4);
+    return low | (((block[high_at] >> shift) & 3) << 4);
+}
+
+}
+
+void pack_q4_k(const uint8_t* rows, size_t n_in, size_t n_out, uint8_t* out)
+{
+    const size_t blocks = n_in / Q4_K_BLOCK;
+    const size_t row_bytes = blocks * Q4_K_BLOCK_BYTES;
+    const size_t groups = q8_0_padded_rows(n_out) / Q8_0_GROUP;
+
+    for (size_t g = 0; g < groups; ++g)
+    {
+        for (size_t b = 0; b < blocks; ++b)
+        {
+            // padding rows are all zero: zero scales and mins make any nibble worth nothing
+            std::memset(out, 0, Q4_K_GROUP_BLOCK_BYTES);
+            for (size_t r = 0; r < Q8_0_GROUP; ++r)
+            {
+                const size_t row = g * Q8_0_GROUP + r;
+                if (row >= n_out)
+                {
+                    continue;
+                }
+                const uint8_t* block = rows + row * row_bytes + b * Q4_K_BLOCK_BYTES;
+                std::memcpy(out + 2 * r, block, 2);
+                std::memcpy(out + 2 * Q8_0_GROUP + 2 * r, block + 2, 2);
+                for (size_t s = 0; s < 8; ++s)
+                {
+                    uint8_t scale = 0;
+                    uint8_t min = 0;
+                    q4_k_scale_min(block + 4, s, scale, min);
+                    out[Q4_K_PACKED_SCALES + s * Q8_0_GROUP + r] = scale;
+                    out[Q4_K_PACKED_MINS + s * Q8_0_GROUP + r] = min;
+                }
+                for (size_t k = 0; k < Q4_K_BLOCK; ++k)
+                {
+                    bool high = false;
+                    const size_t at = Q4_K_PACKED_QUANTS + k_packed_nibble_byte(r, k, high);
+                    const uint8_t value = q4_k_value(block, k);
+                    out[at] = static_cast<uint8_t>(out[at] | (high ? value << 4 : value));
+                }
+            }
+            out += Q4_K_GROUP_BLOCK_BYTES;
+        }
+    }
+}
+
+void row_q4_k_packed(const uint8_t* packed, size_t n_in, size_t row, float* out)
+{
+    const size_t blocks = n_in / Q4_K_BLOCK;
+    const size_t g = row / Q8_0_GROUP;
+    const size_t r = row % Q8_0_GROUP;
+    const uint8_t* group = packed + g * blocks * Q4_K_GROUP_BLOCK_BYTES;
+    for (size_t b = 0; b < blocks; ++b)
+    {
+        const uint8_t* block = group + b * Q4_K_GROUP_BLOCK_BYTES;
+        const float d = half_at(block + 2 * r);
+        const float dmin = half_at(block + 2 * Q8_0_GROUP + 2 * r);
+        for (size_t s = 0; s < 8; ++s)
+        {
+            const float ds = d * static_cast<float>(block[Q4_K_PACKED_SCALES + s * Q8_0_GROUP + r]);
+            const float ms = dmin * static_cast<float>(block[Q4_K_PACKED_MINS + s * Q8_0_GROUP + r]);
+            for (size_t l = 0; l < 32; ++l)
+            {
+                out[b * Q4_K_BLOCK + s * 32 + l] = ds * static_cast<float>(q4_k_packed_value(block, r, s * 32 + l)) - ms;
+            }
+        }
+    }
+}
+
+void matvec_q4_k_packed_scalar(const uint8_t* packed, const uint8_t* xq, const int32_t* x_sums, size_t n_in,
+                               size_t n_out, size_t first, size_t last, float* out)
+{
+    const size_t blocks = n_in / Q4_K_BLOCK;
+    for (size_t g = first / Q8_0_GROUP; g * Q8_0_GROUP < last; ++g)
+    {
+        const uint8_t* group = packed + g * blocks * Q4_K_GROUP_BLOCK_BYTES;
+        float acc[Q8_0_GROUP] = {};
+        for (size_t b = 0; b < blocks; ++b)
+        {
+            const uint8_t* block = group + b * Q4_K_GROUP_BLOCK_BYTES;
+            const int8_t* x = reinterpret_cast<const int8_t*>(xq + b * Q8_K_BLOCK_BYTES + 4);
+            float dx = 0.0f;
+            std::memcpy(&dx, xq + b * Q8_K_BLOCK_BYTES, 4);
+            const int32_t* sums = x_sums + b * (Q8_K_BLOCK / 16);
+            for (size_t r = 0; r < Q8_0_GROUP; ++r)
+            {
+                int32_t sumi = 0;
+                int32_t summ = 0;
+                for (size_t s = 0; s < 8; ++s)
+                {
+                    int32_t dot = 0;
+                    for (size_t l = 0; l < 32; ++l)
+                    {
+                        dot += q4_k_packed_value(block, r, s * 32 + l) * x[s * 32 + l];
+                    }
+                    sumi += block[Q4_K_PACKED_SCALES + s * Q8_0_GROUP + r] * dot;
+                    summ += block[Q4_K_PACKED_MINS + s * Q8_0_GROUP + r] * (sums[2 * s] + sums[2 * s + 1]);
+                }
+                const float d = half_at(block + 2 * r) * dx;
+                const float dmin = half_at(block + 2 * Q8_0_GROUP + 2 * r) * dx;
+                acc[r] = std::fma(static_cast<float>(sumi), d, acc[r]);
+                acc[r] = std::fma(-static_cast<float>(summ), dmin, acc[r]);
+            }
+        }
+        for (size_t r = 0; r < Q8_0_GROUP && g * Q8_0_GROUP + r < last; ++r)
+        {
+            out[g * Q8_0_GROUP + r] = acc[r];
+        }
+    }
+    (void)n_out;
+}
+
+void pack_q6_k(const uint8_t* rows, size_t n_in, size_t n_out, uint8_t* out)
+{
+    const size_t blocks = n_in / Q6_K_BLOCK;
+    const size_t row_bytes = blocks * Q6_K_BLOCK_BYTES;
+    const size_t groups = q8_0_padded_rows(n_out) / Q8_0_GROUP;
+
+    for (size_t g = 0; g < groups; ++g)
+    {
+        for (size_t b = 0; b < blocks; ++b)
+        {
+            // padding rows are all zero: zero scales make any value worth nothing
+            std::memset(out, 0, Q6_K_GROUP_BLOCK_BYTES);
+            for (size_t r = 0; r < Q8_0_GROUP; ++r)
+            {
+                const size_t row = g * Q8_0_GROUP + r;
+                if (row >= n_out)
+                {
+                    continue;
+                }
+                const uint8_t* block = rows + row * row_bytes + b * Q6_K_BLOCK_BYTES;
+                std::memcpy(out + 2 * r, block + 208, 2);
+                for (size_t s = 0; s < 16; ++s)
+                {
+                    out[Q6_K_PACKED_SCALES + s * Q8_0_GROUP + r] = block[192 + s];
+                }
+                for (size_t k = 0; k < Q6_K_BLOCK; ++k)
+                {
+                    const uint8_t value = q6_k_value(block, k);
+                    bool high = false;
+                    const size_t at = Q6_K_PACKED_QUANTS + k_packed_nibble_byte(r, k, high);
+                    out[at] = static_cast<uint8_t>(out[at] | (high ? (value & 0x0f) << 4 : (value & 0x0f)));
+                    const size_t high_at = Q6_K_PACKED_HIGH + (k / 16) * 64 + r * 4 + (k % 4);
+                    const unsigned shift = 2 * static_cast<unsigned>((k % 16) / 4);
+                    out[high_at] = static_cast<uint8_t>(out[high_at] | ((value >> 4) << shift));
+                }
+            }
+            out += Q6_K_GROUP_BLOCK_BYTES;
+        }
+    }
+}
+
+void row_q6_k_packed(const uint8_t* packed, size_t n_in, size_t row, float* out)
+{
+    const size_t blocks = n_in / Q6_K_BLOCK;
+    const size_t g = row / Q8_0_GROUP;
+    const size_t r = row % Q8_0_GROUP;
+    const uint8_t* group = packed + g * blocks * Q6_K_GROUP_BLOCK_BYTES;
+    for (size_t b = 0; b < blocks; ++b)
+    {
+        const uint8_t* block = group + b * Q6_K_GROUP_BLOCK_BYTES;
+        const float d = half_at(block + 2 * r);
+        for (size_t k = 0; k < Q6_K_BLOCK; ++k)
+        {
+            const float scale = static_cast<float>(static_cast<int8_t>(block[Q6_K_PACKED_SCALES + (k / 16) * Q8_0_GROUP + r]));
+            out[b * Q6_K_BLOCK + k] = d * scale * static_cast<float>(q6_k_packed_value(block, r, k) - 32);
+        }
+    }
+}
+
+void matvec_q6_k_packed_scalar(const uint8_t* packed, const uint8_t* xq, const int32_t* x_sums, size_t n_in,
+                               size_t n_out, size_t first, size_t last, float* out)
+{
+    const size_t blocks = n_in / Q6_K_BLOCK;
+    for (size_t g = first / Q8_0_GROUP; g * Q8_0_GROUP < last; ++g)
+    {
+        const uint8_t* group = packed + g * blocks * Q6_K_GROUP_BLOCK_BYTES;
+        float acc[Q8_0_GROUP] = {};
+        for (size_t b = 0; b < blocks; ++b)
+        {
+            const uint8_t* block = group + b * Q6_K_GROUP_BLOCK_BYTES;
+            const int8_t* x = reinterpret_cast<const int8_t*>(xq + b * Q8_K_BLOCK_BYTES + 4);
+            float dx = 0.0f;
+            std::memcpy(&dx, xq + b * Q8_K_BLOCK_BYTES, 4);
+            const int32_t* sums = x_sums + b * (Q8_K_BLOCK / 16);
+            for (size_t r = 0; r < Q8_0_GROUP; ++r)
+            {
+                int32_t sumi = 0;
+                for (size_t s = 0; s < 16; ++s)
+                {
+                    int32_t dot = 0;
+                    for (size_t l = 0; l < 16; ++l)
+                    {
+                        dot += q6_k_packed_value(block, r, s * 16 + l) * x[s * 16 + l];
+                    }
+                    dot -= 32 * sums[s];
+                    sumi += static_cast<int8_t>(block[Q6_K_PACKED_SCALES + s * Q8_0_GROUP + r]) * dot;
+                }
+                const float d = half_at(block + 2 * r) * dx;
+                acc[r] = std::fma(static_cast<float>(sumi), d, acc[r]);
+            }
+        }
+        for (size_t r = 0; r < Q8_0_GROUP && g * Q8_0_GROUP + r < last; ++r)
+        {
+            out[g * Q8_0_GROUP + r] = acc[r];
+        }
+    }
+    (void)n_out;
+}
+
 #if defined(FAISCA_AVX512_VNNI)
 
 namespace
@@ -512,6 +1076,265 @@ void matmul_q4_0_packed(const uint8_t* packed, const uint8_t* xq, size_t xq_stri
     (void)n_out;
 }
 
+namespace
+{
+
+inline void store_group(float* o, size_t row, size_t last, __m512 acc)
+{
+    if (row + Q8_0_GROUP <= last)
+    {
+        _mm512_storeu_ps(o, acc);
+    }
+    else
+    {
+        _mm512_mask_storeu_ps(o, static_cast<__mmask16>((1u << (last - row)) - 1), acc);
+    }
+}
+
+template <size_t TOKENS>
+void gemm_group_q5_avx512(const uint8_t* block, const uint8_t* xq, size_t xq_stride, const int32_t* x_sums,
+                          size_t sums_stride, size_t blocks, size_t row, size_t last, float* out, size_t out_stride)
+{
+    const __m512i low_mask = _mm512_set1_epi8(0x0f);
+    const __m512i one = _mm512_set1_epi8(0x01);
+    __m512 acc[TOKENS];
+    for (size_t t = 0; t < TOKENS; ++t)
+    {
+        acc[t] = _mm512_setzero_ps();
+    }
+    for (size_t b = 0; b < blocks; ++b)
+    {
+        const uint8_t* quants = block + 2 * Q8_0_GROUP;
+        const __m512i high = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(quants + 4 * 64));
+        __m512i w[8];
+        for (size_t c = 0; c < 4; ++c)
+        {
+            const __m512i bytes = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(quants + 64 * c));
+            const __m512i h_lo = _mm512_slli_epi16(_mm512_and_si512(_mm512_srli_epi16(high, static_cast<int>(2 * c)), one), 4);
+            const __m512i h_hi = _mm512_slli_epi16(_mm512_and_si512(_mm512_srli_epi16(high, static_cast<int>(2 * c + 1)), one), 4);
+            w[2 * c] = _mm512_or_si512(_mm512_and_si512(bytes, low_mask), h_lo);
+            w[2 * c + 1] = _mm512_or_si512(_mm512_and_si512(_mm512_srli_epi16(bytes, 4), low_mask), h_hi);
+        }
+        const __m512 scales = _mm512_cvtph_ps(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(block)));
+        for (size_t t = 0; t < TOKENS; ++t)
+        {
+            const uint8_t* x = xq + t * xq_stride + b * Q8_0_BLOCK_BYTES;
+            __m512i sum = _mm512_setzero_si512();
+            for (size_t j = 0; j < 8; ++j)
+            {
+                int32_t x4 = 0;
+                std::memcpy(&x4, x + 2 + 4 * j, 4);
+                sum = _mm512_dpbusd_epi32(sum, w[j], _mm512_set1_epi32(x4));
+            }
+            sum = _mm512_sub_epi32(sum, _mm512_set1_epi32(16 * x_sums[t * sums_stride + b]));
+            uint16_t dx_bits = 0;
+            std::memcpy(&dx_bits, x, 2);
+            const __m512 d = _mm512_mul_ps(scales, _mm512_set1_ps(f16_to_f32(dx_bits)));
+            acc[t] = _mm512_fmadd_ps(_mm512_cvtepi32_ps(sum), d, acc[t]);
+        }
+        block += Q5_0_GROUP_BLOCK_BYTES;
+    }
+    for (size_t t = 0; t < TOKENS; ++t)
+    {
+        store_group(out + t * out_stride + row, row, last, acc[t]);
+    }
+}
+
+// 8 dot products of 4 consecutive values against one input, the integer part of a sub block of 32
+inline __m512i dot_chunks(const __m512i* w, const int8_t* x)
+{
+    __m512i sum = _mm512_setzero_si512();
+    for (size_t j = 0; j < 8; ++j)
+    {
+        int32_t x4 = 0;
+        std::memcpy(&x4, x + 4 * j, 4);
+        sum = _mm512_dpbusd_epi32(sum, w[j], _mm512_set1_epi32(x4));
+    }
+    return sum;
+}
+
+template <size_t TOKENS>
+void gemm_group_q4_k_avx512(const uint8_t* block, const uint8_t* xq, size_t xq_stride, const int32_t* x_sums,
+                            size_t sums_stride, size_t blocks, size_t row, size_t last, float* out, size_t out_stride)
+{
+    const __m512i low_mask = _mm512_set1_epi8(0x0f);
+    __m512 acc[TOKENS];
+    for (size_t t = 0; t < TOKENS; ++t)
+    {
+        acc[t] = _mm512_setzero_ps();
+    }
+    for (size_t b = 0; b < blocks; ++b)
+    {
+        const uint8_t* quants = block + Q4_K_PACKED_QUANTS;
+        __m512i sumi[TOKENS];
+        __m512i summ[TOKENS];
+        for (size_t t = 0; t < TOKENS; ++t)
+        {
+            sumi[t] = _mm512_setzero_si512();
+            summ[t] = _mm512_setzero_si512();
+        }
+        for (size_t s = 0; s < 8; ++s)
+        {
+            __m512i w[8];
+            for (size_t c = 0; c < 4; ++c)
+            {
+                const __m512i bytes = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(quants + 64 * (4 * s + c)));
+                w[2 * c] = _mm512_and_si512(bytes, low_mask);
+                w[2 * c + 1] = _mm512_and_si512(_mm512_srli_epi16(bytes, 4), low_mask);
+            }
+            const __m512i scale = _mm512_cvtepu8_epi32(
+                _mm_loadu_si128(reinterpret_cast<const __m128i*>(block + Q4_K_PACKED_SCALES + s * Q8_0_GROUP)));
+            const __m512i min = _mm512_cvtepu8_epi32(
+                _mm_loadu_si128(reinterpret_cast<const __m128i*>(block + Q4_K_PACKED_MINS + s * Q8_0_GROUP)));
+            for (size_t t = 0; t < TOKENS; ++t)
+            {
+                const int8_t* x = reinterpret_cast<const int8_t*>(xq + t * xq_stride + b * Q8_K_BLOCK_BYTES + 4);
+                const int32_t* sums = x_sums + t * sums_stride + b * (Q8_K_BLOCK / 16);
+                sumi[t] = _mm512_add_epi32(sumi[t], _mm512_mullo_epi32(dot_chunks(w, x + 32 * s), scale));
+                summ[t] = _mm512_add_epi32(summ[t], _mm512_mullo_epi32(min, _mm512_set1_epi32(sums[2 * s] + sums[2 * s + 1])));
+            }
+        }
+        const __m512 d = _mm512_cvtph_ps(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(block)));
+        const __m512 dmin = _mm512_cvtph_ps(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(block + 2 * Q8_0_GROUP)));
+        for (size_t t = 0; t < TOKENS; ++t)
+        {
+            float dx = 0.0f;
+            std::memcpy(&dx, xq + t * xq_stride + b * Q8_K_BLOCK_BYTES, 4);
+            const __m512 vdx = _mm512_set1_ps(dx);
+            acc[t] = _mm512_fmadd_ps(_mm512_cvtepi32_ps(sumi[t]), _mm512_mul_ps(d, vdx), acc[t]);
+            acc[t] = _mm512_fnmadd_ps(_mm512_cvtepi32_ps(summ[t]), _mm512_mul_ps(dmin, vdx), acc[t]);
+        }
+        block += Q4_K_GROUP_BLOCK_BYTES;
+    }
+    for (size_t t = 0; t < TOKENS; ++t)
+    {
+        store_group(out + t * out_stride + row, row, last, acc[t]);
+    }
+}
+
+template <size_t TOKENS>
+void gemm_group_q6_k_avx512(const uint8_t* block, const uint8_t* xq, size_t xq_stride, const int32_t* x_sums,
+                            size_t sums_stride, size_t blocks, size_t row, size_t last, float* out, size_t out_stride)
+{
+    const __m512i low_mask = _mm512_set1_epi8(0x0f);
+    const __m512i mask_03 = _mm512_set1_epi8(0x03);
+    const __m512i mask_0c = _mm512_set1_epi8(0x0c);
+    const __m512i mask_30 = _mm512_set1_epi8(0x30);
+    const __m512i mask_c0 = _mm512_set1_epi8(static_cast<char>(0xc0));
+    __m512 acc[TOKENS];
+    for (size_t t = 0; t < TOKENS; ++t)
+    {
+        acc[t] = _mm512_setzero_ps();
+    }
+    for (size_t b = 0; b < blocks; ++b)
+    {
+        const uint8_t* quants = block + Q6_K_PACKED_QUANTS;
+        const uint8_t* high = block + Q6_K_PACKED_HIGH;
+        __m512i sumi[TOKENS];
+        for (size_t t = 0; t < TOKENS; ++t)
+        {
+            sumi[t] = _mm512_setzero_si512();
+        }
+        for (size_t s = 0; s < 16; ++s)
+        {
+            const __m512i h = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(high + 64 * s));
+            const __m512i bytes0 = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(quants + 64 * (2 * s)));
+            const __m512i bytes1 = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(quants + 64 * (2 * s + 1)));
+            __m512i w[4];
+            w[0] = _mm512_or_si512(_mm512_and_si512(bytes0, low_mask), _mm512_slli_epi16(_mm512_and_si512(h, mask_03), 4));
+            w[1] = _mm512_or_si512(_mm512_and_si512(_mm512_srli_epi16(bytes0, 4), low_mask),
+                                   _mm512_slli_epi16(_mm512_and_si512(h, mask_0c), 2));
+            w[2] = _mm512_or_si512(_mm512_and_si512(bytes1, low_mask), _mm512_and_si512(h, mask_30));
+            w[3] = _mm512_or_si512(_mm512_and_si512(_mm512_srli_epi16(bytes1, 4), low_mask),
+                                   _mm512_srli_epi16(_mm512_and_si512(h, mask_c0), 2));
+            const __m512i scale = _mm512_cvtepi8_epi32(
+                _mm_loadu_si128(reinterpret_cast<const __m128i*>(block + Q6_K_PACKED_SCALES + s * Q8_0_GROUP)));
+            for (size_t t = 0; t < TOKENS; ++t)
+            {
+                const int8_t* x = reinterpret_cast<const int8_t*>(xq + t * xq_stride + b * Q8_K_BLOCK_BYTES + 4) + 16 * s;
+                const int32_t* sums = x_sums + t * sums_stride + b * (Q8_K_BLOCK / 16);
+                __m512i dot = _mm512_setzero_si512();
+                for (size_t j = 0; j < 4; ++j)
+                {
+                    int32_t x4 = 0;
+                    std::memcpy(&x4, x + 4 * j, 4);
+                    dot = _mm512_dpbusd_epi32(dot, w[j], _mm512_set1_epi32(x4));
+                }
+                dot = _mm512_sub_epi32(dot, _mm512_set1_epi32(32 * sums[s]));
+                sumi[t] = _mm512_add_epi32(sumi[t], _mm512_mullo_epi32(dot, scale));
+            }
+        }
+        const __m512 d = _mm512_cvtph_ps(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(block)));
+        for (size_t t = 0; t < TOKENS; ++t)
+        {
+            float dx = 0.0f;
+            std::memcpy(&dx, xq + t * xq_stride + b * Q8_K_BLOCK_BYTES, 4);
+            acc[t] = _mm512_fmadd_ps(_mm512_cvtepi32_ps(sumi[t]), _mm512_mul_ps(d, _mm512_set1_ps(dx)), acc[t]);
+        }
+        block += Q6_K_GROUP_BLOCK_BYTES;
+    }
+    for (size_t t = 0; t < TOKENS; ++t)
+    {
+        store_group(out + t * out_stride + row, row, last, acc[t]);
+    }
+}
+
+template <void (*GEMM)(const uint8_t*, const uint8_t*, size_t, const int32_t*, size_t, size_t, size_t, size_t, float*, size_t),
+          void (*GEMV)(const uint8_t*, const uint8_t*, size_t, const int32_t*, size_t, size_t, size_t, size_t, float*, size_t)>
+void matmul_groups(size_t group_block_bytes, const uint8_t* packed, const uint8_t* xq, size_t xq_stride,
+                   const int32_t* x_sums, size_t sums_stride, size_t n_tokens, size_t blocks, size_t first, size_t last,
+                   float* out, size_t out_stride)
+{
+    for (size_t g = first / Q8_0_GROUP; g * Q8_0_GROUP < last; ++g)
+    {
+        const uint8_t* block = packed + g * blocks * group_block_bytes;
+        const size_t row = g * Q8_0_GROUP;
+        size_t t = 0;
+        for (; t + GEMM_TOKENS <= n_tokens; t += GEMM_TOKENS)
+        {
+            GEMM(block, xq + t * xq_stride, xq_stride, x_sums + t * sums_stride, sums_stride, blocks, row, last,
+                 out + t * out_stride, out_stride);
+        }
+        for (; t < n_tokens; ++t)
+        {
+            GEMV(block, xq + t * xq_stride, xq_stride, x_sums + t * sums_stride, sums_stride, blocks, row, last,
+                 out + t * out_stride, out_stride);
+        }
+    }
+}
+
+}
+
+void matmul_q5_0_packed(const uint8_t* packed, const uint8_t* xq, size_t xq_stride, const int32_t* x_sums,
+                        size_t sums_stride, size_t n_tokens, size_t n_in, size_t n_out, size_t first, size_t last,
+                        float* out, size_t out_stride)
+{
+    matmul_groups<gemm_group_q5_avx512<GEMM_TOKENS>, gemm_group_q5_avx512<1>>(
+        Q5_0_GROUP_BLOCK_BYTES, packed, xq, xq_stride, x_sums, sums_stride, n_tokens, n_in / Q5_0_BLOCK, first, last,
+        out, out_stride);
+    (void)n_out;
+}
+
+void matmul_q4_k_packed(const uint8_t* packed, const uint8_t* xq, size_t xq_stride, const int32_t* x_sums,
+                        size_t sums_stride, size_t n_tokens, size_t n_in, size_t n_out, size_t first, size_t last,
+                        float* out, size_t out_stride)
+{
+    matmul_groups<gemm_group_q4_k_avx512<GEMM_TOKENS>, gemm_group_q4_k_avx512<1>>(
+        Q4_K_GROUP_BLOCK_BYTES, packed, xq, xq_stride, x_sums, sums_stride, n_tokens, n_in / Q4_K_BLOCK, first, last,
+        out, out_stride);
+    (void)n_out;
+}
+
+void matmul_q6_k_packed(const uint8_t* packed, const uint8_t* xq, size_t xq_stride, const int32_t* x_sums,
+                        size_t sums_stride, size_t n_tokens, size_t n_in, size_t n_out, size_t first, size_t last,
+                        float* out, size_t out_stride)
+{
+    matmul_groups<gemm_group_q6_k_avx512<GEMM_TOKENS>, gemm_group_q6_k_avx512<1>>(
+        Q6_K_GROUP_BLOCK_BYTES, packed, xq, xq_stride, x_sums, sums_stride, n_tokens, n_in / Q6_K_BLOCK, first, last,
+        out, out_stride);
+    (void)n_out;
+}
+
 #elif defined(FAISCA_AVX_VNNI)
 
 void matmul_q4_0_packed(const uint8_t* packed, const uint8_t* xq, size_t xq_stride, const int32_t* x_sums,
@@ -657,6 +1480,43 @@ void matvec_q8_0_packed(const uint8_t* packed, const uint8_t* xq, const int32_t*
                         size_t first, size_t last, float* out)
 {
     matvec_q8_0_packed_scalar(packed, xq, x_sums, n_in, n_out, first, last, out);
+}
+
+#endif
+
+#if !defined(FAISCA_AVX512_VNNI)
+
+void matmul_q5_0_packed(const uint8_t* packed, const uint8_t* xq, size_t xq_stride, const int32_t* x_sums,
+                        size_t sums_stride, size_t n_tokens, size_t n_in, size_t n_out, size_t first, size_t last,
+                        float* out, size_t out_stride)
+{
+    for (size_t t = 0; t < n_tokens; ++t)
+    {
+        matvec_q5_0_packed_scalar(packed, xq + t * xq_stride, x_sums + t * sums_stride, n_in, n_out, first, last,
+                                  out + t * out_stride);
+    }
+}
+
+void matmul_q4_k_packed(const uint8_t* packed, const uint8_t* xq, size_t xq_stride, const int32_t* x_sums,
+                        size_t sums_stride, size_t n_tokens, size_t n_in, size_t n_out, size_t first, size_t last,
+                        float* out, size_t out_stride)
+{
+    for (size_t t = 0; t < n_tokens; ++t)
+    {
+        matvec_q4_k_packed_scalar(packed, xq + t * xq_stride, x_sums + t * sums_stride, n_in, n_out, first, last,
+                                  out + t * out_stride);
+    }
+}
+
+void matmul_q6_k_packed(const uint8_t* packed, const uint8_t* xq, size_t xq_stride, const int32_t* x_sums,
+                        size_t sums_stride, size_t n_tokens, size_t n_in, size_t n_out, size_t first, size_t last,
+                        float* out, size_t out_stride)
+{
+    for (size_t t = 0; t < n_tokens; ++t)
+    {
+        matvec_q6_k_packed_scalar(packed, xq + t * xq_stride, x_sums + t * sums_stride, n_in, n_out, first, last,
+                                  out + t * out_stride);
+    }
 }
 
 #endif

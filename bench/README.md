@@ -174,6 +174,32 @@ SmolLM2-360M-Instruct.
 | Q4_0 prompt (tok/s) | 1 | 249 | 165 |
 | Q4_0 prompt (tok/s) | 4 | 147 | 480 |
 
+Q4_K_M (Q5_0 for the 960 wide matrices, Q4_K and Q6_K for `ffn_down`, Q8_0
+for the embeddings and half of `attn_v`), measured with a harness over
+`Runner`: the first 512 tokens of the 1045 token prompt, then 32 greedy
+tokens, best of 3; llama-bench pp512 and tg32. Q8_0 under the same harness is
+the calibration row.
+
+| | threads | llama.cpp | faisca |
+| --- | --- | --- | --- |
+| Q4_K_M generation (tok/s) | 1 | 19.2 | 23.6 |
+| Q4_K_M generation (tok/s) | 4 | 54 | 78 |
+| Q4_K_M prompt (tok/s) | 1 | 83 | 164 |
+| Q4_K_M prompt (tok/s) | 4 | 266 | 492 |
+| Q8_0 generation, same harness (tok/s) | 1 | | 24.6 |
+| Q8_0 generation, same harness (tok/s) | 4 | | 76.5 |
+| Q8_0 prompt, same harness (tok/s) | 1 | | 166 |
+| Q8_0 prompt, same harness (tok/s) | 4 | | 494 |
+
+llama.cpp is slower on Q4_K_M than on Q8_0 here because Q5_0 has no AMX
+kernel in its CPU backend. faisca's Q5_0 kernel is compute bound on one
+thread like its Q4_0 one: over the 64 Q5_0 `ffn_gate` and `ffn_up` matrices
+(103 MiB) one token takes 15.4 ms, 7.0 GB/s of weights, while the same values
+expanded to packed Q8_0 at load (exact, 159 MiB) take 14.5 ms at 11.5 GB/s;
+with 16 tokens Q5_0 wins, 25.3 ms against 33.6. The packed Q5_0 is kept: it
+is 35% less memory, faster on the prompt and 6% slower on single thread
+generation, which a cheaper unpack can recover.
+
 KV cache in f16 against float32, Q8_0 weights, context of 2048 positions,
 prompt of 1045 tokens then 64 greedy tokens (best of 3, `tests/runner_dump`
 style harness over `Runner` with `kv_f16` on and off):
