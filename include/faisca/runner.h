@@ -73,6 +73,15 @@ public:
         return m_cache_bytes;
     }
 
+    // the cache of positions 0 to position() as bytes, layer by layer the key tiles
+    // that cover those positions then the value rows: state_k_bytes() + state_v_bytes()
+    // per layer; import_state sets the position and expects exactly state_bytes(pos)
+    size_t state_k_bytes(uint32_t pos) const;
+    size_t state_v_bytes(uint32_t pos) const;
+    size_t state_bytes(uint32_t pos) const;
+    bool export_state(uint8_t* out, size_t bytes) const;
+    bool import_state(const uint8_t* data, size_t bytes, uint32_t pos, Error& error);
+
     const LlamaModel* model() const
     {
         return m_model;

@@ -70,7 +70,21 @@ top. No third party dependencies. Owner: Luís (akadjoker). "faisca" is a workin
    rows per workgroup, vectorized loads, f16 cache, fewer dispatches),
    Windows loading path untested.
 6. Own cache format with offset tables, KV cache kept between turns and saved to
-   disk, longest common prefix reuse, snapshots.
+   disk, longest common prefix reuse, snapshots: done. `Runner::state_bytes /
+   export_state / import_state` (positions 0..pos: per layer the key tiles
+   covering them, then the value rows), `Session` (include/faisca/session.h:
+   tokens by position, `feed` with longest common prefix reuse capped at
+   count - 1 so the last token always runs, `push`, `truncate`, `snapshot /
+   restore` in memory, `save / load`: "FSCA" header, version 1, n_layer,
+   n_head_kv, head_dim, kv_f16, n_vocab, n_tokens, model name, offset table
+   of {kind, layer, offset, size} with the tokens then keys and values per
+   layer, sections 8 byte aligned; another model, cache type or version is
+   refused), `faisca chat` with `--session`. tests/session_check: prefix
+   reuse, cut at a divergence, restore and load in a fresh runner all give
+   logits bit identical to an uninterrupted run (Q8_0 and Q4_K_M, ASan
+   clean). A 19 token snapshot of SmolLM2-360M in f16 is 1 MiB (whole key
+   tiles of 16 positions are stored). The Vulkan runner has no state
+   export yet.
 
 Target model: SmolLM2-360M-Instruct GGUF, then 1B to 3B models.
 

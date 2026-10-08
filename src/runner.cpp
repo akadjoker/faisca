@@ -160,6 +160,94 @@ bool Runner::init_buffers(const LlamaModel& model, uint32_t n_ctx, bool kv_f16, 
     return true;
 }
 
+size_t Runner::state_k_bytes(uint32_t pos) const
+{
+    const LlamaHparams& h = m_model->hparams();
+    const size_t tiles = (static_cast<size_t>(pos) + KEY_TILE - 1) / KEY_TILE;
+    const size_t element = m_kv_f16 ? sizeof(uint16_t) : sizeof(float);
+    return static_cast<size_t>(h.n_head_kv) * tiles * h.head_dim * KEY_TILE * element;
+}
+
+size_t Runner::state_v_bytes(uint32_t pos) const
+{
+    const LlamaHparams& h = m_model->hparams();
+    const size_t element = m_kv_f16 ? sizeof(uint16_t) : sizeof(float);
+    return static_cast<size_t>(pos) * h.n_head_kv * h.head_dim * element;
+}
+
+size_t Runner::state_bytes(uint32_t pos) const
+{
+    return m_model == nullptr ? 0 : static_cast<size_t>(m_model->hparams().n_layer) * (state_k_bytes(pos) + state_v_bytes(pos));
+}
+
+bool Runner::export_state(uint8_t* out, size_t bytes) const
+{
+    if (m_model == nullptr || bytes != state_bytes(m_pos))
+    {
+        return false;
+    }
+    const LlamaHparams& h = m_model->hparams();
+    const size_t element = m_kv_f16 ? sizeof(uint16_t) : sizeof(float);
+    const size_t n_kv = static_cast<size_t>(h.n_head_kv) * h.head_dim;
+    const size_t tiles_all = (static_cast<size_t>(m_n_ctx) + KEY_TILE - 1) / KEY_TILE;
+    const size_t head_bytes = tiles_all * h.head_dim * KEY_TILE * element;
+    const size_t k_head = state_k_bytes(m_pos) / h.n_head_kv;
+    const size_t v_bytes = state_v_bytes(m_pos);
+    const uint8_t* k_base = m_kv_f16 ? reinterpret_cast<const uint8_t*>(m_k16.data()) : reinterpret_cast<const uint8_t*>(m_k.data());
+    const uint8_t* v_base = m_kv_f16 ? reinterpret_cast<const uint8_t*>(m_v16.data()) : reinterpret_cast<const uint8_t*>(m_v.data());
+    for (uint32_t l = 0; l < h.n_layer; ++l)
+    {
+        for (uint32_t head = 0; head < h.n_head_kv; ++head)
+        {
+            std::memcpy(out, k_base + (static_cast<size_t>(l) * h.n_head_kv + head) * head_bytes, k_head);
+            out += k_head;
+        }
+        std::memcpy(out, v_base + static_cast<size_t>(l) * m_n_ctx * n_kv * element, v_bytes);
+        out += v_bytes;
+    }
+    return true;
+}
+
+bool Runner::import_state(const uint8_t* data, size_t bytes, uint32_t pos, Error& error)
+{
+    if (m_model == nullptr)
+    {
+        error.set("the runner is not initialized");
+        return false;
+    }
+    if (pos > m_n_ctx)
+    {
+        error.set("a state of %" PRIu32 " positions does not fit a context of %" PRIu32, pos, m_n_ctx);
+        return false;
+    }
+    if (bytes != state_bytes(pos))
+    {
+        error.set("a state of %" PRIu32 " positions takes %zu bytes, %zu given", pos, state_bytes(pos), bytes);
+        return false;
+    }
+    const LlamaHparams& h = m_model->hparams();
+    const size_t element = m_kv_f16 ? sizeof(uint16_t) : sizeof(float);
+    const size_t n_kv = static_cast<size_t>(h.n_head_kv) * h.head_dim;
+    const size_t tiles_all = (static_cast<size_t>(m_n_ctx) + KEY_TILE - 1) / KEY_TILE;
+    const size_t head_bytes = tiles_all * h.head_dim * KEY_TILE * element;
+    const size_t k_head = state_k_bytes(pos) / h.n_head_kv;
+    const size_t v_bytes = state_v_bytes(pos);
+    uint8_t* k_base = m_kv_f16 ? reinterpret_cast<uint8_t*>(m_k16.data()) : reinterpret_cast<uint8_t*>(m_k.data());
+    uint8_t* v_base = m_kv_f16 ? reinterpret_cast<uint8_t*>(m_v16.data()) : reinterpret_cast<uint8_t*>(m_v.data());
+    for (uint32_t l = 0; l < h.n_layer; ++l)
+    {
+        for (uint32_t head = 0; head < h.n_head_kv; ++head)
+        {
+            std::memcpy(k_base + (static_cast<size_t>(l) * h.n_head_kv + head) * head_bytes, data, k_head);
+            data += k_head;
+        }
+        std::memcpy(v_base + static_cast<size_t>(l) * m_n_ctx * n_kv * element, data, v_bytes);
+        data += v_bytes;
+    }
+    m_pos = pos;
+    return true;
+}
+
 bool Runner::forward(const int32_t* tokens, size_t count, Array<float>& logits, Error& error, bool all_logits)
 {
     if (m_model == nullptr)

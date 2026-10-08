@@ -2,6 +2,7 @@
 #include "faisca/model.h"
 #include "faisca/ops.h"
 #include "faisca/runner.h"
+#include "faisca/session.h"
 #include "faisca/speculative.h"
 #if defined(FAISCA_VULKAN)
 #include "faisca/vulkan_runner.h"
@@ -29,6 +30,7 @@ void print_usage()
         "\n"
         "usage:\n"
         "  faisca info <model.gguf> [--meta] [--tensors]\n"
+        "  faisca chat <model.gguf> [-n <tokens>] [-c <context>] [-t <threads>] [--session <file>] [--kv-f32]\n"
         "  faisca generate <model.gguf> -p <prompt> [-n <tokens>] [-c <context>] [-t <threads>] [--raw] [--f32] [--kv-f32]\n"
         "                                [--draft <draft.gguf>] [--draft-n <tokens>] [--vulkan]\n"
         "  faisca version\n"
@@ -47,7 +49,11 @@ void print_usage()
         "  --kv-f32    keep the KV cache in float32 instead of f16\n"
         "  --draft     a smaller model of the same vocabulary that proposes tokens (speculative decoding)\n"
         "  --draft-n   tokens proposed per round, default 3\n"
-        "  --vulkan    run on the Vulkan device instead of the CPU (float32 activations, no draft)\n",
+        "  --vulkan    run on the Vulkan device instead of the CPU (float32 activations, no draft)\n"
+        "\n"
+        "chat reads one user message per line from standard input and keeps the conversation in the\n"
+        "KV cache between turns; --session loads the conversation from the file if it exists and\n"
+        "saves it after every reply.\n",
         FAISCA_VERSION);
 }
 
@@ -707,6 +713,198 @@ int command_generate(int argc, char** argv)
 
 }
 
+int command_chat(int argc, char** argv)
+{
+    const char* path = nullptr;
+    const char* session_path = nullptr;
+    int count = 256;
+    long context = 2048;
+    int threads = 1;
+    bool kv_f16 = true;
+
+    for (int i = 2; i < argc; ++i)
+    {
+        if (std::strcmp(argv[i], "-n") == 0 && i + 1 < argc)
+        {
+            count = std::atoi(argv[++i]);
+        }
+        else if (std::strcmp(argv[i], "-c") == 0 && i + 1 < argc)
+        {
+            context = std::atol(argv[++i]);
+        }
+        else if (std::strcmp(argv[i], "-t") == 0 && i + 1 < argc)
+        {
+            threads = std::atoi(argv[++i]);
+        }
+        else if (std::strcmp(argv[i], "--session") == 0 && i + 1 < argc)
+        {
+            session_path = argv[++i];
+        }
+        else if (std::strcmp(argv[i], "--kv-f32") == 0)
+        {
+            kv_f16 = false;
+        }
+        else if (argv[i][0] == '-' && argv[i][1] != '\0')
+        {
+            std::fprintf(stderr, "faisca: unknown option '%s'\n", argv[i]);
+            return 2;
+        }
+        else if (path == nullptr)
+        {
+            path = argv[i];
+        }
+        else
+        {
+            std::fprintf(stderr, "faisca: unexpected argument '%s'\n", argv[i]);
+            return 2;
+        }
+    }
+    if (path == nullptr)
+    {
+        std::fprintf(stderr, "faisca: chat needs a model file\n");
+        return 2;
+    }
+    if (count < 1 || context < 1 || context > 0x7fffffffL)
+    {
+        std::fprintf(stderr, "faisca: -n and -c must be positive\n");
+        return 2;
+    }
+
+    Error error;
+    GgufFile file;
+    Tokenizer tokenizer;
+    LlamaModel model;
+    ThreadPool pool;
+    Runner runner;
+    Session session;
+    if (!file.open(path, error) || !tokenizer.load(file, error) || !model.load(file, error) || !pool.start(threads, error) ||
+        !runner.init(model, static_cast<uint32_t>(context), pool, error, kv_f16))
+    {
+        std::fprintf(stderr, "faisca: %s\n", error.c_str());
+        return 1;
+    }
+    std::string_view name;
+    file.get_string("general.name", name);
+    char model_name[128] = {};
+    std::snprintf(model_name, sizeof(model_name), "%.*s", static_cast<int>(name.size()), name.data());
+    if (!session.init(runner, model_name, error))
+    {
+        std::fprintf(stderr, "faisca: %s\n", error.c_str());
+        return 1;
+    }
+    if (session_path != nullptr)
+    {
+        FILE* probe = std::fopen(session_path, "rb");
+        if (probe != nullptr)
+        {
+            std::fclose(probe);
+            if (!session.load(session_path, error))
+            {
+                std::fprintf(stderr, "faisca: %s\n", error.c_str());
+                return 1;
+            }
+            std::fprintf(stderr, "faisca: session '%s' loaded, %" PRIu32 " tokens of conversation\n", session_path,
+                         session.position());
+        }
+    }
+
+    Array<int32_t> turn;
+    Array<int32_t> conversation;
+    Array<float> logits;
+    Array<char> text;
+    Array<char> piece;
+    char line[4096];
+    for (;;)
+    {
+        std::fprintf(stderr, "> ");
+        std::fflush(stderr);
+        if (std::fgets(line, sizeof(line), stdin) == nullptr)
+        {
+            break;
+        }
+        size_t length = std::strlen(line);
+        while (length > 0 && (line[length - 1] == '\n' || line[length - 1] == '\r'))
+        {
+            line[--length] = '\0';
+        }
+        if (length == 0)
+        {
+            continue;
+        }
+
+        // the turn as tokens appended to what the cache holds, never re-tokenizing the past
+        text.clear();
+        const bool first = session.tokens().empty();
+        append_text(text, first ? "<|im_start|>user\n" : "<|im_end|>\n<|im_start|>user\n");
+        append_text(text, line);
+        append_text(text, "<|im_end|>\n<|im_start|>assistant\n");
+        turn.clear();
+        if (!tokenizer.encode(std::string_view(text.data(), text.size()), first, true, turn) || turn.empty())
+        {
+            std::fprintf(stderr, "faisca: the message produced no tokens\n");
+            continue;
+        }
+        conversation.clear();
+        if (!conversation.append(session.tokens().data(), session.tokens().size()) || !conversation.append(turn.data(), turn.size()))
+        {
+            std::fprintf(stderr, "faisca: out of memory\n");
+            return 1;
+        }
+        if (conversation.size() + static_cast<size_t>(count) > runner.context_size())
+        {
+            std::fprintf(stderr, "faisca: the conversation of %zu tokens plus %d do not fit a context of %" PRIu32 "\n",
+                         conversation.size(), count, runner.context_size());
+            break;
+        }
+        const auto start = std::chrono::steady_clock::now();
+        size_t reused = 0;
+        if (!session.feed(conversation.data(), conversation.size(), logits, error, &reused))
+        {
+            std::fprintf(stderr, "faisca: %s\n", error.c_str());
+            return 1;
+        }
+        const double prompt_seconds = seconds_since(start);
+
+        const auto generate_start = std::chrono::steady_clock::now();
+        int generated = 0;
+        for (; generated < count; ++generated)
+        {
+            int32_t best = 0;
+            for (size_t t = 1; t < logits.size(); ++t)
+            {
+                if (logits[t] > logits[static_cast<size_t>(best)])
+                {
+                    best = static_cast<int32_t>(t);
+                }
+            }
+            if (best == tokenizer.eos() || tokenizer.token_type(best) == TokenType::Control)
+            {
+                break;
+            }
+            piece.clear();
+            tokenizer.token_to_piece(best, false, piece);
+            std::fwrite(piece.data(), 1, piece.size(), stdout);
+            std::fflush(stdout);
+            if (!session.push(best, logits, error))
+            {
+                std::fprintf(stderr, "\nfaisca: %s\n", error.c_str());
+                return 1;
+            }
+        }
+        const double generate_seconds = seconds_since(generate_start);
+        std::printf("\n");
+        std::fprintf(stderr, "[%zu tokens reused, %zu processed in %.2f s, %d generated in %.2f s (%.1f tok/s)]\n", reused,
+                     conversation.size() - reused, prompt_seconds, generated, generate_seconds,
+                     generated > 0 ? static_cast<double>(generated) / generate_seconds : 0.0);
+        if (session_path != nullptr && !session.save(session_path, error))
+        {
+            std::fprintf(stderr, "faisca: %s\n", error.c_str());
+            return 1;
+        }
+    }
+    return 0;
+}
+
 int main(int argc, char** argv)
 {
     if (argc < 2)
@@ -719,6 +917,10 @@ int main(int argc, char** argv)
     if (std::strcmp(command, "info") == 0)
     {
         return command_info(argc, argv);
+    }
+    if (std::strcmp(command, "chat") == 0)
+    {
+        return command_chat(argc, argv);
     }
     if (std::strcmp(command, "generate") == 0)
     {

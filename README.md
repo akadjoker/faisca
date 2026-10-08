@@ -20,7 +20,7 @@ or exceptions. It has its own containers (`faisca::Array`, `faisca::StringMap`,
 | CPU runner, float32, validated layer by layer against llama.cpp | done |
 | CPU optimization: threads, VNNI kernels for Q8_0, Q4_0, Q5_0, Q4_K and Q6_K, batched prompt, f16 KV cache | done, AMX pending |
 | Vulkan compute backend | runs the whole model, validated layer by layer on llvmpipe; speed on a real GPU not measured yet |
-| Own cache format and KV cache on disk | planned |
+| Own cache format and KV cache on disk | done: sessions with prefix reuse, snapshots and files with an offset table |
 
 ## Build
 
@@ -44,7 +44,14 @@ faisca info model.gguf              # summary
 faisca info model.gguf --meta       # every metadata key
 faisca info model.gguf --tensors    # every tensor
 faisca generate model.gguf -p "What is the capital of France?" -n 64 -t 4
+faisca chat model.gguf -t 4 --session talk.session
 ```
+
+`chat` reads one user message per line and keeps the conversation in the KV
+cache between turns, so a new turn only processes its own tokens;
+`--session` loads the conversation from the file if it exists and saves it
+after every reply, so a chat can be resumed days later without recomputing
+anything.
 
 `generate` wraps the prompt in the SmolLM2 chat template (`--raw` to skip
 that), decodes greedily and prints the tokens as they come, then the timings.
@@ -144,6 +151,20 @@ which rounds both to f16 for its f16 cache. Every matrix row group, attention he
 token step is computed whole by one thread, so the output is bit identical
 for any thread count. The prompt is processed in batches; generation reuses
 the same kernels one token at a time.
+
+`Session` (include/faisca/session.h) keeps the tokens a runner's cache holds
+by position. `feed` keeps the longest prefix the new tokens share with them
+(all but the last token at most) and forwards only the rest; `snapshot` and
+`restore` serialize the tokens and the cache of the positions in use
+(`Runner::export_state` and `import_state`); `save` and `load` write that
+snapshot as a file: a header with the model name, the hyperparameters the
+cache depends on and the cache type, then an offset table with one entry for
+the tokens and one per layer for the keys and for the values, so a reader can
+find any part without parsing the rest. A session of another model, another
+cache type or another version is refused. `tests/session_check` verifies
+that prefix reuse, a cut at a divergence, restore from memory and load from
+a file in a fresh runner all continue a generation with logits bit identical
+to an uninterrupted run.
 
 `Speculative` (include/faisca/speculative.h) runs greedy speculative decoding
 over two runners sharing one thread pool (`Runner::init` with a
