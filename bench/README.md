@@ -326,6 +326,32 @@ Expanding Q5_0 to packed Q8_0 at load (exact values, 1.55x the bytes) was
 measured before the prefetch: 6% faster for one token on one thread, slower
 with 16 tokens; packed Q5_0 is kept.
 
+AVX-VNNI build (`-mavx2 -mfma -mf16c -mavxvnni`, no AVX-512) on the same
+machine, the harness over `Runner` as above (512 tokens then 32, best of 3,
+two runs each). "Before" is the same build when Q5_0 and the K-quants were
+converted to float32 at load; "after" has the 256-bit packed kernels. The
+AVX-512 build was run in the same minutes.
+
+| | threads | AVX-VNNI before | AVX-VNNI after | AVX-512 |
+| --- | --- | --- | --- | --- |
+| Q4_K_M 360M generation (tok/s) | 1 | 6.5 to 6.8 | 34.3 to 36.7 | 39.8 to 40.0 |
+| Q4_K_M 360M generation (tok/s) | 4 | 21.5 to 21.8 | 100 to 104 | 111 to 134 |
+| Q4_K_M 360M prompt (tok/s) | 1 | 17.2 to 17.5 | 82.3 to 82.7 | 176 to 204 |
+| Q4_K_M 360M prompt (tok/s) | 4 | 64 | 245 to 252 | 573 to 628 |
+| 1.7B Q4_K_M generation (tok/s) | 1 | | 8.2 | 9.2 |
+| 1.7B Q4_K_M generation (tok/s) | 4 | | 25.8 | 24.9 |
+| 1.7B Q4_K_M prompt (tok/s) | 1 | | 17.2 | 43.5 |
+| 1.7B Q4_K_M prompt (tok/s) | 4 | | 56 | 134 |
+
+Generation is within 10% of the AVX-512 build (both read the same bytes,
+memory bound). The prompt is 2.2 to 2.5x slower because the 256-bit kernels
+walk the weights once per token where the AVX-512 GEMM reads each group
+block once for all 32 tokens of the batch; a 256-bit GEMM is the next step
+for that build. The 1.7B "before" column is missing: that file converted to
+float32 does not fit the memory of this VM. Q4_0 on the same build moved
+within noise with the attention change (122 / 337 to 383 prompt, 39 to 43 /
+115 to 136 generation, before and after interleaved).
+
 How the generation speed got there, one thread, Q8_0: float32 weights 4.7
 tok/s; Q8_0 rows with an AVX2 kernel 7.8; block scales converted with F16C
 13.4; packed groups of 16 rows with VNNI 24.6. The kernels are checked
