@@ -29,7 +29,7 @@ void layer_norm(const float* x, const float* weight, const float* bias, size_t n
     }
 }
 
-void gelu(float* x, size_t n)
+void gelu_scalar(float* x, size_t n)
 {
     const float coef_a = 0.044715f;
     const float sqrt_2_over_pi = 0.79788456080286535587989211986876f;

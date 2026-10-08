@@ -2553,6 +2553,34 @@ void swiglu(const float* gate, const float* up, size_t n, float* out)
     }
 }
 
+// 0.5 x (1 + tanh(y)) = x / (1 + exp(-2y)), y = sqrt(2 / pi) (x + 0.044715 x^3), with exp_values' exp
+void gelu(float* x, size_t n)
+{
+    const float coef_a = 0.044715f;
+    const float two_sqrt_2_over_pi = 2.0f * 0.79788456080286535587989211986876f;
+    size_t i = 0;
+#if defined(__AVX512F__)
+    for (; i + 16 <= n; i += 16)
+    {
+        const __m512 v = _mm512_loadu_ps(x + i);
+        const __m512 inner = _mm512_mul_ps(v, _mm512_fmadd_ps(_mm512_set1_ps(coef_a), _mm512_mul_ps(v, v), _mm512_set1_ps(1.0f)));
+        const __m512 e = exp_avx512(_mm512_mul_ps(_mm512_set1_ps(-two_sqrt_2_over_pi), inner));
+        _mm512_storeu_ps(x + i, _mm512_div_ps(v, _mm512_add_ps(_mm512_set1_ps(1.0f), e)));
+    }
+#endif
+    for (; i + 8 <= n; i += 8)
+    {
+        const __m256 v = _mm256_loadu_ps(x + i);
+        const __m256 inner = _mm256_mul_ps(v, _mm256_fmadd_ps(_mm256_set1_ps(coef_a), _mm256_mul_ps(v, v), _mm256_set1_ps(1.0f)));
+        const __m256 e = exp_avx2(_mm256_mul_ps(_mm256_set1_ps(-two_sqrt_2_over_pi), inner));
+        _mm256_storeu_ps(x + i, _mm256_div_ps(v, _mm256_add_ps(_mm256_set1_ps(1.0f), e)));
+    }
+    if (i < n)
+    {
+        gelu_scalar(x + i, n - i);
+    }
+}
+
 namespace
 {
 
@@ -3124,6 +3152,11 @@ void exp_values(float* x, size_t n)
 void swiglu(const float* gate, const float* up, size_t n, float* out)
 {
     swiglu_scalar(gate, up, n, out);
+}
+
+void gelu(float* x, size_t n)
+{
+    gelu_scalar(x, n);
 }
 
 void quantize_q8_0(const float* x, size_t n, uint8_t* out)

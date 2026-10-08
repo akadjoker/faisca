@@ -68,6 +68,7 @@ private:
     void norm_rows(const float* x, const float* w, const float* b, size_t rows, size_t width, float* out);
     void gelu_rows(float* x, size_t rows, size_t width);
     void bias_rows(float* x, const float* b, size_t rows, size_t width);
+    void bias_gelu_rows(float* x, const float* b, size_t rows, size_t width, size_t stride);
     void add_rows(float* x, const float* y, size_t rows, size_t width);
     void tile_keys(const float* k, const float* v, size_t n_kv, float* tiles, float* v_heads);
     size_t tiles_per_head() const;

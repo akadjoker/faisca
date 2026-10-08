@@ -239,6 +239,7 @@ void layer_norm(const float* x, const float* weight, const float* bias, size_t n
 
 // x = 0.5 x (1 + tanh(sqrt(2 / pi) (x + 0.044715 x^3))), the tanh form the models were trained with
 void gelu(float* x, size_t n);
+void gelu_scalar(float* x, size_t n); // tanhf; the vector one computes x / (1 + exp(-2y)), within a few ulp
 
 void add_bias(float* x, const float* bias, size_t n);
 

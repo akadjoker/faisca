@@ -65,9 +65,10 @@ struct VisionRunner::RowsJob
     const float* b;
     size_t rows;
     size_t width;
+    size_t stride;
     float eps;
     float* out;
-    int mode; // 0 layer norm, 1 gelu, 2 bias, 3 add
+    int mode; // 0 layer norm, 1 gelu, 2 bias, 3 add, 4 bias then gelu
 };
 
 struct VisionRunner::MatmulJob
@@ -173,7 +174,7 @@ void VisionRunner::rows_task(void* user, int thread_index, int thread_count)
     const size_t last = job.rows * static_cast<size_t>(thread_index + 1) / static_cast<size_t>(thread_count);
     for (size_t r = first; r < last; ++r)
     {
-        float* out = job.out + r * job.width;
+        float* out = job.out + r * job.stride;
         switch (job.mode)
         {
         case 0:
@@ -185,6 +186,10 @@ void VisionRunner::rows_task(void* user, int thread_index, int thread_count)
         case 2:
             add_bias(out, job.b, job.width);
             break;
+        case 4:
+            add_bias(out, job.b, job.width);
+            gelu(out, job.width);
+            break;
         default:
             add(out, job.x + r * job.width, job.width);
             break;
@@ -194,25 +199,31 @@ void VisionRunner::rows_task(void* user, int thread_index, int thread_count)
 
 void VisionRunner::norm_rows(const float* x, const float* w, const float* b, size_t rows, size_t width, float* out)
 {
-    RowsJob job{x, w, b, rows, width, m_model->hparams().eps, out, 0};
+    RowsJob job{x, w, b, rows, width, width, m_model->hparams().eps, out, 0};
     m_pool->run(rows_task, &job);
 }
 
 void VisionRunner::gelu_rows(float* x, size_t rows, size_t width)
 {
-    RowsJob job{nullptr, nullptr, nullptr, rows, width, 0.0f, x, 1};
+    RowsJob job{nullptr, nullptr, nullptr, rows, width, width, 0.0f, x, 1};
+    m_pool->run(rows_task, &job);
+}
+
+void VisionRunner::bias_gelu_rows(float* x, const float* b, size_t rows, size_t width, size_t stride)
+{
+    RowsJob job{nullptr, nullptr, b, rows, width, stride, 0.0f, x, 4};
     m_pool->run(rows_task, &job);
 }
 
 void VisionRunner::bias_rows(float* x, const float* b, size_t rows, size_t width)
 {
-    RowsJob job{nullptr, nullptr, b, rows, width, 0.0f, x, 2};
+    RowsJob job{nullptr, nullptr, b, rows, width, width, 0.0f, x, 2};
     m_pool->run(rows_task, &job);
 }
 
 void VisionRunner::add_rows(float* x, const float* y, size_t rows, size_t width)
 {
-    RowsJob job{y, nullptr, nullptr, rows, width, 0.0f, x, 3};
+    RowsJob job{y, nullptr, nullptr, rows, width, width, 0.0f, x, 3};
     m_pool->run(rows_task, &job);
 }
 
@@ -418,11 +429,7 @@ bool VisionRunner::encode_planes(const float* planes, Array<float>& embeddings, 
         trace("ffn_inp_normed", il, m_h.data(), n * dim);
         matmul(layer.up, m_h.data(), n, m_up.data(), h.n_ff_padded);
         // the padded tail of every row stays zero: the bias and the GELU cover n_ff values
-        for (size_t t = 0; t < n; ++t)
-        {
-            add_bias(m_up.data() + t * h.n_ff_padded, layer.up_b, h.n_ff);
-            gelu(m_up.data() + t * h.n_ff_padded, h.n_ff);
-        }
+        bias_gelu_rows(m_up.data(), layer.up_b, n, h.n_ff, h.n_ff_padded);
         trace("ffn_gelu", il, m_up.data(), n * h.n_ff_padded);
         matmul(layer.down, m_up.data(), n, m_h.data());
         bias_rows(m_h.data(), layer.down_b, n, dim);

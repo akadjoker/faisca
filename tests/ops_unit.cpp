@@ -1403,6 +1403,28 @@ void test_attention_block()
                 attention_block_queries());
 }
 
+void test_gelu()
+{
+    std::mt19937 rng(53);
+    std::vector<float> a = random_values(rng, 1003, 8.0f);
+    a.push_back(-100.0f);
+    a.push_back(100.0f);
+    a.push_back(0.0f);
+    std::vector<float> b = a;
+    std::vector<float> x = a;
+    gelu_scalar(a.data(), a.size());
+    gelu(b.data(), b.size());
+    // relative to the input: 1 + tanh(y) cancels for x below -4 and the tanhf form loses its digits there
+    double worst = 0.0;
+    for (size_t i = 0; i < a.size(); ++i)
+    {
+        const double scale = std::fabs(static_cast<double>(x[i])) > 1e-6 ? std::fabs(static_cast<double>(x[i])) : 1e-6;
+        worst = std::max(worst, std::fabs(static_cast<double>(a[i]) - b[i]) / scale);
+    }
+    CHECK(worst < 1e-6);
+    std::printf("gelu: vector within %.2e of tanhf relative to the input (%zu values, -100 to 100)\n", worst, a.size());
+}
+
 int main()
 {
     test_f16();
@@ -1426,6 +1448,7 @@ int main()
     test_rope_neox();
     test_attention_head_72();
     test_attention_block();
+    test_gelu();
 
     std::printf("%s ops_unit: %d checks, %d failed\n", g_failures == 0 ? "ok  " : "FAIL", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;
