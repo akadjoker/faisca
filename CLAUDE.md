@@ -86,7 +86,15 @@ top. No third party dependencies. Owner: Luís (akadjoker). "faisca" is a workin
    tiles of 16 positions are stored). The Vulkan runner has no state
    export yet.
 
-Target model: SmolLM2-360M-Instruct GGUF, then 1B to 3B models.
+Target model: SmolLM2-360M-Instruct GGUF, then 1B to 3B models. SmolLM2-1.7B
+Q4_K_M (/home/user/models/1.7b/, official file, its float32 copy and the
+llama dump /home/user/ref/llama_17b_dump.bin) validated: matmul_check zero
+error on 145 matrices, float32 path 1.8e-5 from llama.cpp (block 22 is
+sensitive: the quantized runs of both runners are 0.9 to 1.0 from float32
+there, tokens identical), 16 tokens identical; 9.0 / 28.2 tok/s generation
+and 45 / 125 prompt with 1 / 4 threads (llama.cpp 5.4 / 16.5 and 55 /
+169). Load takes 10 s (packing 1 GB into huge pages). Llama 3.x files
+need rope scaling, which the loader still rejects.
 
 ## Tokenizer status
 

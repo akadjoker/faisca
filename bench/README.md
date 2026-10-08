@@ -234,6 +234,24 @@ AVX-512 (bit identical bytes: the same product rounded to nearest even)
 take 0.11 s. The products are bound by one 512-bit `vpdpbusd` per cycle, 64
 multiply adds, 131 GMAC/s at 2.1 GHz.
 
+**SmolLM2-1.7B-Instruct Q4_K_M** (HuggingFaceTB's file: 24 blocks, 2048 wide,
+32 heads, Q4_K and Q6_K everywhere, 1005 MiB), same harness and machine:
+
+| | threads | llama.cpp | faisca |
+| --- | --- | --- | --- |
+| generation (tok/s) | 1 | 5.4 | 9.0 |
+| generation (tok/s) | 4 | 16.5 | 28.2 |
+| prompt (tok/s) | 1 | 55 | 45 |
+| prompt (tok/s) | 4 | 169 | 125 |
+
+Validation of the 1.7B: matmul_check gives zero error on all 145 matrices
+checked (120 Q4_K, 25 Q6_K); the float32 path is 1.8e-5 from llama.cpp
+(block 22 of this model is numerically sensitive: the quantized runs of both
+faisca and llama.cpp sit at 0.9 to 1.0 relative L2 from the float32 run
+there, with 16 greedy tokens identical on every side, so the activation
+quantization is the cause, not the kernels); the Vulkan kernels on llvmpipe
+are within 4e-7 per matrix.
+
 **Speculative decoding with SmolLM2-135M as draft.** Measured with
 `speculative_check` (SmolLM2-360M Q8_0 target, chat prompt of 16 tokens, 64
 generated unless said otherwise; the sequences are identical to plain greedy

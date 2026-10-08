@@ -62,7 +62,8 @@ the same vocabulary (`--draft-n` tokens per round, default 3); the output is
 the same, only the speed changes, see bench/README.md for when it helps.
 SmolLM2-360M on a 2.1 GHz Xeon, 4 threads: 98 tokens per second from Q8_0,
 about 150 from Q4_0, 118 from Q4_K_M, prompts at 550 to 600 tokens per
-second (bench/README.md has the table against llama.cpp).
+second; SmolLM2-1.7B Q4_K_M: 28 tokens per second, prompts at 125
+(bench/README.md has the tables against llama.cpp).
 
 ## Library
 
