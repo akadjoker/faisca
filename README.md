@@ -283,12 +283,12 @@ python3 tests/compare_with_gguf_py.py build/gguf_dump model.gguf
   | Prompt | Tensors compared | Worst relative L2 error | Generated tokens |
   | --- | --- | --- | --- |
   | chat prompt, 16 tokens | 386 | 4.5e-6 (`l_out-31`) | 16, identical |
-  | chat prompt, 1045 tokens | 386 | 3.9e-6 (`ffn_out-13`) | 8, identical |
+  | chat prompt, 1045 tokens | 386 | 5.3e-6 (`ffn_out-13`) | 16, identical |
 
   Those rows keep both caches in float32 (`--ours-flags=--kv-f32`). With the
   default f16 cache on the faisca side and the same float32 reference, the
   error is the rounding of the keys and values: 1.9e-3 (16 tokens) and
-  2.49e-3 (1045 tokens), tokens still identical. llama.cpp with its own f16
+  2.59e-3 (1045 tokens), tokens still identical. llama.cpp with its own f16
   cache (`--reference-flags=--kv-f16`) sits at 2.2e-3 and 2.50e-3 from its
   float32 run.
 

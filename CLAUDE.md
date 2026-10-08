@@ -41,7 +41,10 @@ top. No third party dependencies. Owner: Luís (akadjoker). "faisca" is a workin
    templates like the AVX-512 ones: each chunk unpacked once per group
    block and reused for GEMM_TOKENS_AVX = 4 inputs (16 ymm registers:
    two halves of the sums for 4 inputs plus the chunk), the tail and
-   generation through the same template with 1 input (bench/README.md).
+   generation through the same template with 1 input: the prompt is 1.2x
+   (Q4_0) to 2x (1.7B) over the per token kernels and 1.5 to 1.7x below
+   AVX-512, generation unchanged; 8 inputs spill and lose 10 to 25%
+   (bench/README.md).
    Speculative decoding with SmolLM2-135M as draft: done (`Speculative`,
    `--draft`), output identical to plain greedy, gain 1.3 to 1.4x on one
    thread with a Q4_0 draft and about 1.1x with four, 0.9x at a 512 token
@@ -172,11 +175,16 @@ runner_dump files is the test). -ffp-contract=off keeps Debug and Release
 identical. No rope scaling, no biases, no MoE yet: rejected with an error.
 
 - Validation: float32 path against llama.cpp with compare_layers.py: 386
-  tensors, worst rel L2 4.5e-6 (16 tokens) and 3.9e-6 (1045 tokens), greedy
+  tensors, worst rel L2 4.1e-6 (16 tokens) and 5.3e-6 (1045 tokens), greedy
   tokens identical (both caches float32, `--ours-flags=--kv-f32`). f16 cache
-  against the same float32 reference: 1.9e-3 and 2.49e-3, tokens identical;
+  against the same float32 reference: 1.9e-3 and 2.59e-3, tokens identical;
   llama.cpp's own f16 cache (`--reference-flags=--kv-f16`) is at 2.2e-3 and
-  2.50e-3, so ours is never further than theirs. On Q8_0 the 8th greedy token
+  2.50e-3. The 1045 token numbers were 3.66e-6 and 2.49e-3 up to 9532ba4
+  and moved at 4611b8f (vectorized SwiGLU and quantizers, which only
+  re-measured the 16 token prompt); bisected with worktrees of both
+  commits, tokens identical in all. Pitfall: /home/user/ref/long_tokens.txt
+  has no "E " prefix, so `cut -c3-` drops its first token (the BOS) and
+  gives 3.46e-3 on a 1044 token prompt. On Q8_0 the 8th greedy token
   of the chat prompt is a near tie (gap 0.03 to 0.04 logits between 7042 and
   EOS) that flips with any change of rounding, on both runners. Quantized kernels with matmul_check against llama.cpp's
   own inputs: 193 matrices, zero error, Q8_0 and Q4_0. Full quantized pass:

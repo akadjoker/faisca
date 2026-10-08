@@ -328,29 +328,39 @@ with 16 tokens; packed Q5_0 is kept.
 
 AVX-VNNI build (`-mavx2 -mfma -mf16c -mavxvnni`, no AVX-512) on the same
 machine, the harness over `Runner` as above (512 tokens then 32, best of 3,
-two runs each). "Before" is the same build when Q5_0 and the K-quants were
-converted to float32 at load; "after" has the 256-bit packed kernels. The
-AVX-512 build was run in the same minutes.
+two runs each, the binaries interleaved in the same minutes). Three states
+of that build: Q5_0 and the K-quants converted to float32 at load, the
+first 256-bit kernels that walked the weights once per token, and the GEMM
+templates that unpack each chunk once for 4 inputs. The AVX-512 column is
+from the same session.
 
-| | threads | AVX-VNNI before | AVX-VNNI after | AVX-512 |
-| --- | --- | --- | --- | --- |
-| Q4_K_M 360M generation (tok/s) | 1 | 6.5 to 6.8 | 34.3 to 36.7 | 39.8 to 40.0 |
-| Q4_K_M 360M generation (tok/s) | 4 | 21.5 to 21.8 | 100 to 104 | 111 to 134 |
-| Q4_K_M 360M prompt (tok/s) | 1 | 17.2 to 17.5 | 82.3 to 82.7 | 176 to 204 |
-| Q4_K_M 360M prompt (tok/s) | 4 | 64 | 245 to 252 | 573 to 628 |
-| 1.7B Q4_K_M generation (tok/s) | 1 | | 8.2 | 9.2 |
-| 1.7B Q4_K_M generation (tok/s) | 4 | | 25.8 | 24.9 |
-| 1.7B Q4_K_M prompt (tok/s) | 1 | | 17.2 | 43.5 |
-| 1.7B Q4_K_M prompt (tok/s) | 4 | | 56 | 134 |
+| | threads | float32 conversion | per token kernels | GEMM of 4 | AVX-512 |
+| --- | --- | --- | --- | --- | --- |
+| Q4_K_M 360M prompt (tok/s) | 1 | 17.2 to 17.5 | 80 to 82 | 126 to 132 | 176 to 204 |
+| Q4_K_M 360M prompt (tok/s) | 4 | 64 | 239 to 247 | 338 to 344 | 573 to 628 |
+| Q4_K_M 360M generation (tok/s) | 1 | 6.5 to 6.8 | 33.5 to 34 | 35.5 to 35.7 | 39.8 to 40.0 |
+| Q4_K_M 360M generation (tok/s) | 4 | 21.5 to 21.8 | 94 to 114 | 94 to 99 | 111 to 134 |
+| Q8_0 360M prompt (tok/s) | 1 | | 81 to 85 | 146 to 147 | 212 |
+| Q8_0 360M prompt (tok/s) | 4 | | 355 to 422 | 419 to 442 | 603 |
+| Q8_0 360M generation (tok/s) | 1 | | 27 to 29 | 30 to 31 | 33.8 |
+| Q8_0 360M generation (tok/s) | 4 | | 85 to 92 | 80 to 83 | 98 |
+| Q4_0 360M prompt (tok/s) | 1 | | 125 to 128 | 159 to 163 | 207 |
+| Q4_0 360M prompt (tok/s) | 4 | | 402 to 421 | 427 to 545 | 570 to 599 |
+| Q4_0 360M generation (tok/s) | 1 | | 43 to 45 | 42 to 43 | 45 |
+| Q4_0 360M generation (tok/s) | 4 | | 150 to 153 | 133 to 167 | 144 to 183 |
+| 1.7B Q4_K_M prompt (tok/s) | 1 | | 17.2 | 33.8 | 43.5 |
+| 1.7B Q4_K_M prompt (tok/s) | 4 | | 64.6 | 114 | 134 |
+| 1.7B Q4_K_M generation (tok/s) | 1 | | 8.2 | 8.4 | 9.2 |
+| 1.7B Q4_K_M generation (tok/s) | 4 | | 27.0 | 27.8 | 24.9 |
 
-Generation is within 10% of the AVX-512 build (both read the same bytes,
-memory bound). The prompt is 2.2 to 2.5x slower because the 256-bit kernels
-walk the weights once per token where the AVX-512 GEMM reads each group
-block once for all 32 tokens of the batch; a 256-bit GEMM is the next step
-for that build. The 1.7B "before" column is missing: that file converted to
-float32 does not fit the memory of this VM. Q4_0 on the same build moved
-within noise with the attention change (122 / 337 to 383 prompt, 39 to 43 /
-115 to 136 generation, before and after interleaved).
+The Q8_0 and Q4_0 AVX-512 numbers are the ones of the table above. The
+GEMM takes the prompt 1.2x (Q4_0, whose unpack is cheap) to 2x (1.7B)
+over the per token kernels and generation is unchanged, since one input
+goes through the same template. A GEMM of 8 inputs was measured in the
+same runs and lost 10 to 25% of the prompt to register spills (16 ymm hold
+the two halves of the sums for 4 inputs plus the chunk), so 4 is kept.
+The 1.7B float32 conversion column is missing: that file converted to
+float32 does not fit the memory of this VM.
 
 How the generation speed got there, one thread, Q8_0: float32 weights 4.7
 tok/s; Q8_0 rows with an AVX2 kernel 7.8; block scales converted with F16C
