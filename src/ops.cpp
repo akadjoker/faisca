@@ -1367,6 +1367,10 @@ void matmul_q6_k_packed(const uint8_t* packed, const uint8_t* xq, size_t xq_stri
 namespace
 {
 
+// group block chunks unpacked once and reused for this many inputs; 16 ymm registers
+// hold the two halves of the sums for 4 inputs plus the unpacked chunk
+constexpr size_t GEMM_TOKENS_AVX = 4;
+
 inline void store_group_halves(float* o, size_t row, size_t last, __m256 lo, __m256 hi)
 {
     float values[Q8_0_GROUP];
@@ -1381,69 +1385,414 @@ inline __m256 half_scales(const uint8_t* at)
     return _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(at)));
 }
 
+inline __m256i broadcast_4(const uint8_t* at)
+{
+    int32_t x4 = 0;
+    std::memcpy(&x4, at, 4);
+    return _mm256_set1_epi32(x4);
+}
+
+inline float f16_at(const uint8_t* at)
+{
+    uint16_t bits = 0;
+    std::memcpy(&bits, at, 2);
+    return f16_to_f32(bits);
+}
+
+inline float f32_at(const uint8_t* at)
+{
+    float value = 0.0f;
+    std::memcpy(&value, at, 4);
+    return value;
+}
+
+inline void accumulate_block(__m256& acc_lo, __m256& acc_hi, __m256i sum_lo, __m256i sum_hi, int32_t correction,
+                             __m256 scales_lo, __m256 scales_hi, float dx)
+{
+    const __m256i c = _mm256_set1_epi32(correction);
+    const __m256 vdx = _mm256_set1_ps(dx);
+    acc_lo = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_sub_epi32(sum_lo, c)), _mm256_mul_ps(scales_lo, vdx), acc_lo);
+    acc_hi = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_sub_epi32(sum_hi, c)), _mm256_mul_ps(scales_hi, vdx), acc_hi);
+}
+
+template <size_t TOKENS>
+void gemm_group_q8_avx(const uint8_t* block, const uint8_t* xq, size_t xq_stride, const int32_t* x_sums,
+                       size_t sums_stride, size_t blocks, size_t row, size_t last, float* out, size_t out_stride)
+{
+    __m256 acc_lo[TOKENS];
+    __m256 acc_hi[TOKENS];
+    for (size_t t = 0; t < TOKENS; ++t)
+    {
+        acc_lo[t] = _mm256_setzero_ps();
+        acc_hi[t] = _mm256_setzero_ps();
+    }
+    for (size_t b = 0; b < blocks; ++b)
+    {
+        prefetch_group_block(block, Q8_0_GROUP_BLOCK_BYTES);
+        const uint8_t* quants = block + 2 * Q8_0_GROUP;
+        const uint8_t* x = xq + b * Q8_0_BLOCK_BYTES;
+        __m256i sum_lo[TOKENS];
+        __m256i sum_hi[TOKENS];
+        for (size_t t = 0; t < TOKENS; ++t)
+        {
+            sum_lo[t] = _mm256_setzero_si256();
+            sum_hi[t] = _mm256_setzero_si256();
+        }
+        for (size_t j = 0; j < 8; ++j)
+        {
+            const __m256i w_lo = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(quants + 64 * j));
+            const __m256i w_hi = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(quants + 64 * j + 32));
+            for (size_t t = 0; t < TOKENS; ++t)
+            {
+                const __m256i xb = broadcast_4(x + t * xq_stride + 2 + 4 * j);
+                sum_lo[t] = _mm256_dpbusd_avx_epi32(sum_lo[t], w_lo, xb);
+                sum_hi[t] = _mm256_dpbusd_avx_epi32(sum_hi[t], w_hi, xb);
+            }
+        }
+        const __m256 scales_lo = half_scales(block);
+        const __m256 scales_hi = half_scales(block + 16);
+        for (size_t t = 0; t < TOKENS; ++t)
+        {
+            accumulate_block(acc_lo[t], acc_hi[t], sum_lo[t], sum_hi[t], 128 * x_sums[t * sums_stride + b], scales_lo,
+                             scales_hi, f16_at(x + t * xq_stride));
+        }
+        block += Q8_0_GROUP_BLOCK_BYTES;
+    }
+    for (size_t t = 0; t < TOKENS; ++t)
+    {
+        store_group_halves(out + t * out_stride + row, row, last, acc_lo[t], acc_hi[t]);
+    }
+}
+
+template <size_t TOKENS>
+void gemm_group_q4_avx(const uint8_t* block, const uint8_t* xq, size_t xq_stride, const int32_t* x_sums,
+                       size_t sums_stride, size_t blocks, size_t row, size_t last, float* out, size_t out_stride)
+{
+    const __m256i low_mask = _mm256_set1_epi8(0x0f);
+    __m256 acc_lo[TOKENS];
+    __m256 acc_hi[TOKENS];
+    for (size_t t = 0; t < TOKENS; ++t)
+    {
+        acc_lo[t] = _mm256_setzero_ps();
+        acc_hi[t] = _mm256_setzero_ps();
+    }
+    for (size_t b = 0; b < blocks; ++b)
+    {
+        prefetch_group_block(block, Q4_0_GROUP_BLOCK_BYTES);
+        const uint8_t* quants = block + 2 * Q8_0_GROUP;
+        const uint8_t* x = xq + b * Q8_0_BLOCK_BYTES;
+        __m256i sum_lo[TOKENS];
+        __m256i sum_hi[TOKENS];
+        for (size_t t = 0; t < TOKENS; ++t)
+        {
+            sum_lo[t] = _mm256_setzero_si256();
+            sum_hi[t] = _mm256_setzero_si256();
+        }
+        for (size_t c = 0; c < 4; ++c)
+        {
+            const __m256i bytes_lo = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(quants + 64 * c));
+            const __m256i bytes_hi = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(quants + 64 * c + 32));
+            const __m256i w_lo_a = _mm256_and_si256(bytes_lo, low_mask);
+            const __m256i w_hi_a = _mm256_and_si256(bytes_hi, low_mask);
+            const __m256i w_lo_b = _mm256_and_si256(_mm256_srli_epi16(bytes_lo, 4), low_mask);
+            const __m256i w_hi_b = _mm256_and_si256(_mm256_srli_epi16(bytes_hi, 4), low_mask);
+            for (size_t t = 0; t < TOKENS; ++t)
+            {
+                const __m256i xa = broadcast_4(x + t * xq_stride + 2 + 8 * c);
+                const __m256i xb = broadcast_4(x + t * xq_stride + 6 + 8 * c);
+                sum_lo[t] = _mm256_dpbusd_avx_epi32(sum_lo[t], w_lo_a, xa);
+                sum_hi[t] = _mm256_dpbusd_avx_epi32(sum_hi[t], w_hi_a, xa);
+                sum_lo[t] = _mm256_dpbusd_avx_epi32(sum_lo[t], w_lo_b, xb);
+                sum_hi[t] = _mm256_dpbusd_avx_epi32(sum_hi[t], w_hi_b, xb);
+            }
+        }
+        const __m256 scales_lo = half_scales(block);
+        const __m256 scales_hi = half_scales(block + 16);
+        for (size_t t = 0; t < TOKENS; ++t)
+        {
+            accumulate_block(acc_lo[t], acc_hi[t], sum_lo[t], sum_hi[t], 8 * x_sums[t * sums_stride + b], scales_lo,
+                             scales_hi, f16_at(x + t * xq_stride));
+        }
+        block += Q4_0_GROUP_BLOCK_BYTES;
+    }
+    for (size_t t = 0; t < TOKENS; ++t)
+    {
+        store_group_halves(out + t * out_stride + row, row, last, acc_lo[t], acc_hi[t]);
+    }
+}
+
+template <size_t TOKENS>
+void gemm_group_q5_avx(const uint8_t* block, const uint8_t* xq, size_t xq_stride, const int32_t* x_sums,
+                       size_t sums_stride, size_t blocks, size_t row, size_t last, float* out, size_t out_stride)
+{
+    const __m256i low_mask = _mm256_set1_epi8(0x0f);
+    const __m256i one = _mm256_set1_epi8(0x01);
+    __m256 acc_lo[TOKENS];
+    __m256 acc_hi[TOKENS];
+    for (size_t t = 0; t < TOKENS; ++t)
+    {
+        acc_lo[t] = _mm256_setzero_ps();
+        acc_hi[t] = _mm256_setzero_ps();
+    }
+    for (size_t b = 0; b < blocks; ++b)
+    {
+        prefetch_group_block(block, Q5_0_GROUP_BLOCK_BYTES);
+        const uint8_t* quants = block + 2 * Q8_0_GROUP;
+        const uint8_t* x = xq + b * Q8_0_BLOCK_BYTES;
+        const __m256i high_lo = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(quants + 4 * 64));
+        const __m256i high_hi = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(quants + 4 * 64 + 32));
+        __m256i sum_lo[TOKENS];
+        __m256i sum_hi[TOKENS];
+        for (size_t t = 0; t < TOKENS; ++t)
+        {
+            sum_lo[t] = _mm256_setzero_si256();
+            sum_hi[t] = _mm256_setzero_si256();
+        }
+        for (size_t c = 0; c < 4; ++c)
+        {
+            const __m256i bytes_lo = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(quants + 64 * c));
+            const __m256i bytes_hi = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(quants + 64 * c + 32));
+            const int shift_a = static_cast<int>(2 * c);
+            const int shift_b = shift_a + 1;
+            const __m256i w_lo_a = _mm256_or_si256(_mm256_and_si256(bytes_lo, low_mask),
+                                                   _mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(high_lo, shift_a), one), 4));
+            const __m256i w_hi_a = _mm256_or_si256(_mm256_and_si256(bytes_hi, low_mask),
+                                                   _mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(high_hi, shift_a), one), 4));
+            const __m256i w_lo_b = _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16(bytes_lo, 4), low_mask),
+                                                   _mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(high_lo, shift_b), one), 4));
+            const __m256i w_hi_b = _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16(bytes_hi, 4), low_mask),
+                                                   _mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(high_hi, shift_b), one), 4));
+            for (size_t t = 0; t < TOKENS; ++t)
+            {
+                const __m256i xa = broadcast_4(x + t * xq_stride + 2 + 8 * c);
+                const __m256i xb = broadcast_4(x + t * xq_stride + 6 + 8 * c);
+                sum_lo[t] = _mm256_dpbusd_avx_epi32(sum_lo[t], w_lo_a, xa);
+                sum_hi[t] = _mm256_dpbusd_avx_epi32(sum_hi[t], w_hi_a, xa);
+                sum_lo[t] = _mm256_dpbusd_avx_epi32(sum_lo[t], w_lo_b, xb);
+                sum_hi[t] = _mm256_dpbusd_avx_epi32(sum_hi[t], w_hi_b, xb);
+            }
+        }
+        const __m256 scales_lo = half_scales(block);
+        const __m256 scales_hi = half_scales(block + 16);
+        for (size_t t = 0; t < TOKENS; ++t)
+        {
+            accumulate_block(acc_lo[t], acc_hi[t], sum_lo[t], sum_hi[t], 16 * x_sums[t * sums_stride + b], scales_lo,
+                             scales_hi, f16_at(x + t * xq_stride));
+        }
+        block += Q5_0_GROUP_BLOCK_BYTES;
+    }
+    for (size_t t = 0; t < TOKENS; ++t)
+    {
+        store_group_halves(out + t * out_stride + row, row, last, acc_lo[t], acc_hi[t]);
+    }
+}
+
+template <size_t TOKENS>
+void gemm_group_q4_k_avx(const uint8_t* block, const uint8_t* xq, size_t xq_stride, const int32_t* x_sums,
+                         size_t sums_stride, size_t blocks, size_t row, size_t last, float* out, size_t out_stride)
+{
+    const __m256i low_mask = _mm256_set1_epi8(0x0f);
+    __m256 acc_lo[TOKENS];
+    __m256 acc_hi[TOKENS];
+    for (size_t t = 0; t < TOKENS; ++t)
+    {
+        acc_lo[t] = _mm256_setzero_ps();
+        acc_hi[t] = _mm256_setzero_ps();
+    }
+    for (size_t b = 0; b < blocks; ++b)
+    {
+        prefetch_group_block(block, Q4_K_GROUP_BLOCK_BYTES);
+        const uint8_t* quants = block + Q4_K_PACKED_QUANTS;
+        const uint8_t* x = xq + b * Q8_K_BLOCK_BYTES;
+        __m256i sumi_lo[TOKENS];
+        __m256i sumi_hi[TOKENS];
+        __m256i summ_lo[TOKENS];
+        __m256i summ_hi[TOKENS];
+        for (size_t t = 0; t < TOKENS; ++t)
+        {
+            sumi_lo[t] = _mm256_setzero_si256();
+            sumi_hi[t] = _mm256_setzero_si256();
+            summ_lo[t] = _mm256_setzero_si256();
+            summ_hi[t] = _mm256_setzero_si256();
+        }
+        for (size_t s = 0; s < 8; ++s)
+        {
+            __m256i dot_lo[TOKENS];
+            __m256i dot_hi[TOKENS];
+            for (size_t t = 0; t < TOKENS; ++t)
+            {
+                dot_lo[t] = _mm256_setzero_si256();
+                dot_hi[t] = _mm256_setzero_si256();
+            }
+            for (size_t c = 0; c < 4; ++c)
+            {
+                const uint8_t* chunk = quants + 64 * (4 * s + c);
+                const __m256i bytes_lo = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(chunk));
+                const __m256i bytes_hi = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(chunk + 32));
+                const __m256i w_lo_a = _mm256_and_si256(bytes_lo, low_mask);
+                const __m256i w_hi_a = _mm256_and_si256(bytes_hi, low_mask);
+                const __m256i w_lo_b = _mm256_and_si256(_mm256_srli_epi16(bytes_lo, 4), low_mask);
+                const __m256i w_hi_b = _mm256_and_si256(_mm256_srli_epi16(bytes_hi, 4), low_mask);
+                for (size_t t = 0; t < TOKENS; ++t)
+                {
+                    const uint8_t* xt = x + t * xq_stride + 4 + 32 * s + 8 * c;
+                    const __m256i xa = broadcast_4(xt);
+                    const __m256i xb = broadcast_4(xt + 4);
+                    dot_lo[t] = _mm256_dpbusd_avx_epi32(dot_lo[t], w_lo_a, xa);
+                    dot_hi[t] = _mm256_dpbusd_avx_epi32(dot_hi[t], w_hi_a, xa);
+                    dot_lo[t] = _mm256_dpbusd_avx_epi32(dot_lo[t], w_lo_b, xb);
+                    dot_hi[t] = _mm256_dpbusd_avx_epi32(dot_hi[t], w_hi_b, xb);
+                }
+            }
+            const uint8_t* scales = block + Q4_K_PACKED_SCALES + s * Q8_0_GROUP;
+            const uint8_t* mins = block + Q4_K_PACKED_MINS + s * Q8_0_GROUP;
+            const __m256i scale_lo = _mm256_cvtepu8_epi32(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(scales)));
+            const __m256i scale_hi = _mm256_cvtepu8_epi32(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(scales + 8)));
+            const __m256i min_lo = _mm256_cvtepu8_epi32(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(mins)));
+            const __m256i min_hi = _mm256_cvtepu8_epi32(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(mins + 8)));
+            for (size_t t = 0; t < TOKENS; ++t)
+            {
+                const int32_t* sums = x_sums + t * sums_stride + b * (Q8_K_BLOCK / 16);
+                const __m256i sum32 = _mm256_set1_epi32(sums[2 * s] + sums[2 * s + 1]);
+                sumi_lo[t] = _mm256_add_epi32(sumi_lo[t], _mm256_mullo_epi32(dot_lo[t], scale_lo));
+                sumi_hi[t] = _mm256_add_epi32(sumi_hi[t], _mm256_mullo_epi32(dot_hi[t], scale_hi));
+                summ_lo[t] = _mm256_add_epi32(summ_lo[t], _mm256_mullo_epi32(min_lo, sum32));
+                summ_hi[t] = _mm256_add_epi32(summ_hi[t], _mm256_mullo_epi32(min_hi, sum32));
+            }
+        }
+        const __m256 d_lo = half_scales(block);
+        const __m256 d_hi = half_scales(block + 16);
+        const __m256 dmin_lo = half_scales(block + 2 * Q8_0_GROUP);
+        const __m256 dmin_hi = half_scales(block + 2 * Q8_0_GROUP + 16);
+        for (size_t t = 0; t < TOKENS; ++t)
+        {
+            const __m256 vdx = _mm256_set1_ps(f32_at(x + t * xq_stride));
+            acc_lo[t] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(sumi_lo[t]), _mm256_mul_ps(d_lo, vdx), acc_lo[t]);
+            acc_hi[t] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(sumi_hi[t]), _mm256_mul_ps(d_hi, vdx), acc_hi[t]);
+            acc_lo[t] = _mm256_fnmadd_ps(_mm256_cvtepi32_ps(summ_lo[t]), _mm256_mul_ps(dmin_lo, vdx), acc_lo[t]);
+            acc_hi[t] = _mm256_fnmadd_ps(_mm256_cvtepi32_ps(summ_hi[t]), _mm256_mul_ps(dmin_hi, vdx), acc_hi[t]);
+        }
+        block += Q4_K_GROUP_BLOCK_BYTES;
+    }
+    for (size_t t = 0; t < TOKENS; ++t)
+    {
+        store_group_halves(out + t * out_stride + row, row, last, acc_lo[t], acc_hi[t]);
+    }
+}
+
+template <size_t TOKENS>
+void gemm_group_q6_k_avx(const uint8_t* block, const uint8_t* xq, size_t xq_stride, const int32_t* x_sums,
+                         size_t sums_stride, size_t blocks, size_t row, size_t last, float* out, size_t out_stride)
+{
+    const __m256i low_mask = _mm256_set1_epi8(0x0f);
+    const __m256i mask_03 = _mm256_set1_epi8(0x03);
+    const __m256i mask_0c = _mm256_set1_epi8(0x0c);
+    const __m256i mask_30 = _mm256_set1_epi8(0x30);
+    const __m256i mask_c0 = _mm256_set1_epi8(static_cast<char>(0xc0));
+    __m256 acc_lo[TOKENS];
+    __m256 acc_hi[TOKENS];
+    for (size_t t = 0; t < TOKENS; ++t)
+    {
+        acc_lo[t] = _mm256_setzero_ps();
+        acc_hi[t] = _mm256_setzero_ps();
+    }
+    for (size_t b = 0; b < blocks; ++b)
+    {
+        prefetch_group_block(block, Q6_K_GROUP_BLOCK_BYTES);
+        const uint8_t* quants = block + Q6_K_PACKED_QUANTS;
+        const uint8_t* high = block + Q6_K_PACKED_HIGH;
+        const uint8_t* x = xq + b * Q8_K_BLOCK_BYTES;
+        __m256i sumi_lo[TOKENS];
+        __m256i sumi_hi[TOKENS];
+        for (size_t t = 0; t < TOKENS; ++t)
+        {
+            sumi_lo[t] = _mm256_setzero_si256();
+            sumi_hi[t] = _mm256_setzero_si256();
+        }
+        for (size_t s = 0; s < 16; ++s)
+        {
+            __m256i w[2][4];
+            for (size_t half = 0; half < 2; ++half)
+            {
+                const size_t offset = 32 * half;
+                const __m256i h = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(high + 64 * s + offset));
+                const __m256i bytes0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(quants + 64 * (2 * s) + offset));
+                const __m256i bytes1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(quants + 64 * (2 * s + 1) + offset));
+                w[half][0] = _mm256_or_si256(_mm256_and_si256(bytes0, low_mask), _mm256_slli_epi16(_mm256_and_si256(h, mask_03), 4));
+                w[half][1] = _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16(bytes0, 4), low_mask),
+                                             _mm256_slli_epi16(_mm256_and_si256(h, mask_0c), 2));
+                w[half][2] = _mm256_or_si256(_mm256_and_si256(bytes1, low_mask), _mm256_and_si256(h, mask_30));
+                w[half][3] = _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16(bytes1, 4), low_mask),
+                                             _mm256_srli_epi16(_mm256_and_si256(h, mask_c0), 2));
+            }
+            const uint8_t* scales = block + Q6_K_PACKED_SCALES + s * Q8_0_GROUP;
+            const __m256i scale_lo = _mm256_cvtepi8_epi32(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(scales)));
+            const __m256i scale_hi = _mm256_cvtepi8_epi32(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(scales + 8)));
+            for (size_t t = 0; t < TOKENS; ++t)
+            {
+                const uint8_t* xt = x + t * xq_stride + 4 + 16 * s;
+                __m256i dot_lo = _mm256_setzero_si256();
+                __m256i dot_hi = _mm256_setzero_si256();
+                for (size_t j = 0; j < 4; ++j)
+                {
+                    const __m256i xb = broadcast_4(xt + 4 * j);
+                    dot_lo = _mm256_dpbusd_avx_epi32(dot_lo, w[0][j], xb);
+                    dot_hi = _mm256_dpbusd_avx_epi32(dot_hi, w[1][j], xb);
+                }
+                const __m256i correction = _mm256_set1_epi32(32 * x_sums[t * sums_stride + b * (Q8_K_BLOCK / 16) + s]);
+                sumi_lo[t] = _mm256_add_epi32(sumi_lo[t], _mm256_mullo_epi32(_mm256_sub_epi32(dot_lo, correction), scale_lo));
+                sumi_hi[t] = _mm256_add_epi32(sumi_hi[t], _mm256_mullo_epi32(_mm256_sub_epi32(dot_hi, correction), scale_hi));
+            }
+        }
+        const __m256 d_lo = half_scales(block);
+        const __m256 d_hi = half_scales(block + 16);
+        for (size_t t = 0; t < TOKENS; ++t)
+        {
+            const __m256 vdx = _mm256_set1_ps(f32_at(x + t * xq_stride));
+            acc_lo[t] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(sumi_lo[t]), _mm256_mul_ps(d_lo, vdx), acc_lo[t]);
+            acc_hi[t] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(sumi_hi[t]), _mm256_mul_ps(d_hi, vdx), acc_hi[t]);
+        }
+        block += Q6_K_GROUP_BLOCK_BYTES;
+    }
+    for (size_t t = 0; t < TOKENS; ++t)
+    {
+        store_group_halves(out + t * out_stride + row, row, last, acc_lo[t], acc_hi[t]);
+    }
+}
+
+template <void (*GEMM)(const uint8_t*, const uint8_t*, size_t, const int32_t*, size_t, size_t, size_t, size_t, float*, size_t),
+          void (*GEMV)(const uint8_t*, const uint8_t*, size_t, const int32_t*, size_t, size_t, size_t, size_t, float*, size_t)>
+void matmul_groups_avx(size_t group_block_bytes, const uint8_t* packed, const uint8_t* xq, size_t xq_stride,
+                       const int32_t* x_sums, size_t sums_stride, size_t n_tokens, size_t blocks, size_t first,
+                       size_t last, float* out, size_t out_stride)
+{
+    for (size_t g = first / Q8_0_GROUP; g * Q8_0_GROUP < last; ++g)
+    {
+        const uint8_t* block = packed + g * blocks * group_block_bytes;
+        const size_t row = g * Q8_0_GROUP;
+        size_t t = 0;
+        for (; t + GEMM_TOKENS_AVX <= n_tokens; t += GEMM_TOKENS_AVX)
+        {
+            GEMM(block, xq + t * xq_stride, xq_stride, x_sums + t * sums_stride, sums_stride, blocks, row, last,
+                 out + t * out_stride, out_stride);
+        }
+        for (; t < n_tokens; ++t)
+        {
+            GEMV(block, xq + t * xq_stride, xq_stride, x_sums + t * sums_stride, sums_stride, blocks, row, last,
+                 out + t * out_stride, out_stride);
+        }
+    }
+}
+
 }
 
 void matmul_q5_0_packed(const uint8_t* packed, const uint8_t* xq, size_t xq_stride, const int32_t* x_sums,
                         size_t sums_stride, size_t n_tokens, size_t n_in, size_t n_out, size_t first, size_t last,
                         float* out, size_t out_stride)
 {
-    const size_t blocks = n_in / Q5_0_BLOCK;
-    const __m256i low_mask = _mm256_set1_epi8(0x0f);
-    const __m256i one = _mm256_set1_epi8(0x01);
-    for (size_t t = 0; t < n_tokens; ++t)
-    {
-        const uint8_t* xt = xq + t * xq_stride;
-        for (size_t g = first / Q8_0_GROUP; g * Q8_0_GROUP < last; ++g)
-        {
-            const uint8_t* block = packed + g * blocks * Q5_0_GROUP_BLOCK_BYTES;
-            __m256 acc_lo = _mm256_setzero_ps();
-            __m256 acc_hi = _mm256_setzero_ps();
-            for (size_t b = 0; b < blocks; ++b)
-            {
-                prefetch_group_block(block, Q5_0_GROUP_BLOCK_BYTES);
-                const uint8_t* quants = block + 2 * Q8_0_GROUP;
-                const uint8_t* x = xt + b * Q8_0_BLOCK_BYTES;
-                const __m256i high_lo = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(quants + 4 * 64));
-                const __m256i high_hi = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(quants + 4 * 64 + 32));
-                __m256i sum_lo = _mm256_setzero_si256();
-                __m256i sum_hi = _mm256_setzero_si256();
-                for (size_t c = 0; c < 4; ++c)
-                {
-                    const __m256i bytes_lo = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(quants + 64 * c));
-                    const __m256i bytes_hi = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(quants + 64 * c + 32));
-                    const int shift_a = static_cast<int>(2 * c);
-                    const int shift_b = shift_a + 1;
-                    const __m256i w_lo_a = _mm256_or_si256(_mm256_and_si256(bytes_lo, low_mask),
-                                                           _mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(high_lo, shift_a), one), 4));
-                    const __m256i w_hi_a = _mm256_or_si256(_mm256_and_si256(bytes_hi, low_mask),
-                                                           _mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(high_hi, shift_a), one), 4));
-                    const __m256i w_lo_b = _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16(bytes_lo, 4), low_mask),
-                                                           _mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(high_lo, shift_b), one), 4));
-                    const __m256i w_hi_b = _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16(bytes_hi, 4), low_mask),
-                                                           _mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(high_hi, shift_b), one), 4));
-                    int32_t x4 = 0;
-                    int32_t x5 = 0;
-                    std::memcpy(&x4, x + 2 + 8 * c, 4);
-                    std::memcpy(&x5, x + 6 + 8 * c, 4);
-                    sum_lo = _mm256_dpbusd_avx_epi32(sum_lo, w_lo_a, _mm256_set1_epi32(x4));
-                    sum_hi = _mm256_dpbusd_avx_epi32(sum_hi, w_hi_a, _mm256_set1_epi32(x4));
-                    sum_lo = _mm256_dpbusd_avx_epi32(sum_lo, w_lo_b, _mm256_set1_epi32(x5));
-                    sum_hi = _mm256_dpbusd_avx_epi32(sum_hi, w_hi_b, _mm256_set1_epi32(x5));
-                }
-                const __m256i correction = _mm256_set1_epi32(16 * x_sums[t * sums_stride + b]);
-                sum_lo = _mm256_sub_epi32(sum_lo, correction);
-                sum_hi = _mm256_sub_epi32(sum_hi, correction);
-                uint16_t dx_bits = 0;
-                std::memcpy(&dx_bits, x, 2);
-                const __m256 dx = _mm256_set1_ps(f16_to_f32(dx_bits));
-                acc_lo = _mm256_fmadd_ps(_mm256_cvtepi32_ps(sum_lo), _mm256_mul_ps(half_scales(block), dx), acc_lo);
-                acc_hi = _mm256_fmadd_ps(_mm256_cvtepi32_ps(sum_hi), _mm256_mul_ps(half_scales(block + 16), dx), acc_hi);
-                block += Q5_0_GROUP_BLOCK_BYTES;
-            }
-            const size_t row = g * Q8_0_GROUP;
-            store_group_halves(out + t * out_stride + row, row, last, acc_lo, acc_hi);
-        }
-    }
+    matmul_groups_avx<gemm_group_q5_avx<GEMM_TOKENS_AVX>, gemm_group_q5_avx<1>>(
+        Q5_0_GROUP_BLOCK_BYTES, packed, xq, xq_stride, x_sums, sums_stride, n_tokens, n_in / Q5_0_BLOCK, first, last,
+        out, out_stride);
     (void)n_out;
 }
 
@@ -1451,66 +1800,9 @@ void matmul_q4_k_packed(const uint8_t* packed, const uint8_t* xq, size_t xq_stri
                         size_t sums_stride, size_t n_tokens, size_t n_in, size_t n_out, size_t first, size_t last,
                         float* out, size_t out_stride)
 {
-    const size_t blocks = n_in / Q4_K_BLOCK;
-    const __m256i low_mask = _mm256_set1_epi8(0x0f);
-    for (size_t t = 0; t < n_tokens; ++t)
-    {
-        const uint8_t* xt = xq + t * xq_stride;
-        const int32_t* sums_t = x_sums + t * sums_stride;
-        for (size_t g = first / Q8_0_GROUP; g * Q8_0_GROUP < last; ++g)
-        {
-            const uint8_t* block = packed + g * blocks * Q4_K_GROUP_BLOCK_BYTES;
-            __m256 acc_lo = _mm256_setzero_ps();
-            __m256 acc_hi = _mm256_setzero_ps();
-            for (size_t b = 0; b < blocks; ++b)
-            {
-                prefetch_group_block(block, Q4_K_GROUP_BLOCK_BYTES);
-                const uint8_t* quants = block + Q4_K_PACKED_QUANTS;
-                const int8_t* x = reinterpret_cast<const int8_t*>(xt + b * Q8_K_BLOCK_BYTES + 4);
-                const int32_t* sums = sums_t + b * (Q8_K_BLOCK / 16);
-                __m256i sumi_lo = _mm256_setzero_si256();
-                __m256i sumi_hi = _mm256_setzero_si256();
-                __m256i summ_lo = _mm256_setzero_si256();
-                __m256i summ_hi = _mm256_setzero_si256();
-                for (size_t s = 0; s < 8; ++s)
-                {
-                    __m256i dot_lo = _mm256_setzero_si256();
-                    __m256i dot_hi = _mm256_setzero_si256();
-                    for (size_t c = 0; c < 4; ++c)
-                    {
-                        const uint8_t* chunk = quants + 64 * (4 * s + c);
-                        const __m256i bytes_lo = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(chunk));
-                        const __m256i bytes_hi = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(chunk + 32));
-                        int32_t x4 = 0;
-                        int32_t x5 = 0;
-                        std::memcpy(&x4, x + 32 * s + 8 * c, 4);
-                        std::memcpy(&x5, x + 32 * s + 8 * c + 4, 4);
-                        dot_lo = _mm256_dpbusd_avx_epi32(dot_lo, _mm256_and_si256(bytes_lo, low_mask), _mm256_set1_epi32(x4));
-                        dot_hi = _mm256_dpbusd_avx_epi32(dot_hi, _mm256_and_si256(bytes_hi, low_mask), _mm256_set1_epi32(x4));
-                        dot_lo = _mm256_dpbusd_avx_epi32(dot_lo, _mm256_and_si256(_mm256_srli_epi16(bytes_lo, 4), low_mask), _mm256_set1_epi32(x5));
-                        dot_hi = _mm256_dpbusd_avx_epi32(dot_hi, _mm256_and_si256(_mm256_srli_epi16(bytes_hi, 4), low_mask), _mm256_set1_epi32(x5));
-                    }
-                    const uint8_t* scales = block + Q4_K_PACKED_SCALES + s * Q8_0_GROUP;
-                    const uint8_t* mins = block + Q4_K_PACKED_MINS + s * Q8_0_GROUP;
-                    sumi_lo = _mm256_add_epi32(sumi_lo, _mm256_mullo_epi32(dot_lo, _mm256_cvtepu8_epi32(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(scales)))));
-                    sumi_hi = _mm256_add_epi32(sumi_hi, _mm256_mullo_epi32(dot_hi, _mm256_cvtepu8_epi32(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(scales + 8)))));
-                    const __m256i sum32 = _mm256_set1_epi32(sums[2 * s] + sums[2 * s + 1]);
-                    summ_lo = _mm256_add_epi32(summ_lo, _mm256_mullo_epi32(_mm256_cvtepu8_epi32(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(mins))), sum32));
-                    summ_hi = _mm256_add_epi32(summ_hi, _mm256_mullo_epi32(_mm256_cvtepu8_epi32(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(mins + 8))), sum32));
-                }
-                float dx = 0.0f;
-                std::memcpy(&dx, xt + b * Q8_K_BLOCK_BYTES, 4);
-                const __m256 vdx = _mm256_set1_ps(dx);
-                acc_lo = _mm256_fmadd_ps(_mm256_cvtepi32_ps(sumi_lo), _mm256_mul_ps(half_scales(block), vdx), acc_lo);
-                acc_hi = _mm256_fmadd_ps(_mm256_cvtepi32_ps(sumi_hi), _mm256_mul_ps(half_scales(block + 16), vdx), acc_hi);
-                acc_lo = _mm256_fnmadd_ps(_mm256_cvtepi32_ps(summ_lo), _mm256_mul_ps(half_scales(block + 2 * Q8_0_GROUP), vdx), acc_lo);
-                acc_hi = _mm256_fnmadd_ps(_mm256_cvtepi32_ps(summ_hi), _mm256_mul_ps(half_scales(block + 2 * Q8_0_GROUP + 16), vdx), acc_hi);
-                block += Q4_K_GROUP_BLOCK_BYTES;
-            }
-            const size_t row = g * Q8_0_GROUP;
-            store_group_halves(out + t * out_stride + row, row, last, acc_lo, acc_hi);
-        }
-    }
+    matmul_groups_avx<gemm_group_q4_k_avx<GEMM_TOKENS_AVX>, gemm_group_q4_k_avx<1>>(
+        Q4_K_GROUP_BLOCK_BYTES, packed, xq, xq_stride, x_sums, sums_stride, n_tokens, n_in / Q4_K_BLOCK, first, last,
+        out, out_stride);
     (void)n_out;
 }
 
@@ -1518,83 +1810,9 @@ void matmul_q6_k_packed(const uint8_t* packed, const uint8_t* xq, size_t xq_stri
                         size_t sums_stride, size_t n_tokens, size_t n_in, size_t n_out, size_t first, size_t last,
                         float* out, size_t out_stride)
 {
-    const size_t blocks = n_in / Q6_K_BLOCK;
-    const __m256i low_mask = _mm256_set1_epi8(0x0f);
-    const __m256i mask_03 = _mm256_set1_epi8(0x03);
-    const __m256i mask_0c = _mm256_set1_epi8(0x0c);
-    const __m256i mask_30 = _mm256_set1_epi8(0x30);
-    const __m256i mask_c0 = _mm256_set1_epi8(static_cast<char>(0xc0));
-    for (size_t t = 0; t < n_tokens; ++t)
-    {
-        const uint8_t* xt = xq + t * xq_stride;
-        const int32_t* sums_t = x_sums + t * sums_stride;
-        for (size_t g = first / Q8_0_GROUP; g * Q8_0_GROUP < last; ++g)
-        {
-            const uint8_t* block = packed + g * blocks * Q6_K_GROUP_BLOCK_BYTES;
-            __m256 acc_lo = _mm256_setzero_ps();
-            __m256 acc_hi = _mm256_setzero_ps();
-            for (size_t b = 0; b < blocks; ++b)
-            {
-                prefetch_group_block(block, Q6_K_GROUP_BLOCK_BYTES);
-                const uint8_t* quants = block + Q6_K_PACKED_QUANTS;
-                const uint8_t* high = block + Q6_K_PACKED_HIGH;
-                const int8_t* x = reinterpret_cast<const int8_t*>(xt + b * Q8_K_BLOCK_BYTES + 4);
-                const int32_t* sums = sums_t + b * (Q8_K_BLOCK / 16);
-                __m256i sumi_lo = _mm256_setzero_si256();
-                __m256i sumi_hi = _mm256_setzero_si256();
-                for (size_t s = 0; s < 16; ++s)
-                {
-                    __m256i dot_lo = _mm256_setzero_si256();
-                    __m256i dot_hi = _mm256_setzero_si256();
-                    for (size_t half = 0; half < 2; ++half)
-                    {
-                        const size_t offset = 32 * half;
-                        const __m256i h = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(high + 64 * s + offset));
-                        const __m256i bytes0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(quants + 64 * (2 * s) + offset));
-                        const __m256i bytes1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(quants + 64 * (2 * s + 1) + offset));
-                        const __m256i w0 = _mm256_or_si256(_mm256_and_si256(bytes0, low_mask), _mm256_slli_epi16(_mm256_and_si256(h, mask_03), 4));
-                        const __m256i w1 = _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16(bytes0, 4), low_mask),
-                                                           _mm256_slli_epi16(_mm256_and_si256(h, mask_0c), 2));
-                        const __m256i w2 = _mm256_or_si256(_mm256_and_si256(bytes1, low_mask), _mm256_and_si256(h, mask_30));
-                        const __m256i w3 = _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16(bytes1, 4), low_mask),
-                                                           _mm256_srli_epi16(_mm256_and_si256(h, mask_c0), 2));
-                        __m256i dot = _mm256_setzero_si256();
-                        int32_t x4 = 0;
-                        std::memcpy(&x4, x + 16 * s, 4);
-                        dot = _mm256_dpbusd_avx_epi32(dot, w0, _mm256_set1_epi32(x4));
-                        std::memcpy(&x4, x + 16 * s + 4, 4);
-                        dot = _mm256_dpbusd_avx_epi32(dot, w1, _mm256_set1_epi32(x4));
-                        std::memcpy(&x4, x + 16 * s + 8, 4);
-                        dot = _mm256_dpbusd_avx_epi32(dot, w2, _mm256_set1_epi32(x4));
-                        std::memcpy(&x4, x + 16 * s + 12, 4);
-                        dot = _mm256_dpbusd_avx_epi32(dot, w3, _mm256_set1_epi32(x4));
-                        if (half == 0)
-                        {
-                            dot_lo = dot;
-                        }
-                        else
-                        {
-                            dot_hi = dot;
-                        }
-                    }
-                    const __m256i correction = _mm256_set1_epi32(32 * sums[s]);
-                    const uint8_t* scales = block + Q6_K_PACKED_SCALES + s * Q8_0_GROUP;
-                    dot_lo = _mm256_sub_epi32(dot_lo, correction);
-                    dot_hi = _mm256_sub_epi32(dot_hi, correction);
-                    sumi_lo = _mm256_add_epi32(sumi_lo, _mm256_mullo_epi32(dot_lo, _mm256_cvtepi8_epi32(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(scales)))));
-                    sumi_hi = _mm256_add_epi32(sumi_hi, _mm256_mullo_epi32(dot_hi, _mm256_cvtepi8_epi32(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(scales + 8)))));
-                }
-                float dx = 0.0f;
-                std::memcpy(&dx, xt + b * Q8_K_BLOCK_BYTES, 4);
-                const __m256 vdx = _mm256_set1_ps(dx);
-                acc_lo = _mm256_fmadd_ps(_mm256_cvtepi32_ps(sumi_lo), _mm256_mul_ps(half_scales(block), vdx), acc_lo);
-                acc_hi = _mm256_fmadd_ps(_mm256_cvtepi32_ps(sumi_hi), _mm256_mul_ps(half_scales(block + 16), vdx), acc_hi);
-                block += Q6_K_GROUP_BLOCK_BYTES;
-            }
-            const size_t row = g * Q8_0_GROUP;
-            store_group_halves(out + t * out_stride + row, row, last, acc_lo, acc_hi);
-        }
-    }
+    matmul_groups_avx<gemm_group_q6_k_avx<GEMM_TOKENS_AVX>, gemm_group_q6_k_avx<1>>(
+        Q6_K_GROUP_BLOCK_BYTES, packed, xq, xq_stride, x_sums, sums_stride, n_tokens, n_in / Q6_K_BLOCK, first, last,
+        out, out_stride);
     (void)n_out;
 }
 
@@ -1602,56 +1820,9 @@ void matmul_q4_0_packed(const uint8_t* packed, const uint8_t* xq, size_t xq_stri
                         size_t sums_stride, size_t n_tokens, size_t n_in, size_t n_out, size_t first, size_t last,
                         float* out, size_t out_stride)
 {
-    const size_t blocks = n_in / Q4_0_BLOCK;
-    const __m256i low_mask = _mm256_set1_epi8(0x0f);
-    for (size_t t = 0; t < n_tokens; ++t)
-    {
-        const uint8_t* xt = xq + t * xq_stride;
-        for (size_t g = first / Q8_0_GROUP; g * Q8_0_GROUP < last; ++g)
-        {
-            const uint8_t* block = packed + g * blocks * Q4_0_GROUP_BLOCK_BYTES;
-            __m256 acc_lo = _mm256_setzero_ps();
-            __m256 acc_hi = _mm256_setzero_ps();
-            for (size_t b = 0; b < blocks; ++b)
-            {
-                prefetch_group_block(block, Q4_0_GROUP_BLOCK_BYTES);
-                const uint8_t* quants = block + 2 * Q8_0_GROUP;
-                const uint8_t* x = xt + b * Q8_0_BLOCK_BYTES;
-                __m256i sum_lo = _mm256_setzero_si256();
-                __m256i sum_hi = _mm256_setzero_si256();
-                for (size_t c = 0; c < 4; ++c)
-                {
-                    const __m256i bytes_lo = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(quants + 64 * c));
-                    const __m256i bytes_hi = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(quants + 64 * c + 32));
-                    int32_t x4 = 0;
-                    int32_t x5 = 0;
-                    std::memcpy(&x4, x + 2 + 8 * c, 4);
-                    std::memcpy(&x5, x + 6 + 8 * c, 4);
-                    sum_lo = _mm256_dpbusd_avx_epi32(sum_lo, _mm256_and_si256(bytes_lo, low_mask), _mm256_set1_epi32(x4));
-                    sum_hi = _mm256_dpbusd_avx_epi32(sum_hi, _mm256_and_si256(bytes_hi, low_mask), _mm256_set1_epi32(x4));
-                    sum_lo = _mm256_dpbusd_avx_epi32(sum_lo, _mm256_and_si256(_mm256_srli_epi16(bytes_lo, 4), low_mask), _mm256_set1_epi32(x5));
-                    sum_hi = _mm256_dpbusd_avx_epi32(sum_hi, _mm256_and_si256(_mm256_srli_epi16(bytes_hi, 4), low_mask), _mm256_set1_epi32(x5));
-                }
-                const __m256i correction = _mm256_set1_epi32(8 * x_sums[t * sums_stride + b]);
-                sum_lo = _mm256_sub_epi32(sum_lo, correction);
-                sum_hi = _mm256_sub_epi32(sum_hi, correction);
-                uint16_t dx_bits = 0;
-                std::memcpy(&dx_bits, x, 2);
-                const __m256 dx = _mm256_set1_ps(f16_to_f32(dx_bits));
-                const __m256 d_lo = _mm256_mul_ps(_mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(block))), dx);
-                const __m256 d_hi = _mm256_mul_ps(_mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(block + 16))), dx);
-                acc_lo = _mm256_fmadd_ps(_mm256_cvtepi32_ps(sum_lo), d_lo, acc_lo);
-                acc_hi = _mm256_fmadd_ps(_mm256_cvtepi32_ps(sum_hi), d_hi, acc_hi);
-                block += Q4_0_GROUP_BLOCK_BYTES;
-            }
-            const size_t row = g * Q8_0_GROUP;
-            float values[Q8_0_GROUP];
-            _mm256_storeu_ps(values, acc_lo);
-            _mm256_storeu_ps(values + 8, acc_hi);
-            const size_t count = row + Q8_0_GROUP <= last ? Q8_0_GROUP : last - row;
-            std::memcpy(out + t * out_stride + row, values, count * sizeof(float));
-        }
-    }
+    matmul_groups_avx<gemm_group_q4_avx<GEMM_TOKENS_AVX>, gemm_group_q4_avx<1>>(
+        Q4_0_GROUP_BLOCK_BYTES, packed, xq, xq_stride, x_sums, sums_stride, n_tokens, n_in / Q4_0_BLOCK, first, last,
+        out, out_stride);
     (void)n_out;
 }
 
@@ -1659,59 +1830,17 @@ void matmul_q8_0_packed(const uint8_t* packed, const uint8_t* xq, size_t xq_stri
                         size_t sums_stride, size_t n_tokens, size_t n_in, size_t n_out, size_t first, size_t last,
                         float* out, size_t out_stride)
 {
-    for (size_t t = 0; t < n_tokens; ++t)
-    {
-        matvec_q8_0_packed(packed, xq + t * xq_stride, x_sums + t * sums_stride, n_in, n_out, first, last,
-                           out + t * out_stride);
-    }
+    matmul_groups_avx<gemm_group_q8_avx<GEMM_TOKENS_AVX>, gemm_group_q8_avx<1>>(
+        Q8_0_GROUP_BLOCK_BYTES, packed, xq, xq_stride, x_sums, sums_stride, n_tokens, n_in / Q8_0_BLOCK, first, last,
+        out, out_stride);
+    (void)n_out;
 }
 
 void matvec_q8_0_packed(const uint8_t* packed, const uint8_t* xq, const int32_t* x_sums, size_t n_in, size_t n_out,
                         size_t first, size_t last, float* out)
 {
-    const size_t blocks = n_in / Q8_0_BLOCK;
-    for (size_t g = first / Q8_0_GROUP; g * Q8_0_GROUP < last; ++g)
-    {
-        const uint8_t* block = packed + g * blocks * Q8_0_GROUP_BLOCK_BYTES;
-        const uint8_t* x = xq;
-        __m256 acc_lo = _mm256_setzero_ps();
-        __m256 acc_hi = _mm256_setzero_ps();
-        for (size_t b = 0; b < blocks; ++b)
-        {
-            prefetch_group_block(block, Q8_0_GROUP_BLOCK_BYTES);
-            const uint8_t* quants = block + 2 * Q8_0_GROUP;
-            __m256i sum_lo = _mm256_setzero_si256();
-            __m256i sum_hi = _mm256_setzero_si256();
-            for (size_t j = 0; j < 8; ++j)
-            {
-                int32_t x4 = 0;
-                std::memcpy(&x4, x + 2 + 4 * j, 4);
-                const __m256i xb = _mm256_set1_epi32(x4);
-                sum_lo = _mm256_dpbusd_avx_epi32(sum_lo, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(quants + 64 * j)), xb);
-                sum_hi = _mm256_dpbusd_avx_epi32(sum_hi, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(quants + 64 * j + 32)), xb);
-            }
-            const __m256i correction = _mm256_set1_epi32(128 * x_sums[b]);
-            sum_lo = _mm256_sub_epi32(sum_lo, correction);
-            sum_hi = _mm256_sub_epi32(sum_hi, correction);
-
-            uint16_t dx_bits = 0;
-            std::memcpy(&dx_bits, x, 2);
-            const __m256 dx = _mm256_set1_ps(f16_to_f32(dx_bits));
-            const __m256 d_lo = _mm256_mul_ps(_mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(block))), dx);
-            const __m256 d_hi = _mm256_mul_ps(_mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(block + 16))), dx);
-            acc_lo = _mm256_fmadd_ps(_mm256_cvtepi32_ps(sum_lo), d_lo, acc_lo);
-            acc_hi = _mm256_fmadd_ps(_mm256_cvtepi32_ps(sum_hi), d_hi, acc_hi);
-
-            block += Q8_0_GROUP_BLOCK_BYTES;
-            x += Q8_0_BLOCK_BYTES;
-        }
-        const size_t row = g * Q8_0_GROUP;
-        float values[Q8_0_GROUP];
-        _mm256_storeu_ps(values, acc_lo);
-        _mm256_storeu_ps(values + 8, acc_hi);
-        const size_t count = row + Q8_0_GROUP <= last ? Q8_0_GROUP : last - row;
-        std::memcpy(out + row, values, count * sizeof(float));
-    }
+    matmul_groups_avx<gemm_group_q8_avx<GEMM_TOKENS_AVX>, gemm_group_q8_avx<1>>(
+        Q8_0_GROUP_BLOCK_BYTES, packed, xq, 0, x_sums, 0, 1, n_in / Q8_0_BLOCK, first, last, out, 0);
     (void)n_out;
 }
 

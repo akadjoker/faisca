@@ -145,8 +145,9 @@ for the Q8_0, Q4_0 and Q5_0 kernels, Q8_K per block of 256 (float32 scale,
 sums of 16) for the K-quants, whose kernels sum every super block exactly in
 integers with the sub block scales before two fused multiply adds in float32.
 Builds with AVX-VNNI but no AVX-512 run the same five types with 256-bit
-kernels (each 64 byte chunk of a group as two halves of 8 rows) and give bit
-identical output to the AVX-512 build; builds without VNNI keep Q8_0 in place
+kernels (each 64 byte chunk of a group as two halves of 8 rows, unpacked
+once and reused for 4 inputs of the batch) and give bit identical output to
+the AVX-512 build; builds without VNNI keep Q8_0 in place
 with an AVX2 kernel and convert the rest to float32.
 
 `Runner` holds the KV cache (`n_ctx` positions, keys and values in f16 unless

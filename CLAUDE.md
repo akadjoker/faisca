@@ -37,10 +37,11 @@ top. No third party dependencies. Owner: Luís (akadjoker). "faisca" is a workin
    AVX-512 one on every model (the softmax denominator of the attention is
    16 partial sums reduced by one fixed tree in both; before, the two
    builds differed by ulps there, invisible under f16 scales and visible
-   under the float32 scale of Q8_K). On that build generation is within
-   10% of AVX-512 but the prompt is 2.2 to 2.5x slower: the 256-bit
-   kernels walk the weights once per token (bench/README.md). Pending: a
-   256-bit GEMM for the batch.
+   under the float32 scale of Q8_K). The 256-bit kernels are GEMM
+   templates like the AVX-512 ones: each chunk unpacked once per group
+   block and reused for GEMM_TOKENS_AVX = 4 inputs (16 ymm registers:
+   two halves of the sums for 4 inputs plus the chunk), the tail and
+   generation through the same template with 1 input (bench/README.md).
    Speculative decoding with SmolLM2-135M as draft: done (`Speculative`,
    `--draft`), output identical to plain greedy, gain 1.3 to 1.4x on one
    thread with a Q4_0 draft and about 1.1x with four, 0.9x at a 512 token
