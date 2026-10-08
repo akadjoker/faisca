@@ -411,6 +411,41 @@ the memory, and the prompt ties llama-bench at four threads. The load of
 the Qwen2.5 file takes 4 s on one thread and 0.2 s with four, the 4B 25 s
 and 1.3 s (packing into huge pages).
 
+## Gemma 3 vision against llama.cpp's mtmd
+
+The SigLIP encoder of gemma-3-4b-it (27 layers over 4096 patches, 400M
+parameters) on test-1.png, `vision_dump` (Q8_0 matrices, quantized
+activations) against `llama_vision_dump` (the F16 mmproj with mtmd's
+defaults: f16 weights, flash attention, the same no AMX build), encode
+time of the image in seconds.
+
+| | threads | llama.cpp | faisca |
+| --- | --- | --- | --- |
+| encoder (s) | 1 | 115 | 74 |
+| encoder (s) | 4 | 31 | 20.5 |
+
+Where the time went: the first version took 374 s on one thread.
+`attention_head` (one query against the tiled keys) is bound by the L3
+on 4096 keys: each query streams the head's 1.2 MB of key tiles and, with
+the values strided by n_embd, 20k cache lines of V, 2.5 GMAC/s in a micro
+benchmark (scratch bench_attn, 5.0 with V packed per head).
+`attention_block` runs 16 queries per pass over the keys and the values
+(each query's FMAs in the order of `attention_head`, so bit identical):
+24.5 GMAC/s; 8 queries give 13.7, 12 give 23.6, 20 and 24 spill and fall
+to 10; the AVX2 version with 4 queries and 16 wide value chunks is 2.6x
+over its single query kernel. The FFN's bias and GELU ran on the main
+thread (476 M tanhf per image, 21 s): they are row jobs now and the GELU
+is vectorized on the exp of exp_values (x / (1 + exp(-2y)), within 1.2e-7
+of tanhf relative to the input). Phases at 4 threads before the GELU work,
+with another job on the machine: attention 26 s, the six matmuls 18, GELU
+21, norms 0.5, tiling 0.5. The block kernel is bound by the broadcast
+loads of the queries (one per FMA); a key tiled kernel that keeps K and V
+of a block in L2 is the next step, and the matmuls (1.7 TMAC per image
+against 1.0 TMAC of attention) are at the VNNI rate of the text prompt.
+
+`faisca describe` with 4 threads on the 4B Q8_0: load 9.5 s, encode
+20.9 s, the 271 token prompt 4.1 s (66 tok/s), generation 7.7 tok/s.
+
 ## Whisper against whisper.cpp
 
 `faisca transcribe` against `whisper-cli` 1.9.5 (stock build, CPU, no flash

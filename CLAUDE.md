@@ -262,11 +262,87 @@ top. No third party dependencies. Owner: Luís (akadjoker). "faisca" is a workin
    4B generation 2.3 / 7.2 (1.7 / 6.0), prompt 18 / 59 (10 / 38); the 4B
    reads 3.9 GiB per token and its load packs them in 25 s on one thread,
    1.3 s with four. Not done: Gemma 3 12B and 27B (13 and 28 GB in Q8_0,
-   beyond this machine; Q4_K_M files should load), the vision encoder of
-   the 4B and up (SigLIP 400M plus the projector, the mmproj file), Qwen
-   larger than 0.6B (should load, not tried), the Vulkan runner for these
-   architectures. Next: Mistral / Llama 2 with the SentencePiece tokenizer
-   (needs the add_space_prefix path, which Gemma does not exercise).
+   beyond this machine; Q4_K_M files should load), Qwen larger than 0.6B
+   (should load, not tried), the Vulkan runner for these architectures.
+   Next: Mistral / Llama 2 with the SentencePiece tokenizer (needs the
+   add_space_prefix path, which Gemma does not exercise).
+10. Gemma 3 vision (the owner wants to work with Gemma; the 4B's SigLIP
+   encoder and projector from the mmproj file): done. Image decoders
+   written from scratch (include/faisca/image.h, src/image.cpp): PNG (own
+   inflate, every colour type and bit depth, no interlace, alpha dropped)
+   and baseline JPEG (Huffman, any sampling, restart markers, progressive
+   refused) replicating stb_image's integer IDCT, fixed point YCbCr and
+   fancy upsampling, bit identical to stb dumps on the test images
+   (tests/image_check, /home/user/ref/images); `resize_image` is Pillow's
+   separable fixed point resampling (22 bits, bilinear or bicubic),
+   identical byte for byte to mtmd's img_tool::resize (checked with a
+   harness that includes mtmd-image.cpp). `VisionModel`
+   (vision_model.h: clip.* keys of the mmproj GGUF, F16 matrices
+   quantized to Q8_0 and packed unless `quantize` is false, n_in padded to
+   the Q8_0 block: the patch kernel 588 to 608, n_ff 4304 to 4320),
+   `VisionRunner` (vision_runner.h: mtmd's fixed size preprocessing for
+   gemma3, bilinear, PAD_CEIL, centred on black, mean and std 0.5, planar
+   R G B; im2col patches in (channel, row, col) order; 27 pre-LN layers
+   with biases, GELU, bidirectional attention over the 4096 patches with
+   the keys tiled and the values stored per head, post LN, 4x4 average
+   pool to 256 tokens, RMS norm with mm.soft_emb_norm, projection to
+   2560; the padded FFN tail stays zero and the up projection is written
+   with the padded stride, which was the first bug found), `Runner::
+   forward_embeddings` (rows of input embeddings as one non causal block:
+   every row sees the whole block and the positions before it, a local
+   layer's window starts n_swa before each row, no embedding scale, the
+   mask llama.cpp builds with llama_set_causal_attn(false) and
+   LLAMA_NON_CAUSAL_TYPE_ALL; `reserve_batch` grows the token buffers to
+   the block), `faisca describe <model> <mmproj> <image> [-p]` with the
+   image before the user text as mtmd lays it out (<start_of_image>, 256
+   embeddings, <end_of_image>). Reference: tests/reference/
+   llama_vision_dump.cpp over libmtmd (build-noamx/bin/libmtmd.so, run
+   with that LD_LIBRARY_PATH): the embeddings, `--trace` of the encoder
+   through the eval callback with clip.cpp's names (`--layers N`, a whole
+   trace is 8 GB), `--lm` for the language model on an image prompt
+   (inp_embd, l_out, the greedy tokens); ours: tests/vision_dump
+   (`--trace`, `--layers`, `--f32`, `--f16-patches`), tests/describe_dump,
+   tests/compare_vision.py (cuts the padded FFN columns). Pitfalls met:
+   ggml_conv_2d runs its im2col in f16 whatever the kernel type, so the
+   reference rounds the image patches to f16 and its patch embedding is
+   6e-5 from an exact one (`--f16-patches` rounds ours the same way for
+   the comparison only); mtmd's default resize is bicubic but clip.cpp
+   sets bilinear for gemma3; llama.cpp's image rows are not scaled by
+   sqrt(n_embd) (scale_rows marks token rows only). Validation on
+   test-1.png (the NYT moon landing page, 640 x 488): float32 encoder on
+   a float32 copy of the mmproj (make_f32_gguf.py works on it) against
+   the reference, f16 patches, layer 0 at worst 2.3e-6 (kqv_out) and the
+   256 x 2560 embeddings at 1.7e-5 rel L2 after 27 layers (the f16 file
+   with its f16 activations is 2.2e-3 away); Q8_0 encoder 7.7e-2 from the
+   float32 reference (the quantization noise of 27 layers; llama.cpp's
+   own quantized mmproj was not measured, precisamos de mais dados), 1
+   and 4 threads bit identical, ASan/UBSan clean; language model on
+   "<start_of_turn>user\n<image>Describe this image." against mtmd (Q8_0
+   both, float32 KV cache, no flash attention): the 16 greedy tokens
+   identical, the text rows before the image at 1.3e-6 (layer 0) to
+   9.9e-3 (layer 32) as the Q8_0 vs Q8_0 noise of the text comparison,
+   the image rows 3.9e-2 to 1.4e-1 (the vision noise on top), ASan/UBSan
+   clean on the whole path. Speed (bench/README.md): the encoder was
+   374 s on one thread: attention_head is bound by the L3 on 4096 keys
+   (every query streams 1.2 MB of key tiles and, with V strided by
+   n_embd, 20k cache lines: 2.5 GMAC/s, 5.0 with V per head), so
+   `attention_block` runs 16 queries per pass over the keys and the
+   values with each query's FMAs in attention_head's order (bit
+   identical, ops_unit; 24.5 GMAC/s, 20 or 24 queries spill to 10), the
+   FFN bias and GELU moved from the main thread to the pool and gelu is
+   vectorized as x / (1 + exp(-2y)) (gelu_scalar keeps tanhf, which loses
+   its digits below x = -4; within 1.2e-7 of each other relative to the
+   input). Encoder Q8_0 74 / 20.5 s with 1 / 4 threads, llama.cpp F16
+   with flash attention 115 / 31; faisca describe with 4 threads: load
+   9.5 s, encode 20.9, prompt 271 tokens 4.1 s, 7.7 tok/s. Phases at 4
+   threads before the GELU work: attention 26 s, matmuls 18, GELU 21 on
+   one thread. Not done: the remaining encoder speed (the block kernel
+   is bound by the broadcast loads, a key tiled flash attention would
+   keep K and V in L2; the matmuls are 1.7 TMAC per image against 1.0 of
+   the attention), several images or tiles per prompt, Gemma 3 12B and
+   27B vision (same mmproj layout, files beyond this machine), Whisper's
+   encoder through attention_block (same shape of problem), the Vulkan
+   runner.
 
 Target model: SmolLM2-360M-Instruct GGUF, then 1B to 3B models. SmolLM2-1.7B
 Q4_K_M (/home/user/models/1.7b/, official file, its float32 copy and the

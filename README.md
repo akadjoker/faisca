@@ -23,7 +23,8 @@ or exceptions. It has its own containers (`faisca::Array`, `faisca::StringMap`,
 | Own cache format and KV cache on disk | done: sessions with prefix reuse, snapshots and files with an offset table |
 | Whisper (speech to text) | done: tiny, base and small validated layer by layer against whisper.cpp, `transcribe` command, no timestamps yet |
 | Pocket TTS (text to speech) | done: validated against pockettts.cpp, `speak` command, 27 voices, no cloning from a recording yet |
-| Qwen2.5, Qwen3, Gemma 3 (270M, 1B, 4B) | done: validated layer by layer against llama.cpp, SentencePiece tokenizer, sliding window attention, linear rope scaling; Gemma 3 12B and 27B untried, no vision yet |
+| Qwen2.5, Qwen3, Gemma 3 (270M, 1B, 4B) | done: validated layer by layer against llama.cpp, SentencePiece tokenizer, sliding window attention, linear rope scaling; Gemma 3 12B and 27B untried |
+| Gemma 3 vision (SigLIP encoder and projector, `describe` command) | done: own PNG and JPEG decoders, encoder validated against llama.cpp's mtmd (1.7e-5 in float32), same tokens on an image prompt, 1.5x faster than mtmd on the encoder |
 
 ## Build
 
@@ -49,6 +50,7 @@ faisca info model.gguf --tensors    # every tensor
 faisca generate model.gguf -p "What is the capital of France?" -n 64 -t 4
 faisca chat model.gguf -t 4 --session talk.session
 faisca transcribe ggml-small.bin recording.wav --language pt -t 4
+faisca describe gemma-3-4b-it-Q8_0.gguf mmproj-F16.gguf photo.png -p "What is this?" -t 4
 ```
 
 `chat` reads one user message per line and keeps the conversation in the KV
@@ -108,6 +110,22 @@ voice prompt until it predicts the end, and the Mimi decoder turns the
 latents into audio. `--seed` picks the noise (default 0, the same seed
 gives the same audio as pocket-tts). With 4 threads on the same Xeon
 13.9 s of audio takes 2.2 s (pocket-tts 6.9 s on its 2 threads).
+
+`describe` runs a Gemma 3 model with its vision projector (the `mmproj`
+GGUF next to the model file) on a PNG or baseline JPEG and answers a
+question about it (default "Describe this image."):
+
+```
+faisca describe gemma-3-4b-it-Q8_0.gguf mmproj-F16.gguf photo.png -p "What is written on the sign?" -t 4
+```
+
+The image is resized to 896 x 896 as mtmd does (bilinear, centred on
+black), the SigLIP encoder turns it into 256 embeddings (its matrices on
+Q8_0 unless `--f32`), and the language model reads them as one non causal
+block between `<start_of_image>` and `<end_of_image>` before the user
+text, as llama.cpp lays out the prompt. On the 4B with 4 threads the
+encoder takes 20 s (mtmd 31 s) and the answer then runs at the model's
+speed.
 
 ## Library
 
@@ -248,6 +266,19 @@ the Q8_0, Q4_0 and Q4_K_M models at 2.0e-6, 1.9e-6 and 2.3e-6 from llama.cpp
 on their float32 copies (`--reference-model`), 16 greedy tokens identical in
 every case. `cmake
 -DFAISCA_VULKAN=OFF` leaves the backend out.
+
+`Image`, `read_image` and `resize_image` (include/faisca/image.h) decode PNG
+(own inflate) and baseline JPEG files exactly as stb_image does and resize
+them with Pillow's fixed point resampling, byte for byte what mtmd feeds its
+encoder. `VisionModel` loads the gemma3 mmproj GGUF (F16 matrices quantized
+to Q8_0 and packed at load unless `quantize` is false), `VisionRunner::encode`
+runs the SigLIP encoder and the projector over a thread pool (keys tiled and
+values stored per head, `attention_block` over 16 queries at a time, the
+FFN as row jobs) and gives the 256 x 2560 image embeddings;
+`Runner::forward_embeddings` feeds them as one non causal block (every row
+attends to the whole block and to the positions before it) with no logits,
+so `describe` is `forward` of the prefix, `forward_embeddings` of the image,
+`forward` of the rest.
 
 `GgufFile` is a plain value object: no smart pointers, no heap allocation for
 the object itself. The reader never copies or decodes anything up front.
@@ -406,6 +437,23 @@ python3 tests/compare_with_gguf_py.py build/gguf_dump model.gguf
   difference and the autoregressive loop keeps the runs apart; the
   reference's own stock and float32 builds are as far apart from each
   other on that pack.
+
+- **Vision against llama.cpp's mtmd.** `image_check` compares the decoders
+  with raw dumps of stb_image (0 bytes differ on the PNG and baseline JPEG
+  test images). `vision_dump` writes the image embeddings and, with
+  `--trace`, the encoder's intermediate tensors; `tests/reference/
+  llama_vision_dump.cpp` (over libmtmd) writes the same through the eval
+  callback, and `--lm` runs the language model on an image prompt;
+  `tests/compare_vision.py` compares them. Against a float32 copy of the
+  mmproj with the image patches rounded to f16 as ggml_conv_2d's im2col
+  does (`--f16-patches`): layer 0 at worst 2.3e-6, the 256 x 2560
+  embeddings 1.7e-5 rel L2 after 27 layers; the Q8_0 encoder is 7.7e-2
+  from that reference (the noise of 27 quantized layers), 1 and 4 threads
+  bit identical. `describe_dump` runs the language model on the same
+  prompt as `llama_vision_dump --lm`: 16 greedy tokens identical on the
+  4B Q8_0, the text rows before the image at the Q8_0 vs Q8_0 noise of
+  the text comparison (1.3e-6 at layer 0, 9.9e-3 at layer 32). ASan and
+  UBSan clean on the encoder and on the whole image prompt.
 
 ## Layout
 
