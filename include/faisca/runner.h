@@ -97,6 +97,11 @@ public:
     // one, or count rows of n_vocab when all_logits is set
     bool forward(const int32_t* tokens, size_t count, Array<float>& logits, Error& error, bool all_logits = false);
 
+    // feeds count rows of n_embd input embeddings (an image) as one non causal block: every
+    // row attends to the whole block and to the positions before it (the sliding window of a
+    // local layer still starts n_swa before each row); no logits, no embedding scale
+    bool forward_embeddings(const float* embeddings, size_t count, Error& error);
+
 private:
     struct MatmulJob;
     struct AttentionJob;
@@ -124,8 +129,10 @@ private:
     size_t m_quantize_tokens = 0;
 
     bool init_buffers(const LlamaModel& model, uint32_t n_ctx, bool kv_f16, Error& error);
+    bool reserve_batch(size_t rows, Error& error);
     void softcap(float* logits, size_t count) const;
-    void forward_batch(const int32_t* tokens, size_t count, uint32_t pos, float* logits, bool all_logits);
+    void forward_batch(const int32_t* tokens, const float* embeddings, size_t count, uint32_t pos, float* logits,
+                       bool all_logits);
     void quantize_inputs(const float* x, size_t stride, size_t n_tokens, size_t n, Activation kind);
     void matmul(const Weight& w, const float* x, size_t x_stride, size_t n_tokens, float* out, size_t out_stride);
     void attention(const LlamaLayer& layer, int il, uint32_t pos, size_t n_tokens);
@@ -140,6 +147,8 @@ private:
     ThreadPool* m_pool = &m_own_pool;
     uint32_t m_n_ctx = 0;
     uint32_t m_pos = 0;
+    size_t m_batch = 0; // rows the token buffers hold
+    size_t m_block = 0; // end of the non causal block being processed, 0 when causal
     bool m_kv_f16 = true;
     size_t m_cache_bytes = 0;
     RunnerTrace m_trace = nullptr;

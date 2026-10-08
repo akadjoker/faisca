@@ -13,6 +13,9 @@
 #include "faisca/pocket_model.h"
 #include "faisca/pocket_runner.h"
 #include "faisca/whisper_runner.h"
+#include "faisca/image.h"
+#include "faisca/vision_model.h"
+#include "faisca/vision_runner.h"
 
 #include <chrono>
 #include <cinttypes>
@@ -39,6 +42,8 @@ void print_usage()
         "  faisca generate <model.gguf> -p <prompt> [-n <tokens>] [-c <context>] [-t <threads>] [--raw] [--f32] [--kv-f32]\n"
         "                                [--draft <draft.gguf>] [--draft-n <tokens>] [--vulkan]\n"
         "  faisca transcribe <model.bin> <audio.wav> [--language <code>] [-t <threads>] [--f32]\n"
+        "  faisca describe <model.gguf> <mmproj.gguf> <image> [-p <prompt>] [-n <tokens>] [-c <context>] [-t <threads>]\n"
+        "                                [--f32] [--kv-f32]\n"
         "  faisca version\n"
         "\n"
         "info options:\n"
@@ -952,6 +957,193 @@ int command_chat(int argc, char** argv)
     return 0;
 }
 
+int command_describe(int argc, char** argv)
+{
+    const char* paths[3] = {nullptr, nullptr, nullptr};
+    int n_paths = 0;
+    const char* prompt = "Describe this image.";
+    int count = 256;
+    long context = 2048;
+    bool dequantize = false;
+    bool kv_f16 = true;
+    int threads = 1;
+
+    for (int i = 2; i < argc; ++i)
+    {
+        if (std::strcmp(argv[i], "-p") == 0 && i + 1 < argc)
+        {
+            prompt = argv[++i];
+        }
+        else if (std::strcmp(argv[i], "-n") == 0 && i + 1 < argc)
+        {
+            count = std::atoi(argv[++i]);
+        }
+        else if (std::strcmp(argv[i], "-c") == 0 && i + 1 < argc)
+        {
+            context = std::atol(argv[++i]);
+        }
+        else if (std::strcmp(argv[i], "-t") == 0 && i + 1 < argc)
+        {
+            threads = std::atoi(argv[++i]);
+        }
+        else if (std::strcmp(argv[i], "--f32") == 0)
+        {
+            dequantize = true;
+        }
+        else if (std::strcmp(argv[i], "--kv-f32") == 0)
+        {
+            kv_f16 = false;
+        }
+        else if (argv[i][0] == '-' && argv[i][1] != '\0')
+        {
+            std::fprintf(stderr, "faisca: unknown option '%s'\n", argv[i]);
+            return 2;
+        }
+        else if (n_paths < 3)
+        {
+            paths[n_paths++] = argv[i];
+        }
+        else
+        {
+            std::fprintf(stderr, "faisca: unexpected argument '%s'\n", argv[i]);
+            return 2;
+        }
+    }
+    if (n_paths != 3)
+    {
+        std::fprintf(stderr, "faisca: describe needs a model file, its mmproj file and an image\n");
+        return 2;
+    }
+    if (count < 1 || context < 1 || context > 0x7fffffffL)
+    {
+        std::fprintf(stderr, "faisca: -n and -c must be positive\n");
+        return 2;
+    }
+
+    Error error;
+    GgufFile file;
+    Tokenizer tokenizer;
+    LlamaModel model;
+    ThreadPool pool;
+    Runner runner;
+    VisionModel vision;
+    VisionRunner encoder;
+    Image image;
+
+    const auto load_start = std::chrono::steady_clock::now();
+    if (!file.open(paths[0], error) || !tokenizer.load(file, error) || !pool.start(threads, error) ||
+        !model.load(file, error, dequantize, &pool) ||
+        !runner.init(model, static_cast<uint32_t>(context), pool, error, kv_f16) ||
+        !vision.load(paths[1], error, !dequantize) || !encoder.init(vision, pool, error) ||
+        !read_image(paths[2], image, error))
+    {
+        std::fprintf(stderr, "faisca: %s\n", error.c_str());
+        return 1;
+    }
+    if (vision.hparams().n_proj != model.hparams().n_embd)
+    {
+        std::fprintf(stderr, "faisca: the projector gives %" PRIu32 " values per token, the model takes %" PRIu32 "\n",
+                     vision.hparams().n_proj, model.hparams().n_embd);
+        return 1;
+    }
+    const double load_seconds = seconds_since(load_start);
+
+    Array<int32_t> probe;
+    if (!tokenizer.encode("<start_of_image>", false, true, probe) || probe.size() != 1 ||
+        tokenizer.token_type(probe[0]) != TokenType::Control)
+    {
+        std::fprintf(stderr, "faisca: the model has no <start_of_image> token\n");
+        return 1;
+    }
+
+    const auto encode_start = std::chrono::steady_clock::now();
+    Array<float> embeddings;
+    if (!encoder.encode(image, embeddings, error))
+    {
+        std::fprintf(stderr, "faisca: %s\n", error.c_str());
+        return 1;
+    }
+    const size_t n_image = vision.hparams().n_tokens();
+    const double encode_seconds = seconds_since(encode_start);
+
+    // the layout of llama.cpp's mtmd for gemma3: the image before the text of the user turn
+    const ChatTemplate chat = chat_template(file, tokenizer);
+    Array<char> text;
+    Array<int32_t> head;
+    Array<int32_t> tail;
+    append_text(text, chat.first_user);
+    append_text(text, "<start_of_image>");
+    if (!tokenizer.encode(std::string_view(text.data(), text.size()), true, true, head) || head.empty())
+    {
+        std::fprintf(stderr, "faisca: the prompt produced no tokens\n");
+        return 1;
+    }
+    text.clear();
+    append_text(text, "<end_of_image>");
+    append_text(text, prompt);
+    append_text(text, chat.assistant);
+    if (!tokenizer.encode(std::string_view(text.data(), text.size()), false, true, tail) || tail.empty())
+    {
+        std::fprintf(stderr, "faisca: the prompt produced no tokens\n");
+        return 1;
+    }
+    const size_t prompt_tokens = head.size() + n_image + tail.size();
+    if (prompt_tokens + static_cast<size_t>(count) > static_cast<size_t>(context))
+    {
+        std::fprintf(stderr, "faisca: %zu prompt tokens plus %d generated do not fit a context of %ld\n", prompt_tokens,
+                     count, context);
+        return 1;
+    }
+
+    Array<float> logits;
+    const auto prompt_start = std::chrono::steady_clock::now();
+    if (!runner.forward(head.data(), head.size(), logits, error) ||
+        !runner.forward_embeddings(embeddings.data(), n_image, error) ||
+        !runner.forward(tail.data(), tail.size(), logits, error))
+    {
+        std::fprintf(stderr, "faisca: %s\n", error.c_str());
+        return 1;
+    }
+    const double prompt_seconds = seconds_since(prompt_start);
+
+    const auto generate_start = std::chrono::steady_clock::now();
+    Array<char> piece;
+    int generated = 0;
+    for (; generated < count; ++generated)
+    {
+        int32_t best = 0;
+        for (size_t t = 1; t < logits.size(); ++t)
+        {
+            if (logits[t] > logits[static_cast<size_t>(best)])
+            {
+                best = static_cast<int32_t>(t);
+            }
+        }
+        if (best == tokenizer.eos() || tokenizer.token_type(best) == TokenType::Control)
+        {
+            break;
+        }
+        piece.clear();
+        tokenizer.token_to_piece(best, false, piece);
+        std::fwrite(piece.data(), 1, piece.size(), stdout);
+        std::fflush(stdout);
+        if (generated + 1 < count && !runner.forward(&best, 1, logits, error))
+        {
+            std::fprintf(stderr, "\nfaisca: %s\n", error.c_str());
+            return 1;
+        }
+    }
+    const double generate_seconds = seconds_since(generate_start);
+    std::printf("\n");
+    std::fprintf(stderr,
+                 "\n%s, %d threads, load %.2f s, image %" PRIu32 " x %" PRIu32 " encoded to %zu tokens in %.2f s, prompt %zu "
+                 "tokens in %.2f s (%.1f tok/s), %d tokens generated in %.2f s (%.1f tok/s)\n",
+                 simd_name(), runner.threads(), load_seconds, image.width, image.height, n_image, encode_seconds,
+                 prompt_tokens, prompt_seconds, static_cast<double>(prompt_tokens) / prompt_seconds, generated,
+                 generate_seconds, generated > 0 ? static_cast<double>(generated) / generate_seconds : 0.0);
+    return 0;
+}
+
 int command_transcribe(int argc, char** argv)
 {
     const char* language = "en";
@@ -1160,6 +1352,10 @@ int main(int argc, char** argv)
     if (std::strcmp(command, "transcribe") == 0)
     {
         return command_transcribe(argc, argv);
+    }
+    if (std::strcmp(command, "describe") == 0)
+    {
+        return command_describe(argc, argv);
     }
     if (std::strcmp(command, "speak") == 0)
     {

@@ -47,6 +47,8 @@ void Runner::release()
     m_model = nullptr;
     m_n_ctx = 0;
     m_pos = 0;
+    m_batch = 0;
+    m_block = 0;
     m_k.release();
     m_v.release();
     m_k16.release();
@@ -108,7 +110,6 @@ bool Runner::init_buffers(const LlamaModel& model, uint32_t n_ctx, bool kv_f16, 
 
     const LlamaHparams& h = model.hparams();
     const size_t n_kv = static_cast<size_t>(h.n_head_kv) * h.head_dim;
-    const size_t n_q = static_cast<size_t>(h.n_head) * h.head_dim;
     const size_t cache = static_cast<size_t>(h.n_layer) * n_ctx * n_kv;
     if (cache / n_kv / n_ctx != h.n_layer || cache > static_cast<size_t>(-1) / (2 * sizeof(float)))
     {
@@ -126,19 +127,20 @@ bool Runner::init_buffers(const LlamaModel& model, uint32_t n_ctx, bool kv_f16, 
     const size_t k_cache = static_cast<size_t>(h.n_layer) * h.n_head_kv * (scores * h.head_dim);
     const size_t element = kv_f16 ? sizeof(uint16_t) : sizeof(float);
     m_cache_bytes = (k_cache + cache) * element;
-    const bool cache_ok = kv_f16 ? m_k16.resize_uninitialized(k_cache) && m_v16.resize_uninitialized(cache) &&
-                                       m_v_batch.resize_uninitialized(BATCH * n_kv)
+    const bool cache_ok = kv_f16 ? m_k16.resize_uninitialized(k_cache) && m_v16.resize_uninitialized(cache)
                                  : m_k.resize_uninitialized(k_cache) && m_v.resize_uninitialized(cache);
-    if (!cache_ok || !m_k_batch.resize_uninitialized(BATCH * n_kv) || !m_x.resize_uninitialized(BATCH * h.n_embd) ||
-        !m_h.resize_uninitialized(BATCH * h.n_embd) || !m_q.resize_uninitialized(BATCH * n_q) ||
-        !m_attn.resize_uninitialized(BATCH * n_q) || !m_gate.resize_uninitialized(BATCH * h.n_ff) ||
-        !m_up.resize_uninitialized(BATCH * h.n_ff) || !m_act.resize_uninitialized(BATCH * h.n_ff) ||
-        !m_scores.resize_uninitialized(threads * scores) || !m_xq.resize_uninitialized(BATCH * m_xq_stride) ||
-        !m_sums.resize_uninitialized(BATCH * m_sums_stride))
+    if (!cache_ok || !m_scores.resize_uninitialized(threads * scores))
     {
         release();
         error.set("out of memory: the KV cache for %" PRIu32 " positions needs %zu MiB", n_ctx,
                   (k_cache + cache) * element >> 20);
+        return false;
+    }
+    m_kv_f16 = kv_f16;
+    m_model = &model;
+    if (!reserve_batch(BATCH, error))
+    {
+        release();
         return false;
     }
     // the score kernel reads whole tiles of 16 positions, so unused positions must hold numbers
@@ -289,7 +291,8 @@ bool Runner::forward(const int32_t* tokens, size_t count, Array<float>& logits, 
     for (size_t done = 0; done < count;)
     {
         const size_t batch = count - done < BATCH ? count - done : BATCH;
-        forward_batch(tokens + done, batch, m_pos, logits.data() + (all_logits ? done * h.n_vocab : 0), all_logits);
+        forward_batch(tokens + done, nullptr, batch, m_pos, logits.data() + (all_logits ? done * h.n_vocab : 0),
+                      all_logits);
         m_pos += static_cast<uint32_t>(batch);
         done += batch;
     }
@@ -494,14 +497,16 @@ void Runner::attention_unit(int il, uint32_t pos, size_t token, size_t head, flo
     const size_t v_offset = static_cast<size_t>(il) * m_n_ctx * n_kv + kv_head * head_dim;
     const float* q = m_q.data() + token * n_q + head * head_dim;
     float* out = m_attn.data() + token * n_q + head * head_dim;
-    size_t n_past = static_cast<size_t>(pos) + token + 1;
-    // a local layer sees the last n_swa positions: the window starts at a whole tile and
-    // the kernel skips the positions before the start inside it
+    // inside a non causal block every token sees the whole block (m_block is its end)
+    const size_t query_end = static_cast<size_t>(pos) + token + 1;
+    size_t n_past = m_block != 0 ? m_block : query_end;
+    // a local layer sees the last n_swa positions before its own: the window starts at a
+    // whole tile and the kernel skips the positions before the start inside it
     size_t start_tile = 0;
     size_t skip = 0;
-    if (h.local_layer(static_cast<uint32_t>(il)) && n_past > h.n_swa)
+    if (h.local_layer(static_cast<uint32_t>(il)) && query_end > h.n_swa)
     {
-        const size_t start = n_past - h.n_swa;
+        const size_t start = query_end - h.n_swa;
         start_tile = start / KEY_TILE;
         skip = start % KEY_TILE;
         n_past -= start_tile * KEY_TILE;
@@ -617,17 +622,23 @@ void Runner::attention(const LlamaLayer& layer, int il, uint32_t pos, size_t n_t
     }
 }
 
-void Runner::forward_batch(const int32_t* tokens, size_t count, uint32_t pos, float* logits, bool all_logits)
+void Runner::forward_batch(const int32_t* tokens, const float* embeddings, size_t count, uint32_t pos, float* logits,
+                           bool all_logits)
 {
     const LlamaHparams& h = m_model->hparams();
     const size_t n_embd = h.n_embd;
 
-    for (size_t t = 0; t < count; ++t)
+    if (embeddings != nullptr)
+    {
+        std::memcpy(m_x.data(), embeddings, count * n_embd * sizeof(float));
+    }
+    for (size_t t = 0; embeddings == nullptr && t < count; ++t)
     {
         m_model->token_embd().row(static_cast<size_t>(tokens[t]), m_x.data() + t * n_embd);
     }
     trace_rows("inp_embd", -1, m_x.data(), n_embd, count, n_embd);
-    if (h.embd_scale != 1.0f)
+    // the scale applies to token rows only, as llama.cpp does with its image embeddings
+    if (h.embd_scale != 1.0f && embeddings == nullptr)
     {
         for_tokens(&Runner::step_scale_embd, nullptr, pos, count);
         trace_rows("inp_scaled", -1, m_x.data(), n_embd, count, n_embd);
@@ -664,6 +675,10 @@ void Runner::forward_batch(const int32_t* tokens, size_t count, uint32_t pos, fl
         trace_rows("l_out", il, m_x.data(), n_embd, count, n_embd);
     }
 
+    if (logits == nullptr)
+    {
+        return;
+    }
     if (m_trace != nullptr || all_logits)
     {
         float* rows = all_logits ? logits : m_logits.data();
@@ -683,6 +698,57 @@ void Runner::forward_batch(const int32_t* tokens, size_t count, uint32_t pos, fl
     rms_norm(last, m_model->output_norm(), n_embd, h.rms_eps, m_h.data());
     matmul(m_model->output(), m_h.data(), n_embd, 1, logits, h.n_vocab);
     softcap(logits, h.n_vocab);
+}
+
+bool Runner::forward_embeddings(const float* embeddings, size_t count, Error& error)
+{
+    if (m_model == nullptr)
+    {
+        error.set("the runner is not initialized");
+        return false;
+    }
+    if (count == 0)
+    {
+        error.set("no embeddings to process");
+        return false;
+    }
+    if (count > m_n_ctx - m_pos)
+    {
+        error.set("context full: %zu embeddings at position %" PRIu32 " exceed %" PRIu32, count, m_pos, m_n_ctx);
+        return false;
+    }
+    if (!reserve_batch(count, error))
+    {
+        return false;
+    }
+    m_block = static_cast<size_t>(m_pos) + count;
+    forward_batch(nullptr, embeddings, count, m_pos, nullptr, false);
+    m_block = 0;
+    m_pos += static_cast<uint32_t>(count);
+    return true;
+}
+
+bool Runner::reserve_batch(size_t rows, Error& error)
+{
+    if (rows <= m_batch)
+    {
+        return true;
+    }
+    const LlamaHparams& h = m_model->hparams();
+    const size_t n_kv = static_cast<size_t>(h.n_head_kv) * h.head_dim;
+    const size_t n_q = static_cast<size_t>(h.n_head) * h.head_dim;
+    if ((m_kv_f16 && !m_v_batch.resize_uninitialized(rows * n_kv)) || !m_k_batch.resize_uninitialized(rows * n_kv) ||
+        !m_x.resize_uninitialized(rows * h.n_embd) || !m_h.resize_uninitialized(rows * h.n_embd) ||
+        !m_q.resize_uninitialized(rows * n_q) || !m_attn.resize_uninitialized(rows * n_q) ||
+        !m_gate.resize_uninitialized(rows * h.n_ff) || !m_up.resize_uninitialized(rows * h.n_ff) ||
+        !m_act.resize_uninitialized(rows * h.n_ff) || !m_xq.resize_uninitialized(rows * m_xq_stride) ||
+        !m_sums.resize_uninitialized(rows * m_sums_stride))
+    {
+        error.set("out of memory: a batch of %zu tokens", rows);
+        return false;
+    }
+    m_batch = rows;
+    return true;
 }
 
 void Runner::softcap(float* logits, size_t count) const

@@ -15,7 +15,8 @@ import sys
 
 import numpy as np
 
-from compare_layers import read_dump
+sys.path.insert(0, __import__("os").path.dirname(__import__("os").path.abspath(__file__)))
+from compare_layers import read_dump  # noqa: E402
 
 
 def error_of(mine: np.ndarray, theirs: np.ndarray) -> tuple[float, float]:
@@ -36,6 +37,7 @@ def main() -> int:
     parser.add_argument("--abs", type=float, default=1e-4)
     parser.add_argument("--embeddings", action="store_true")
     parser.add_argument("--n-embd", type=int, default=2560)
+    parser.add_argument("--rows", type=int, default=4096, help="patches per image, to cut the padded FFN columns")
     args = parser.parse_args()
 
     if args.embeddings:
@@ -62,14 +64,11 @@ def main() -> int:
         best = None
         for key, theirs in variants:
             candidate = mine
-            if mine.shape != theirs.shape:
-                if mine.ndim == 2 and theirs.reshape(-1).size % mine.shape[0] == 0:
-                    theirs_2d = theirs.reshape(mine.shape[0], -1)
-                    if theirs_2d.shape[1] <= mine.shape[1]:
-                        candidate = mine[:, :theirs_2d.shape[1]]
-                        theirs = theirs_2d
-                if candidate.size != theirs.size:
+            if mine.size != theirs.size:
+                if mine.size % args.rows != 0 or theirs.size % args.rows != 0 or mine.size < theirs.size:
                     continue
+                theirs = theirs.reshape(args.rows, -1)
+                candidate = mine.reshape(args.rows, -1)[:, :theirs.shape[1]]
             max_abs, rel = error_of(candidate, theirs)
             if best is None or rel < best[2]:
                 best = (key, max_abs, rel, theirs.shape)

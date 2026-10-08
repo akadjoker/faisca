@@ -3,6 +3,13 @@
 // libmtmd; the Q8_0 and AMX issues of this machine need the no AMX libraries.
 //
 // usage: llama_vision_dump [--trace trace.bin] [--layers N] <model.gguf> <mmproj.gguf> <image> <embd.bin>
+//        llama_vision_dump --lm <lm.bin> <generate N> <model.gguf> <mmproj.gguf> <image> <prompt>
+//
+// --lm runs the language model on the prompt (text with mtmd's <__media__> marker where the
+// image goes, wrapped by the caller in the chat template, BOS added), writes inp_embd, l_out
+// and result_norm of the prompt (the rows of the three chunks joined, as runner_dump writes
+// them) in the layer dump format, prints the token ids of the text chunks and the greedy
+// tokens; the KV cache is float32, flash attention off, one thread.
 //
 // --trace writes the named intermediate tensors of the vision graph (clip.cpp's cb names,
 // the post layer norm as post_ln) in the format of llama_layer_dump, with the flash
@@ -40,6 +47,15 @@ struct Capture
     std::map<std::string, int> seen;
     std::vector<uint8_t> buffer;
     size_t records = 0;
+};
+
+const std::set<std::string> LM_WANTED = {"inp_embd", "l_out", "result_norm"};
+
+struct LmCapture
+{
+    bool recording = true;
+    std::vector<std::string> order;
+    std::map<std::string, std::pair<size_t, std::vector<float>>> tensors;
 };
 
 std::string base_name(const char* name, int& layer)
@@ -113,8 +129,189 @@ bool eval_callback(ggml_tensor* t, bool ask, void* user_data)
 
 }
 
+bool lm_eval_callback(ggml_tensor* t, bool ask, void* user_data)
+{
+    LmCapture* capture = static_cast<LmCapture*>(user_data);
+    int layer = -1;
+    const std::string base = base_name(t->name, layer);
+    const bool wanted = capture->recording && LM_WANTED.count(base) != 0;
+    if (ask)
+    {
+        return wanted;
+    }
+    if (!wanted)
+    {
+        return true;
+    }
+    if (t->type != GGML_TYPE_F32 || !ggml_is_contiguous(t))
+    {
+        std::fprintf(stderr, "llama_vision_dump: skipping %s (%s, %s)\n", t->name, ggml_type_name(t->type),
+                     ggml_is_contiguous(t) ? "contiguous" : "not contiguous");
+        return true;
+    }
+    const std::string name(t->name);
+    auto it = capture->tensors.find(name);
+    if (it == capture->tensors.end())
+    {
+        capture->order.push_back(name);
+        it = capture->tensors.emplace(name, std::make_pair(static_cast<size_t>(t->ne[0]), std::vector<float>())).first;
+    }
+    std::vector<float>& values = it->second.second;
+    const size_t count = ggml_nelements(t);
+    const size_t at = values.size();
+    values.resize(at + count);
+    ggml_backend_tensor_get(t, values.data() + at, 0, count * sizeof(float));
+    return true;
+}
+
+int run_lm(const char* out_path, int generate, const char* model_path, const char* mmproj_path, const char* image_path,
+           const char* prompt)
+{
+    llama_backend_init();
+    llama_model_params mparams = llama_model_default_params();
+    mparams.n_gpu_layers = 0;
+    llama_model* model = llama_model_load_from_file(model_path, mparams);
+    if (model == nullptr)
+    {
+        std::fprintf(stderr, "cannot load %s\n", model_path);
+        return 1;
+    }
+    LmCapture capture;
+    llama_context_params cparams = llama_context_default_params();
+    cparams.n_ctx = 4096;
+    cparams.n_batch = 1024;
+    cparams.n_ubatch = 1024;
+    cparams.n_threads = 1;
+    cparams.n_threads_batch = 1;
+    cparams.type_k = GGML_TYPE_F32;
+    cparams.type_v = GGML_TYPE_F32;
+    cparams.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
+    cparams.cb_eval = lm_eval_callback;
+    cparams.cb_eval_user_data = &capture;
+    cparams.no_perf = true;
+    llama_context* lctx = llama_init_from_model(model, cparams);
+    if (lctx == nullptr)
+    {
+        std::fprintf(stderr, "cannot create the context\n");
+        return 1;
+    }
+    mtmd_context_params params = mtmd_context_params_default();
+    params.use_gpu = false;
+    params.n_threads = 1;
+    params.warmup = false;
+    params.print_timings = false;
+    params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
+    mtmd_context* ctx = mtmd_init_from_file(mmproj_path, model, params);
+    if (ctx == nullptr)
+    {
+        std::fprintf(stderr, "cannot load %s\n", mmproj_path);
+        return 1;
+    }
+    mtmd_helper_bitmap_wrapper wrapper = mtmd_helper_bitmap_init_from_file(ctx, image_path, false, mtmd_helper_init_opt_default());
+    if (wrapper.bitmap == nullptr)
+    {
+        std::fprintf(stderr, "cannot read %s\n", image_path);
+        return 1;
+    }
+    mtmd_input_text text{prompt, std::strlen(prompt), true, true};
+    mtmd_input_chunks* chunks = mtmd_input_chunks_init();
+    const mtmd_bitmap* bitmaps[1] = {wrapper.bitmap};
+    if (mtmd_tokenize(ctx, chunks, &text, bitmaps, 1) != 0)
+    {
+        std::fprintf(stderr, "mtmd_tokenize failed\n");
+        return 1;
+    }
+    std::printf("prompt:");
+    const size_t n_chunks = mtmd_input_chunks_size(chunks);
+    for (size_t i = 0; i < n_chunks; ++i)
+    {
+        const mtmd_input_chunk* chunk = mtmd_input_chunks_get(chunks, i);
+        if (mtmd_input_chunk_get_type(chunk) != MTMD_INPUT_CHUNK_TYPE_TEXT)
+        {
+            std::printf(" image");
+            continue;
+        }
+        size_t n = 0;
+        const llama_token* tokens = mtmd_input_chunk_get_tokens_text(chunk, &n);
+        for (size_t k = 0; k < n; ++k)
+        {
+            std::printf(" %d", tokens[k]);
+        }
+    }
+    std::printf("\n");
+    llama_pos n_past = 0;
+    if (mtmd_helper_eval_chunks(ctx, lctx, chunks, 0, 0, 1024, true, &n_past) != 0)
+    {
+        std::fprintf(stderr, "mtmd_helper_eval_chunks failed\n");
+        return 1;
+    }
+    capture.recording = false;
+    FILE* out = std::fopen(out_path, "wb");
+    if (out == nullptr)
+    {
+        std::fprintf(stderr, "cannot write %s\n", out_path);
+        return 1;
+    }
+    for (const std::string& key : capture.order)
+    {
+        const auto& traced = capture.tensors[key];
+        const uint32_t name_length = static_cast<uint32_t>(key.size());
+        const uint32_t dims = 2;
+        const uint64_t ne[2] = {traced.first, traced.second.size() / traced.first};
+        std::fwrite(&name_length, 4, 1, out);
+        std::fwrite(key.data(), 1, key.size(), out);
+        std::fwrite(&dims, 4, 1, out);
+        std::fwrite(ne, 8, 2, out);
+        std::fwrite(traced.second.data(), 4, traced.second.size(), out);
+    }
+    std::fclose(out);
+    std::fprintf(stderr, "llama_vision_dump: %zu tensors written, %d prompt positions\n", capture.order.size(), n_past);
+
+    const llama_vocab* vocab = llama_model_get_vocab(model);
+    const int32_t n_vocab = llama_vocab_n_tokens(vocab);
+    llama_batch batch = llama_batch_init(1, 0, 1);
+    std::printf("generated:");
+    for (int g = 0; g < generate; ++g)
+    {
+        const float* logits = llama_get_logits_ith(lctx, -1);
+        int32_t best = 0;
+        for (int32_t t = 1; t < n_vocab; ++t)
+        {
+            if (logits[t] > logits[best])
+            {
+                best = t;
+            }
+        }
+        std::printf(" %d", best);
+        batch.n_tokens = 1;
+        batch.token[0] = best;
+        batch.pos[0] = n_past++;
+        batch.n_seq_id[0] = 1;
+        batch.seq_id[0][0] = 0;
+        batch.logits[0] = 1;
+        if (g + 1 < generate && llama_decode(lctx, batch) != 0)
+        {
+            std::fprintf(stderr, "decode failed\n");
+            return 1;
+        }
+    }
+    std::printf("\n");
+    llama_batch_free(batch);
+    mtmd_input_chunks_free(chunks);
+    mtmd_bitmap_free(wrapper.bitmap);
+    mtmd_free(ctx);
+    llama_free(lctx);
+    llama_model_free(model);
+    llama_backend_free();
+    return 0;
+}
+
 int main(int argc, char** argv)
 {
+    if (argc == 8 && std::strcmp(argv[1], "--lm") == 0)
+    {
+        return run_lm(argv[2], std::atoi(argv[3]), argv[4], argv[5], argv[6], argv[7]);
+    }
     const char* trace_path = nullptr;
     int layers = 1 << 30;
     while (argc >= 3 && argv[1][0] == '-')

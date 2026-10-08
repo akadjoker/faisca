@@ -80,6 +80,7 @@ struct VisionRunner::MatmulJob
     size_t sums_stride;
     size_t n_tokens;
     float* out;
+    size_t out_stride;
 };
 
 struct VisionRunner::AttentionJob
@@ -224,7 +225,8 @@ void VisionRunner::matmul_task(void* user, int thread_index, int thread_count)
     {
         return;
     }
-    w.matmul(job.x, w.n_in, job.xq, job.xq_stride, job.sums, job.sums_stride, job.n_tokens, first, last, job.out, w.n_out);
+    w.matmul(job.x, w.n_in, job.xq, job.xq_stride, job.sums, job.sums_stride, job.n_tokens, first, last, job.out,
+             job.out_stride);
 }
 
 void VisionRunner::quantize_task(void* user, int thread_index, int thread_count)
@@ -248,10 +250,10 @@ void VisionRunner::quantize_inputs(const float* x, size_t n_tokens, size_t n)
     m_pool->run(quantize_task, this);
 }
 
-// x rows are w.n_in apart, out rows w.n_out apart
-void VisionRunner::matmul(const Weight& w, const float* x, size_t n_tokens, float* out)
+// x rows are w.n_in apart, out rows out_stride apart (w.n_out when 0)
+void VisionRunner::matmul(const Weight& w, const float* x, size_t n_tokens, float* out, size_t out_stride)
 {
-    MatmulJob job{&w, x, nullptr, 0, nullptr, 0, n_tokens, out};
+    MatmulJob job{&w, x, nullptr, 0, nullptr, 0, n_tokens, out, out_stride == 0 ? w.n_out : out_stride};
     if (w.activation() != Activation::F32)
     {
         quantize_inputs(x, n_tokens, w.n_in);
@@ -391,7 +393,7 @@ bool VisionRunner::encode_planes(const float* planes, Array<float>& embeddings, 
         trace("ffn_inp", il, m_x.data(), n * dim);
         norm_rows(m_x.data(), layer.ln2_w, layer.ln2_b, n, dim, m_h.data());
         trace("ffn_inp_normed", il, m_h.data(), n * dim);
-        matmul(layer.up, m_h.data(), n, m_up.data());
+        matmul(layer.up, m_h.data(), n, m_up.data(), h.n_ff_padded);
         // the padded tail of every row stays zero: the bias and the GELU cover n_ff values
         for (size_t t = 0; t < n; ++t)
         {

@@ -56,7 +56,7 @@ private:
     static void patch_task(void* user, int thread_index, int thread_count);
 
     void trace(const char* name, int layer, const float* data, size_t count) const;
-    void matmul(const Weight& w, const float* x, size_t n_tokens, float* out);
+    void matmul(const Weight& w, const float* x, size_t n_tokens, float* out, size_t out_stride = 0);
     void quantize_inputs(const float* x, size_t n_tokens, size_t n);
     void norm_rows(const float* x, const float* w, const float* b, size_t rows, size_t width, float* out);
     void gelu_rows(float* x, size_t rows, size_t width);
