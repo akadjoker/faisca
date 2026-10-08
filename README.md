@@ -16,7 +16,7 @@ or exceptions. It has its own containers (`faisca::Array`, `faisca::StringMap`,
 | Step | State |
 | --- | --- |
 | GGUF loader (memory mapped, zero-copy) | done |
-| Tokenizer (byte level BPE, validated against llama.cpp) | done |
+| Tokenizer (byte level BPE with the gpt-2, smollm and llama-bpe pre-tokenizers, validated against llama.cpp) | done |
 | CPU runner, float32, validated layer by layer against llama.cpp | done |
 | CPU optimization: threads, VNNI kernels for Q8_0, Q4_0, Q5_0, Q4_K and Q6_K, batched prompt, f16 KV cache | done, AMX pending |
 | Vulkan compute backend | runs the whole model, validated layer by layer on llvmpipe; speed on a real GPU not measured yet |
@@ -62,8 +62,10 @@ the same vocabulary (`--draft-n` tokens per round, default 3); the output is
 the same, only the speed changes, see bench/README.md for when it helps.
 SmolLM2-360M on a 2.1 GHz Xeon, 4 threads: 98 tokens per second from Q8_0,
 about 150 from Q4_0, 118 from Q4_K_M, prompts at 550 to 600 tokens per
-second; SmolLM2-1.7B Q4_K_M: 28 tokens per second, prompts at 125
-(bench/README.md has the tables against llama.cpp).
+second; SmolLM2-1.7B Q4_K_M: 28 tokens per second, prompts at 125;
+Llama 3.2 1B Q8_0: 25 tokens per second, prompts at 180 (bench/README.md
+has the tables against llama.cpp). The chat template follows the
+vocabulary: ChatML for SmolLM2, the header tokens for Llama 3.
 
 ## Library
 
@@ -130,7 +132,8 @@ runner.forward(tokens.data(), tokens.size(), logits, error); // logits of the la
 ```
 
 `LlamaModel` reads the `llama` architecture (SmolLM2, Llama 2 and 3 style
-models without rope scaling). F32 tensors are used in place in the mapped
+models, including the Llama 3 rope frequency factors of `rope_freqs.weight`;
+linear and YaRN rope scaling are still rejected). F32 tensors are used in place in the mapped
 file, F16 tensors are converted to float32 at load. Q8_0, Q4_0, Q5_0, Q4_K
 and Q6_K tensors (the types a Q4_K_M file holds) are repacked at load into
 groups of 16 interleaved rows in anonymous memory (huge pages where the

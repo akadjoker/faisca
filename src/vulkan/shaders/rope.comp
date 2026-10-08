@@ -11,6 +11,11 @@ layout(std430, binding = 0) buffer Data
     float x[];
 };
 
+layout(std430, binding = 1) readonly buffer Factors
+{
+    float factors[];
+};
+
 layout(push_constant) uniform Push
 {
     uint n_head;
@@ -18,6 +23,7 @@ layout(push_constant) uniform Push
     uint n_rot;
     uint pos0;
     float freq_base;
+    uint has_factors;
 } p;
 
 void main()
@@ -35,8 +41,9 @@ void main()
     {
         theta *= theta_scale;
     }
-    const float c = cos(theta);
-    const float s = sin(theta);
+    const float angle = p.has_factors != 0u ? theta / factors[pair] : theta;
+    const float c = cos(angle);
+    const float s = sin(angle);
     const uint at = (t * p.n_head + h) * p.head_dim + 2 * pair;
     const float x0 = x[at];
     const float x1 = x[at + 1];

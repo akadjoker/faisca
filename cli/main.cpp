@@ -443,6 +443,26 @@ double seconds_since(std::chrono::steady_clock::time_point start)
     return std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
 }
 
+// the chat template the vocabulary asks for: ChatML (SmolLM2) or Llama 3
+struct ChatTemplate
+{
+    const char* first_user;
+    const char* next_user;
+    const char* assistant;
+};
+
+ChatTemplate chat_template(Tokenizer& tokenizer)
+{
+    Array<int32_t> probe;
+    if (tokenizer.encode("<|start_header_id|>", false, true, probe) && probe.size() == 1 &&
+        tokenizer.token_type(probe[0]) == TokenType::Control)
+    {
+        return {"<|start_header_id|>user<|end_header_id|>\n\n", "<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n",
+                "<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"};
+    }
+    return {"<|im_start|>user\n", "<|im_end|>\n<|im_start|>user\n", "<|im_end|>\n<|im_start|>assistant\n"};
+}
+
 bool append_text(Array<char>& out, const char* text)
 {
     return out.append(text, std::strlen(text));
@@ -605,9 +625,10 @@ int command_generate(int argc, char** argv)
     }
     else
     {
-        append_text(text, "<|im_start|>user\n");
+        const ChatTemplate chat = chat_template(tokenizer);
+        append_text(text, chat.first_user);
         append_text(text, prompt);
-        append_text(text, "<|im_end|>\n<|im_start|>assistant\n");
+        append_text(text, chat.assistant);
     }
 
     Array<int32_t> tokens;
@@ -835,9 +856,10 @@ int command_chat(int argc, char** argv)
         // the turn as tokens appended to what the cache holds, never re-tokenizing the past
         text.clear();
         const bool first = session.tokens().empty();
-        append_text(text, first ? "<|im_start|>user\n" : "<|im_end|>\n<|im_start|>user\n");
+        const ChatTemplate chat = chat_template(tokenizer);
+        append_text(text, first ? chat.first_user : chat.next_user);
         append_text(text, line);
-        append_text(text, "<|im_end|>\n<|im_start|>assistant\n");
+        append_text(text, chat.assistant);
         turn.clear();
         if (!tokenizer.encode(std::string_view(text.data(), text.size()), first, true, turn) || turn.empty())
         {

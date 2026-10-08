@@ -252,6 +252,16 @@ there, with 16 greedy tokens identical on every side, so the activation
 quantization is the cause, not the kernels); the Vulkan kernels on llvmpipe
 are within 4e-7 per matrix.
 
+**Llama 3.2 1B Instruct Q8_0** (bartowski's file, 16 blocks, 2048 wide, 32
+heads over 8 kv heads, a vocabulary of 128256, rope frequency factors,
+1252 MiB), same harness: generation 10.0 / 24.9 tok/s with 1 / 4 threads
+(llama-bench tg32 with 4 threads 26.4), prompt 68 / 180 (llama-bench pp512
+with 4 threads 297, AMX). The output matrix alone is 266 MiB of the weights.
+Validation: matmul_check zero error on 97 matrices, float32 path 2.6e-6 from
+llama.cpp with 16 tokens and 2.4e-6 with 512, Vulkan 2.6e-6, tokens
+identical; the llama-bpe tokenizer at 0 mismatches over 39941 cases (2.69 M
+tokens) of the text corpus.
+
 **Speculative decoding with SmolLM2-135M as draft.** Measured with
 `speculative_check` (SmolLM2-360M Q8_0 target, chat prompt of 16 tokens, 64
 generated unless said otherwise; the sequences are identical to plain greedy

@@ -175,8 +175,10 @@ float dot(const float* a, const float* b, size_t n);
 // out = x / sqrt(mean(x^2) + eps) * weight
 void rms_norm(const float* x, const float* weight, size_t n, float eps, float* out);
 
-// rotates the first n_rot values of every head in place, pairs (2i, 2i + 1), as ggml's NORM mode
-void rope_norm(float* x, size_t n_head, size_t head_dim, size_t n_rot, uint32_t pos, float freq_base);
+// rotates the first n_rot values of every head in place, pairs (2i, 2i + 1), as ggml's NORM
+// mode; factors, when given, divide the angle of pair i by factors[i] (Llama 3 rope scaling)
+void rope_norm(float* x, size_t n_head, size_t head_dim, size_t n_rot, uint32_t pos, float freq_base,
+               const float* factors = nullptr);
 
 void softmax(float* x, size_t n);
 

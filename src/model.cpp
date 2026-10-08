@@ -509,6 +509,7 @@ bool LlamaModel::load(const GgufFile& file, Error& error, bool dequantize)
         return false;
     }
     const GgufTensor* output = find(file, "output", -1, n_embd, h.n_vocab, false, error);
+    const GgufTensor* rope_freqs = find(file, "rope_freqs", -1, h.n_rot / 2, 0, false, error);
     if (output == nullptr && !error.empty())
     {
         return false;
@@ -595,6 +596,7 @@ bool LlamaModel::load(const GgufFile& file, Error& error, bool dequantize)
 
     m_token_embd = materialize(token_embd);
     m_output_norm = materialize(output_norm).f32();
+    m_rope_factors = rope_freqs != nullptr ? materialize(rope_freqs).f32() : nullptr;
     m_output = output != nullptr ? materialize(output) : m_token_embd;
     for (const LayerTensors& t : layers)
     {

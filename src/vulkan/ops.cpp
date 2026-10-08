@@ -114,7 +114,7 @@ bool VulkanKernels::init(VulkanDevice& device, Error& error)
         !device.create_pipeline(spv_embed_q8_0, spv_embed_q8_0_words, 4, 2 * 4, m_embed_q8_0, error) ||
         !device.create_pipeline(spv_embed_f32, spv_embed_f32_words, 3, 1 * 4, m_embed_f32, error) ||
         !device.create_pipeline(spv_rms_norm, spv_rms_norm_words, 3, 2 * 4, m_rms_norm, error) ||
-        !device.create_pipeline(spv_rope, spv_rope_words, 1, 5 * 4, m_rope, error) ||
+        !device.create_pipeline(spv_rope, spv_rope_words, 2, 6 * 4, m_rope, error) ||
         !device.create_pipeline(spv_kv_store, spv_kv_store_words, 4, 5 * 4, m_kv_store, error) ||
         !device.create_pipeline(spv_attention, spv_attention_words, 5, 7 * 4, m_attention, error) ||
         !device.create_pipeline(spv_swiglu, spv_swiglu_words, 3, 1 * 4, m_swiglu, error) ||
@@ -189,12 +189,13 @@ bool VulkanKernels::rms_norm(const VulkanBuffer& x, const VulkanBuffer& weight, 
     return m_device->dispatch(m_rms_norm, buffers, 3, push, sizeof(push), n_tokens, 1, 1, error);
 }
 
-bool VulkanKernels::rope(VulkanBuffer& x, uint32_t n_head, uint32_t head_dim, uint32_t n_rot, uint32_t pos0,
-                         float freq_base, uint32_t n_tokens, Error& error)
+bool VulkanKernels::rope(VulkanBuffer& x, const VulkanBuffer& factors, bool has_factors, uint32_t n_head,
+                         uint32_t head_dim, uint32_t n_rot, uint32_t pos0, float freq_base, uint32_t n_tokens,
+                         Error& error)
 {
-    const uint32_t push[5] = {n_head, head_dim, n_rot, pos0, float_bits(freq_base)};
-    const VulkanBuffer* buffers[1] = {&x};
-    return m_device->dispatch(m_rope, buffers, 1, push, sizeof(push), n_tokens, n_head, 1, error);
+    const uint32_t push[6] = {n_head, head_dim, n_rot, pos0, float_bits(freq_base), has_factors ? 1u : 0u};
+    const VulkanBuffer* buffers[2] = {&x, &factors};
+    return m_device->dispatch(m_rope, buffers, 2, push, sizeof(push), n_tokens, n_head, 1, error);
 }
 
 bool VulkanKernels::kv_store(const VulkanBuffer& k, const VulkanBuffer& v, VulkanBuffer& k_cache, VulkanBuffer& v_cache,

@@ -98,8 +98,14 @@ need rope scaling, which the loader still rejects.
 
 ## Tokenizer status
 
-Byte level BPE (`tokenizer.ggml.model` = gpt2) with the `gpt-2`, `phi-2` and
-`smollm` pre-tokenizers, matching llama.cpp token for token.
+Byte level BPE (`tokenizer.ggml.model` = gpt2) with the `gpt-2`, `phi-2`,
+`smollm` and `llama-bpe` pre-tokenizers, matching llama.cpp token for token.
+`llama-bpe` (Llama 3): `split_llama3` mirrors llama.cpp's hand written
+`unicode_regex_split_custom_llama3`; `ignore_merges` (a word whose byte level
+form is a vocabulary token is that token, looked up as the mapped string,
+not the raw bytes); `clean_spaces` on; `add_bos` on unless the file says
+otherwise. Validated on Llama 3.2 1B: 0 mismatches over 39941 cases, 2.69 M
+tokens, the text corpus in /home/user/ref/texts.
 
 - Done: load from GGUF, special token partition, both splitters, BPE merges,
   decode with llama.cpp's clean_spaces passes, unit tests

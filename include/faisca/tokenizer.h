@@ -102,6 +102,7 @@ private:
     {
         Gpt2,
         SmolLm,
+        Llama3,
     };
 
     struct Token
@@ -158,6 +159,7 @@ private:
     bool encode_text(std::string_view text, Array<int32_t>& out);
     bool split_numbers(const Array<uint32_t>& in, Array<uint32_t>& out) const;
     bool split_gpt2(const Array<uint32_t>& in, Array<uint32_t>& out) const;
+    bool split_llama3(const Array<uint32_t>& in, Array<uint32_t>& out) const;
     bool encode_word(const uint32_t* code_points, size_t count, Array<int32_t>& out);
     bool encode_bytes(std::string_view word, Array<int32_t>& out);
     bool encode_short(std::string_view word, Array<int32_t>& out);
@@ -181,6 +183,8 @@ private:
     uint8_t m_ascii_classes[128] = {};
 
     PreTokenizer m_pre = PreTokenizer::Gpt2;
+    bool m_ignore_merges = false;
+    Array<char> m_mapped_word;
     bool m_clean_spaces = false;
     bool m_add_space_prefix = false;
     bool m_add_bos = false;

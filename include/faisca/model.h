@@ -131,6 +131,12 @@ public:
         return m_output_norm;
     }
 
+    // n_rot / 2 frequency factors of Llama 3 style rope scaling, null when the file has none
+    const float* rope_factors() const
+    {
+        return m_rope_factors;
+    }
+
     const Weight& output() const
     {
         return m_output;
@@ -179,6 +185,7 @@ private:
     Array<LlamaLayer> m_layers;
     Weight m_token_embd;
     const float* m_output_norm = nullptr;
+    const float* m_rope_factors = nullptr;
     Weight m_output;
 };
 

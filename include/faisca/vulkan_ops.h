@@ -69,9 +69,10 @@ public:
     bool rms_norm(const VulkanBuffer& x, const VulkanBuffer& weight, VulkanBuffer& y, uint32_t n, uint32_t n_tokens,
                   float eps, Error& error);
 
-    // rotates the first n_rot values of every head of x[t] in place, token t at position pos0 + t
-    bool rope(VulkanBuffer& x, uint32_t n_head, uint32_t head_dim, uint32_t n_rot, uint32_t pos0, float freq_base,
-              uint32_t n_tokens, Error& error);
+    // rotates the first n_rot values of every head of x[t] in place, token t at position pos0 + t;
+    // factors holds n_rot / 2 frequency factors when has_factors is set (any buffer otherwise)
+    bool rope(VulkanBuffer& x, const VulkanBuffer& factors, bool has_factors, uint32_t n_head, uint32_t head_dim,
+              uint32_t n_rot, uint32_t pos0, float freq_base, uint32_t n_tokens, Error& error);
 
     // copies k and v of the batch into the caches at positions pos0 .. of one layer
     bool kv_store(const VulkanBuffer& k, const VulkanBuffer& v, VulkanBuffer& k_cache, VulkanBuffer& v_cache,

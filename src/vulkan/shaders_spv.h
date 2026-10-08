@@ -31,7 +31,7 @@ constexpr size_t spv_matvec_q8_0_words = 911;
 extern const uint32_t spv_rms_norm[];
 constexpr size_t spv_rms_norm_words = 610;
 extern const uint32_t spv_rope[];
-constexpr size_t spv_rope_words = 495;
+constexpr size_t spv_rope_words = 596;
 extern const uint32_t spv_swiglu[];
 constexpr size_t spv_swiglu_words = 336;
 

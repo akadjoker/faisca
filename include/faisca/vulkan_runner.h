@@ -113,6 +113,8 @@ private:
     Matrix m_output;
     bool m_output_tied = true;
     VulkanBuffer m_output_norm;
+    VulkanBuffer m_rope_factors;
+    bool m_has_rope_factors = false;
     Array<Layer> m_layers;
 
     VulkanBuffer m_tokens;

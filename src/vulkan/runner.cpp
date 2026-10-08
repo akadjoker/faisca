@@ -45,7 +45,7 @@ void VulkanRunner::release()
             destroy_matrix(m_output);
         }
         m_output = Matrix();
-        VulkanBuffer* buffers[] = {&m_output_norm, &m_tokens, &m_x, &m_h, &m_q, &m_k, &m_v, &m_attn, &m_gate, &m_up,
+        VulkanBuffer* buffers[] = {&m_output_norm, &m_rope_factors, &m_tokens, &m_x, &m_h, &m_q, &m_k, &m_v, &m_attn, &m_gate, &m_up,
                                    &m_act, &m_logits, &m_k_cache, &m_v_cache, &m_scores};
         for (VulkanBuffer* buffer : buffers)
         {
@@ -241,6 +241,22 @@ bool VulkanRunner::init(VulkanDevice& device, const GgufFile& file, uint32_t n_c
         release();
         return false;
     }
+    const GgufTensor* rope_freqs = file.find_tensor("rope_freqs.weight");
+    m_has_rope_factors = rope_freqs != nullptr;
+    if (rope_freqs != nullptr)
+    {
+        if (rope_freqs->n_dims != 1 || rope_freqs->dims[0] != h.n_rot / 2 || !upload_vector(rope_freqs, m_rope_factors, error))
+        {
+            error.set("rope_freqs.weight must hold %" PRIu32 " float values", h.n_rot / 2);
+            release();
+            return false;
+        }
+    }
+    else if (!device.create_buffer(sizeof(float), m_rope_factors, error))
+    {
+        release();
+        return false;
+    }
     m_output_tied = output == nullptr;
     if (m_output_tied)
     {
@@ -386,8 +402,8 @@ bool VulkanRunner::forward_batch(size_t count, uint32_t pos, float* logits, bool
              trace("attn_norm", il, m_h, h.n_embd, count, error) &&
              matvec(layer.wq, m_h, m_q, n, error) && matvec(layer.wk, m_h, m_k, n, error) &&
              matvec(layer.wv, m_h, m_v, n, error) &&
-             k.rope(m_q, h.n_head, h.head_dim, h.n_rot, pos, h.rope_freq_base, n, error) &&
-             k.rope(m_k, h.n_head_kv, h.head_dim, h.n_rot, pos, h.rope_freq_base, n, error) &&
+             k.rope(m_q, m_rope_factors, m_has_rope_factors, h.n_head, h.head_dim, h.n_rot, pos, h.rope_freq_base, n, error) &&
+             k.rope(m_k, m_rope_factors, m_has_rope_factors, h.n_head_kv, h.head_dim, h.n_rot, pos, h.rope_freq_base, n, error) &&
              k.kv_store(m_k, m_v, m_k_cache, m_v_cache, h.n_head_kv, h.head_dim, m_n_ctx, pos, l, n, error) &&
              trace("Qcur", il, m_q, n_q, count, error) && trace("Kcur", il, m_k, n_kv, count, error) &&
              trace("Vcur", il, m_v, n_kv, count, error) &&

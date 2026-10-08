@@ -286,9 +286,16 @@ bool Tokenizer::load_tokens(const GgufFile& file, Error& error)
         m_pre = PreTokenizer::SmolLm;
         m_clean_spaces = false;
     }
+    else if (pre == "llama-bpe" || pre == "llama3" || pre == "llama-v3")
+    {
+        m_pre = PreTokenizer::Llama3;
+        m_clean_spaces = true;
+        m_ignore_merges = true;
+        m_add_bos = true;
+    }
     else
     {
-        error.set("pre-tokenizer '%.*s' is not supported yet (supported: gpt-2, phi-2, smollm)",
+        error.set("pre-tokenizer '%.*s' is not supported yet (supported: gpt-2, phi-2, smollm, llama-bpe)",
                   static_cast<int>(pre.size()), pre.data());
         return false;
     }
@@ -678,7 +685,7 @@ bool Tokenizer::encode_text(std::string_view text, Array<int32_t>& out)
         }
         m_words.swap(m_words_next);
     }
-    if (!split_gpt2(m_words, m_words_next))
+    if (m_pre == PreTokenizer::Llama3 ? !split_llama3(m_words, m_words_next) : !split_gpt2(m_words, m_words_next))
     {
         return false;
     }
@@ -846,6 +853,145 @@ bool Tokenizer::split_gpt2(const Array<uint32_t>& in, Array<uint32_t>& out) cons
     return true;
 }
 
+// the llama 3 regex, matched the way llama.cpp's unicode_regex_split_custom_llama3 does:
+// (?i:'s|'t|'re|'ve|'m|'ll|'d) | [^\r\n\p{L}\p{N}]?\p{L}+ | \p{N}{1,3} |
+//  ?[^\s\p{L}\p{N}]+[\r\n]* | \s*[\r\n]+ | \s+(?!\S) | \s+
+bool Tokenizer::split_llama3(const Array<uint32_t>& in, Array<uint32_t>& out) const
+{
+    out.clear();
+
+    const uint32_t* code_points = m_code_points.data();
+    const uint8_t* classes = m_classes.data();
+    const uint8_t word_classes = UNICODE_LETTER | UNICODE_NUMBER | UNICODE_WHITESPACE;
+
+    size_t start = 0;
+    for (const uint32_t length : in)
+    {
+        const size_t begin = start;
+        const size_t end = start + length;
+        start = end;
+
+        const auto class_at = [classes, end](size_t pos) -> uint8_t
+        {
+            return pos < end ? classes[pos] : OUT_OF_RANGE;
+        };
+        const auto code_point_at = [code_points, end](size_t pos) -> uint32_t
+        {
+            return pos < end ? code_points[pos] : 0xffffffffu;
+        };
+        const auto lower = [](uint32_t c) -> uint32_t
+        {
+            return c >= 'A' && c <= 'Z' ? c + 32 : c;
+        };
+
+        size_t previous = begin;
+        size_t pos = begin;
+        while (pos < end)
+        {
+            const uint32_t code_point = code_points[pos];
+            const uint8_t type = classes[pos];
+            size_t next = 0;
+
+            if (code_point == '\'' && pos + 1 < end)
+            {
+                const uint32_t a = lower(code_points[pos + 1]);
+                if (a == 's' || a == 't' || a == 'm' || a == 'd')
+                {
+                    next = pos + 2;
+                }
+                else if (pos + 2 < end)
+                {
+                    const uint32_t b = lower(code_points[pos + 2]);
+                    if ((a == 'r' && b == 'e') || (a == 'v' && b == 'e') || (a == 'l' && b == 'l'))
+                    {
+                        next = pos + 3;
+                    }
+                }
+            }
+
+            if (next == 0 && code_point != '\r' && code_point != '\n' && (type & UNICODE_NUMBER) == 0)
+            {
+                if ((type & UNICODE_LETTER) != 0 || (class_at(pos + 1) & UNICODE_LETTER) != 0)
+                {
+                    size_t scan = pos + 1;
+                    while ((class_at(scan) & UNICODE_LETTER) != 0)
+                    {
+                        ++scan;
+                    }
+                    next = scan;
+                }
+            }
+
+            if (next == 0 && (type & UNICODE_NUMBER) != 0)
+            {
+                size_t scan = pos;
+                while ((class_at(scan) & UNICODE_NUMBER) != 0 && scan - pos < 3)
+                {
+                    ++scan;
+                }
+                next = scan;
+            }
+
+            if (next == 0)
+            {
+                const size_t first = pos + (code_point == ' ' ? 1 : 0);
+                if ((class_at(first) & (word_classes | OUT_OF_RANGE)) == 0)
+                {
+                    size_t scan = first;
+                    while ((class_at(scan) & (word_classes | OUT_OF_RANGE)) == 0)
+                    {
+                        ++scan;
+                    }
+                    while (code_point_at(scan) == '\r' || code_point_at(scan) == '\n')
+                    {
+                        ++scan;
+                    }
+                    next = scan;
+                }
+            }
+
+            if (next == 0)
+            {
+                size_t spaces = 0;
+                size_t last_newline_end = 0;
+                while ((class_at(pos + spaces) & UNICODE_WHITESPACE) != 0)
+                {
+                    const uint32_t c = code_points[pos + spaces];
+                    if (c == '\r' || c == '\n')
+                    {
+                        last_newline_end = pos + spaces + 1;
+                    }
+                    ++spaces;
+                }
+                if (last_newline_end > 0)
+                {
+                    next = last_newline_end;
+                }
+                else if (spaces > 1 && pos + spaces < end)
+                {
+                    next = pos + spaces - 1;
+                }
+                else if (spaces > 0)
+                {
+                    next = pos + spaces;
+                }
+                else
+                {
+                    next = pos + 1;
+                }
+            }
+
+            if (!out.push_back(static_cast<uint32_t>(next - previous)))
+            {
+                return false;
+            }
+            previous = next;
+            pos = next;
+        }
+    }
+    return true;
+}
+
 bool Tokenizer::push_bigram(int32_t left, int32_t right)
 {
     if (left < 0 || right < 0)
@@ -952,7 +1098,31 @@ bool Tokenizer::encode_word(const uint32_t* code_points, size_t count, Array<int
     }
 
     const size_t before = out.size();
-    if (!encode_bytes(word, out))
+    // llama.cpp's ignore_merges: a word whose byte level form is a token of the vocabulary is that token
+    uint32_t whole = 0;
+    bool found = false;
+    if (m_ignore_merges)
+    {
+        m_mapped_word.clear();
+        for (size_t i = 0; i < word.size(); ++i)
+        {
+            const std::string_view piece = m_symbols[m_byte_symbol[static_cast<uint8_t>(word[i])]].text;
+            if (!m_mapped_word.append(piece.data(), piece.size()))
+            {
+                return false;
+            }
+        }
+        found = m_symbol_index.find(std::string_view(m_mapped_word.data(), m_mapped_word.size()), whole) &&
+                m_symbols[whole].token >= 0;
+    }
+    if (found)
+    {
+        if (!out.push_back(m_symbols[whole].token))
+        {
+            return false;
+        }
+    }
+    else if (!encode_bytes(word, out))
     {
         return false;
     }

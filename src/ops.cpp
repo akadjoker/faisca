@@ -1879,7 +1879,8 @@ void rms_norm(const float* x, const float* weight, size_t n, float eps, float* o
     }
 }
 
-void rope_norm(float* x, size_t n_head, size_t head_dim, size_t n_rot, uint32_t pos, float freq_base)
+void rope_norm(float* x, size_t n_head, size_t head_dim, size_t n_rot, uint32_t pos, float freq_base,
+               const float* factors)
 {
     const float theta_scale = std::pow(freq_base, -2.0f / static_cast<float>(n_rot));
     for (size_t h = 0; h < n_head; ++h)
@@ -1888,8 +1889,9 @@ void rope_norm(float* x, size_t n_head, size_t head_dim, size_t n_rot, uint32_t 
         float theta = static_cast<float>(pos);
         for (size_t i = 0; i < n_rot; i += 2)
         {
-            const float cos_theta = std::cos(theta);
-            const float sin_theta = std::sin(theta);
+            const float angle = factors != nullptr ? theta / factors[i / 2] : theta;
+            const float cos_theta = std::cos(angle);
+            const float sin_theta = std::sin(angle);
             const float x0 = head[i];
             const float x1 = head[i + 1];
             head[i] = x0 * cos_theta - x1 * sin_theta;

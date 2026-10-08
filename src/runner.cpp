@@ -469,8 +469,9 @@ void Runner::step_rope_store(const LlamaLayer*, uint32_t pos, size_t token)
     const size_t n_q = static_cast<size_t>(h.n_head) * head_dim;
     const uint32_t p = pos + static_cast<uint32_t>(token);
     float* k_cur = m_k_batch.data() + token * n_kv;
-    rope_norm(m_q.data() + token * n_q, h.n_head, head_dim, h.n_rot, p, h.rope_freq_base);
-    rope_norm(k_cur, h.n_head_kv, head_dim, h.n_rot, p, h.rope_freq_base);
+    const float* factors = m_model->rope_factors();
+    rope_norm(m_q.data() + token * n_q, h.n_head, head_dim, h.n_rot, p, h.rope_freq_base, factors);
+    rope_norm(k_cur, h.n_head_kv, head_dim, h.n_rot, p, h.rope_freq_base, factors);
 
     const size_t tiles = (static_cast<size_t>(m_n_ctx) + 15) / 16;
     const size_t layer_offset = static_cast<size_t>(m_layer) * h.n_head_kv * tiles * head_dim * KEY_TILE;

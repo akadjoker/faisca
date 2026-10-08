@@ -785,6 +785,24 @@ void test_rope()
     }
     CHECK(tail_untouched);
     CHECK(head_rotated);
+
+    // frequency factors divide the angle of every pair
+    const float factors[4] = {1.0f, 2.0f, 8.0f, 0.5f};
+    x = original;
+    rope_norm(x.data(), n_head, head_dim, head_dim, 17, 10000.0f, factors);
+    bool factors_ok = true;
+    for (size_t h = 0; h < n_head; ++h)
+    {
+        for (size_t i = 0; i < head_dim; i += 2)
+        {
+            const double theta = 17.0 * std::pow(10000.0, -static_cast<double>(i) / static_cast<double>(head_dim)) / factors[i / 2];
+            const double x0 = original[h * head_dim + i];
+            const double x1 = original[h * head_dim + i + 1];
+            factors_ok = factors_ok && close(x[h * head_dim + i], x0 * std::cos(theta) - x1 * std::sin(theta), 1e-4);
+            factors_ok = factors_ok && close(x[h * head_dim + i + 1], x0 * std::sin(theta) + x1 * std::cos(theta), 1e-4);
+        }
+    }
+    CHECK(factors_ok);
 }
 
 void test_softmax()

@@ -417,7 +417,7 @@ void test_load_errors()
     CHECK_REJECTED(spec, "tokenizer.ggml.pre is missing");
 
     spec = Spec();
-    spec.pre = "llama3";
+    spec.pre = "deepseek-llm";
     CHECK_REJECTED(spec, "not supported yet");
 
     spec = Spec();
