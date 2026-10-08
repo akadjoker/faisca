@@ -33,8 +33,12 @@ top. No third party dependencies. Owner: Luís (akadjoker). "faisca" is a workin
    AMX for the prompt was measured (scratch bench_amx) and set aside: the
    per block float epilogue bounds it at 1.25x over VNNI on the GEMM, about
    10% of the prompt (bench/README.md). Pending: AVX-VNNI (256-bit) kernels
-   for Q5_0 and the K-quants (those types convert to float32 on such builds). Then speculative decoding with SmolLM2-135M as draft;
-   then Vulkan; then the cache format.
+   for Q5_0 and the K-quants (those types convert to float32 on such builds).
+   Speculative decoding with SmolLM2-135M as draft: done (`Speculative`,
+   `--draft`), output identical to plain greedy, gain 1.3 to 1.4x on one
+   thread with a Q4_0 draft and about 1.1x with four, 0.9x at a 512 token
+   context; the draft costs 0.3 to 0.4 of the target per token, which caps
+   it (bench/README.md). Then Vulkan; then the cache format.
 5. Vulkan compute backend (the owner chose Vulkan over CUDA and OpenGL).
 6. Own cache format with offset tables, KV cache kept between turns and saved to
    disk, longest common prefix reuse, snapshots.
@@ -152,6 +156,20 @@ identical. No rope scaling, no biases, no MoE yet: rejected with an error.
   131 GMAC/s at 2.1 GHz). swiglu now differs from std::exp by a few ulp, so
   dumps changed; the float32 path against llama.cpp is 4.1e-6 (was 4.5e-6)
   and Q8_0 keeps the same 16 tokens as llama.cpp.
+- Speculative decoding: `Runner::truncate(pos)`, `forward(..., all_logits)`
+  (count rows of logits) and `init(model, n_ctx, ThreadPool&, ...)` so two
+  runners share one pool (two pools spinning on four cores cut the speed to
+  a tenth). `Speculative::round(last, out)`: the draft catches up with the
+  tokens the target kept (m_tokens by position), proposes n_draft tokens,
+  the target checks them in one pass, kept = longest agreeing prefix, out
+  gets the kept proposals plus the target's token at the first disagreement.
+  Draft files: /home/user/models/draft/ (bartowski Q8_0 and f16, the f32 copy,
+  and q4_0-pure made with llama-quantize; the community Q4_0 mixes Q4_1).
+  The draft on our runner is at 1.6e-6 from llama.cpp in float32 and 1.7e-2
+  in Q8_0, 16 tokens identical. Costs behind the gain: target token 25 ms
+  (1 thread), K + 1 token pass 29 to 52 ms, draft token 10.8 (Q8_0) / 7
+  (Q4_0) ms; with 4 threads the draft (86 to 136 MiB, in L3) is bound by
+  the ~450 fork/join tasks per token.
 - Reference tools: `tests/reference/llama_layer_dump.cpp` and
   `tests/matmul_check.cpp` (see README). Q4_0 and Q4_K_M files of SmolLM2 were
   made with llama-quantize from the float32 copy; the Q4_K_M one is mostly

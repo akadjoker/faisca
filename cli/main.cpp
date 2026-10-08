@@ -2,6 +2,7 @@
 #include "faisca/model.h"
 #include "faisca/ops.h"
 #include "faisca/runner.h"
+#include "faisca/speculative.h"
 #include "faisca/tokenizer.h"
 
 #include <chrono>
@@ -26,6 +27,7 @@ void print_usage()
         "usage:\n"
         "  faisca info <model.gguf> [--meta] [--tensors]\n"
         "  faisca generate <model.gguf> -p <prompt> [-n <tokens>] [-c <context>] [-t <threads>] [--raw] [--f32] [--kv-f32]\n"
+        "                                [--draft <draft.gguf>] [--draft-n <tokens>]\n"
         "  faisca version\n"
         "\n"
         "info options:\n"
@@ -39,7 +41,9 @@ void print_usage()
         "  -t <count>  threads (default 1)\n"
         "  --raw       feed the prompt as is\n"
         "  --f32       convert the weights to float32 at load instead of computing on Q8_0\n"
-        "  --kv-f32    keep the KV cache in float32 instead of f16\n",
+        "  --kv-f32    keep the KV cache in float32 instead of f16\n"
+        "  --draft     a smaller model of the same vocabulary that proposes tokens (speculative decoding)\n"
+        "  --draft-n   tokens proposed per round, default 3\n",
         FAISCA_VERSION);
 }
 
@@ -444,6 +448,8 @@ int command_generate(int argc, char** argv)
     bool dequantize = false;
     bool kv_f16 = true;
     int threads = 1;
+    const char* draft_path = nullptr;
+    int draft_n = 3;
 
     for (int i = 2; i < argc; ++i)
     {
@@ -475,6 +481,14 @@ int command_generate(int argc, char** argv)
         {
             kv_f16 = false;
         }
+        else if (std::strcmp(argv[i], "--draft") == 0 && i + 1 < argc)
+        {
+            draft_path = argv[++i];
+        }
+        else if (std::strcmp(argv[i], "--draft-n") == 0 && i + 1 < argc)
+        {
+            draft_n = std::atoi(argv[++i]);
+        }
         else if (argv[i][0] == '-' && argv[i][1] != '\0')
         {
             std::fprintf(stderr, "faisca: unknown option '%s'\n", argv[i]);
@@ -496,9 +510,9 @@ int command_generate(int argc, char** argv)
         std::fprintf(stderr, "faisca: generate needs a model file and -p <prompt>\n");
         return 2;
     }
-    if (count < 1 || context < 1 || context > 0x7fffffffL)
+    if (count < 1 || context < 1 || context > 0x7fffffffL || draft_n < 1)
     {
-        std::fprintf(stderr, "faisca: -n and -c must be positive\n");
+        std::fprintf(stderr, "faisca: -n, -c and --draft-n must be positive\n");
         return 2;
     }
 
@@ -506,11 +520,24 @@ int command_generate(int argc, char** argv)
     GgufFile file;
     Tokenizer tokenizer;
     LlamaModel model;
+    ThreadPool pool;
     Runner runner;
 
     const auto load_start = std::chrono::steady_clock::now();
     if (!file.open(path, error) || !tokenizer.load(file, error) || !model.load(file, error, dequantize) ||
-        !runner.init(model, static_cast<uint32_t>(context), threads, error, kv_f16))
+        !pool.start(threads, error) || !runner.init(model, static_cast<uint32_t>(context), pool, error, kv_f16))
+    {
+        std::fprintf(stderr, "faisca: %s\n", error.c_str());
+        return 1;
+    }
+    GgufFile draft_file;
+    LlamaModel draft_model;
+    Runner draft_runner;
+    Speculative speculative;
+    if (draft_path != nullptr &&
+        (!draft_file.open(draft_path, error) || !draft_model.load(draft_file, error, dequantize) ||
+         !draft_runner.init(draft_model, static_cast<uint32_t>(context), pool, error, kv_f16) ||
+         !speculative.init(runner, draft_runner, static_cast<size_t>(draft_n), error)))
     {
         std::fprintf(stderr, "faisca: %s\n", error.c_str());
         return 1;
@@ -543,8 +570,11 @@ int command_generate(int argc, char** argv)
     }
 
     Array<float> logits;
+    Array<int32_t> pending;
+    int32_t best = 0;
     const auto prompt_start = std::chrono::steady_clock::now();
-    if (!runner.forward(tokens.data(), tokens.size(), logits, error))
+    if (draft_path != nullptr ? !speculative.prompt(tokens.data(), tokens.size(), best, error)
+                              : !runner.forward(tokens.data(), tokens.size(), logits, error))
     {
         std::fprintf(stderr, "faisca: %s\n", error.c_str());
         return 1;
@@ -554,15 +584,34 @@ int command_generate(int argc, char** argv)
     const auto generate_start = std::chrono::steady_clock::now();
     Array<char> piece;
     int generated = 0;
+    size_t next_pending = 0;
     for (; generated < count; ++generated)
     {
-        int32_t best = 0;
-        for (size_t t = 1; t < logits.size(); ++t)
+        if (draft_path == nullptr)
         {
-            if (logits[t] > logits[static_cast<size_t>(best)])
+            best = 0;
+            for (size_t t = 1; t < logits.size(); ++t)
             {
-                best = static_cast<int32_t>(t);
+                if (logits[t] > logits[static_cast<size_t>(best)])
+                {
+                    best = static_cast<int32_t>(t);
+                }
             }
+        }
+        else if (generated > 0)
+        {
+            // best was produced by the target; the rounds queue the tokens after it
+            if (next_pending == pending.size())
+            {
+                pending.clear();
+                next_pending = 0;
+                if (!speculative.round(best, pending, error))
+                {
+                    std::fprintf(stderr, "\nfaisca: %s\n", error.c_str());
+                    return 1;
+                }
+            }
+            best = pending[next_pending++];
         }
         if (best == tokenizer.eos() || tokenizer.token_type(best) == TokenType::Control)
         {
@@ -574,7 +623,7 @@ int command_generate(int argc, char** argv)
         std::fwrite(piece.data(), 1, piece.size(), stdout);
         std::fflush(stdout);
 
-        if (generated + 1 < count && !runner.forward(&best, 1, logits, error))
+        if (draft_path == nullptr && generated + 1 < count && !runner.forward(&best, 1, logits, error))
         {
             std::fprintf(stderr, "\nfaisca: %s\n", error.c_str());
             return 1;
@@ -589,6 +638,12 @@ int command_generate(int argc, char** argv)
                  simd_name(), runner.threads(), model.weight_bytes() >> 20, load_seconds, tokens.size(), prompt_seconds,
                  static_cast<double>(tokens.size()) / prompt_seconds, generated, generate_seconds,
                  generated > 0 ? static_cast<double>(generated) / generate_seconds : 0.0);
+    if (draft_path != nullptr)
+    {
+        std::fprintf(stderr, "draft: %zu rounds, %zu tokens proposed, %zu accepted (%.0f%%)\n", speculative.rounds(),
+                     speculative.drafted(), speculative.accepted(),
+                     speculative.drafted() > 0 ? 100.0 * static_cast<double>(speculative.accepted()) / static_cast<double>(speculative.drafted()) : 0.0);
+    }
     return 0;
 }
 

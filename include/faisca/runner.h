@@ -32,11 +32,20 @@ public:
 
     bool init(const LlamaModel& model, uint32_t n_ctx, int n_threads, Error& error, bool kv_f16 = true);
 
+    // the same over a thread pool shared with other runners that never run at the same time
+    bool init(const LlamaModel& model, uint32_t n_ctx, ThreadPool& pool, Error& error, bool kv_f16 = true);
+
     void release();
 
     void reset()
     {
         m_pos = 0;
+    }
+
+    // forgets every position from pos on, so the next tokens overwrite them
+    void truncate(uint32_t pos)
+    {
+        m_pos = pos < m_pos ? pos : m_pos;
     }
 
     uint32_t position() const
@@ -51,7 +60,7 @@ public:
 
     int threads() const
     {
-        return m_pool.size();
+        return m_pool->size();
     }
 
     bool kv_f16() const
@@ -75,8 +84,9 @@ public:
         m_trace_user = user;
     }
 
-    // feeds count tokens after the current position; logits gets n_vocab values for the last one
-    bool forward(const int32_t* tokens, size_t count, Array<float>& logits, Error& error);
+    // feeds count tokens after the current position; logits gets n_vocab values for the last
+    // one, or count rows of n_vocab when all_logits is set
+    bool forward(const int32_t* tokens, size_t count, Array<float>& logits, Error& error, bool all_logits = false);
 
 private:
     struct MatmulJob;
@@ -100,7 +110,8 @@ private:
     size_t m_quantize_stride = 0;
     size_t m_quantize_tokens = 0;
 
-    void forward_batch(const int32_t* tokens, size_t count, uint32_t pos, float* logits);
+    bool init_buffers(const LlamaModel& model, uint32_t n_ctx, bool kv_f16, Error& error);
+    void forward_batch(const int32_t* tokens, size_t count, uint32_t pos, float* logits, bool all_logits);
     void quantize_inputs(const float* x, size_t stride, size_t n_tokens, size_t n, Activation kind);
     void matmul(const Weight& w, const float* x, size_t x_stride, size_t n_tokens, float* out, size_t out_stride);
     void attention(const LlamaLayer& layer, int il, uint32_t pos, size_t n_tokens);
@@ -111,7 +122,8 @@ private:
     static void attention_task(void* user, int thread_index, int thread_count);
 
     const LlamaModel* m_model = nullptr;
-    ThreadPool m_pool;
+    ThreadPool m_own_pool;
+    ThreadPool* m_pool = &m_own_pool;
     uint32_t m_n_ctx = 0;
     uint32_t m_pos = 0;
     bool m_kv_f16 = true;

@@ -48,6 +48,7 @@ add_library(faisca_lib STATIC
     src/model.cpp
     src/ops.cpp
     src/runner.cpp
+    src/speculative.cpp
     src/thread.cpp
     src/tokenizer.cpp
     src/unicode.cpp
@@ -94,6 +95,9 @@ if(FAISCA_BUILD_TESTS)
 
     add_executable(matmul_check tests/matmul_check.cpp)
     target_link_libraries(matmul_check PRIVATE faisca_lib)
+
+    add_executable(speculative_check tests/speculative_check.cpp)
+    target_link_libraries(speculative_check PRIVATE faisca_lib)
     target_compile_options(matmul_check PRIVATE ${FAISCA_WARNINGS})
 
     add_executable(gguf_dump tests/gguf_dump.cpp)

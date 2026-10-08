@@ -234,6 +234,42 @@ AVX-512 (bit identical bytes: the same product rounded to nearest even)
 take 0.11 s. The products are bound by one 512-bit `vpdpbusd` per cycle, 64
 multiply adds, 131 GMAC/s at 2.1 GHz.
 
+**Speculative decoding with SmolLM2-135M as draft.** Measured with
+`speculative_check` (SmolLM2-360M Q8_0 target, chat prompt of 16 tokens, 64
+generated unless said otherwise; the sequences are identical to plain greedy
+decoding in every run):
+
+| draft | threads | tokens per round | plain tok/s | speculative tok/s | gain |
+| --- | --- | --- | --- | --- | --- |
+| 135M Q8_0 | 1 | 1 | 34.1 | 41.0 | 1.20x |
+| 135M Q8_0 | 1 | 4 | 32.1 | 37.9 | 1.18x |
+| 135M Q8_0 | 1 | 8 | 34.5 | 25.6 | 0.74x |
+| 135M Q8_0 | 4 | 2 | 102 | 107 | 1.05x |
+| 135M Q4_0 | 1 | 2 | 35.6 | 45.7 | 1.28x |
+| 135M Q4_0 | 1 | 3 | 36.3 | 50.7 | 1.39x |
+| 135M Q4_0 | 1 | 4 | 34.8 | 47.2 | 1.36x |
+| 135M Q4_0 | 4 | 1 | 109 | 127 | 1.16x |
+| 135M Q4_0 | 4 | 3 | 112 | 127 | 1.13x |
+| 135M Q4_0 | 4 | 3, 128 tokens | 114 | 117 | 1.02x |
+| 135M Q4_0 | 1 | 3, prompt of 512 | 29.2 | 32.0 | 1.09x |
+| 135M Q4_0 | 4 | 3, prompt of 512 | 101 | 94 | 0.92x |
+
+Acceptance runs from 83% with one proposal per round to 48% with eight; 59
+to 65% at the longer prompt and generation. The costs behind the table, one
+thread: a target token 25 ms, a target pass over K + 1 tokens with all the
+logits 29, 34, 43, 52 ms for K = 1, 2, 4, 6 (about 4.5 ms per extra token,
+compute), a draft token 10.8 ms in Q8_0 (136 MiB, 0.43 of the target) and
+about 7 in Q4_0. With four threads the target token takes 9 ms and the
+draft 2.5, but the draft is then bound by the fork and join of its 450
+small tasks per token, not by its 86 MiB, so the gain shrinks. The draft is
+too close to the target in cost for a large gain: the method pays off with
+a draft ten times smaller, or when the target is bound by memory and the
+draft fits in cache. The Q4_0 draft was made with llama-quantize from the
+float32 copy of the f16 file; the community Q4_0 file mixes Q4_1, which the
+loader does not read. Note for whoever measures this: two runners with two
+thread pools of four threads on four cores spin against each other and the
+numbers collapse to a tenth; the runners must share one pool.
+
 **AMX for the prompt, measured and set aside.** The tile unit itself is fast
 (`tdpbsud` 16 x 16 x 32 in 6 ns, 1.3 TMAC/s), but Q8_0 has a scale per block
 of 32, so every block needs its int32 tile stored and scaled in float32 for

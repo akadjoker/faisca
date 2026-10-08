@@ -50,6 +50,9 @@ faisca generate model.gguf -p "What is the capital of France?" -n 64 -t 4
 that), decodes greedily and prints the tokens as they come, then the timings.
 `-t` sets the threads, `--f32` converts the weights to float32 at load (the
 validation path), `--kv-f32` keeps the KV cache in float32 instead of f16.
+`--draft <small.gguf>` turns on speculative decoding with a smaller model of
+the same vocabulary (`--draft-n` tokens per round, default 3); the output is
+the same, only the speed changes, see bench/README.md for when it helps.
 SmolLM2-360M on a 2.1 GHz Xeon, 4 threads: 98 tokens per second from Q8_0,
 about 150 from Q4_0, 118 from Q4_K_M, prompts at 550 to 600 tokens per
 second (bench/README.md has the table against llama.cpp).
@@ -142,6 +145,14 @@ token step is computed whole by one thread, so the output is bit identical
 for any thread count. The prompt is processed in batches; generation reuses
 the same kernels one token at a time.
 
+`Speculative` (include/faisca/speculative.h) runs greedy speculative decoding
+over two runners sharing one thread pool (`Runner::init` with a
+`ThreadPool&`): the draft proposes `n_draft` tokens one at a time, the target
+checks them in one batched pass (`Runner::forward` with all logits) and keeps
+the longest agreeing prefix plus one token of its own, then both caches are
+cut back with `Runner::truncate`. The tokens are exactly those of greedy
+decoding with the target alone, which `tests/speculative_check` verifies.
+
 `GgufFile` is a plain value object: no smart pointers, no heap allocation for
 the object itself. The reader never copies or decodes anything up front.
 Strings, arrays and tensors are views into the mapping and stay valid until the
@@ -231,6 +242,11 @@ python3 tests/compare_with_gguf_py.py build/gguf_dump model.gguf
   dequantization of Q8_0, Q5_0, Q4_K and Q6_K matches it. The Q4_K_M model
   computed in float32 on both sides: 386 tensors, worst 3.3e-6, 16 tokens
   identical.
+- `speculative_check`: generates N tokens greedily with the target alone and
+  then with a draft, checks that the sequences are identical and prints the
+  acceptance rate and both speeds. Identical in every run so far (SmolLM2-360M
+  Q8_0 with SmolLM2-135M in Q8_0 and Q4_0, prompts of 16 and 512 tokens, 32
+  to 128 generated, 1 and 4 threads, under ASan too).
 - `matmul_check`: the quantized kernels on their own. It feeds every matrix of
   every block with the exact input llama.cpp computed (from a
   `llama_layer_dump` of the quantized model) and compares the products. On

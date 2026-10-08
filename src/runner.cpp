@@ -39,7 +39,11 @@ struct Runner::TokenJob
 
 void Runner::release()
 {
-    m_pool.stop();
+    if (m_pool == &m_own_pool)
+    {
+        m_own_pool.stop();
+    }
+    m_pool = &m_own_pool;
     m_model = nullptr;
     m_n_ctx = 0;
     m_pos = 0;
@@ -68,18 +72,37 @@ void Runner::release()
 bool Runner::init(const LlamaModel& model, uint32_t n_ctx, int n_threads, Error& error, bool kv_f16)
 {
     release();
+    if (!m_own_pool.start(n_threads, error))
+    {
+        return false;
+    }
+    return init_buffers(model, n_ctx, kv_f16, error);
+}
+
+bool Runner::init(const LlamaModel& model, uint32_t n_ctx, ThreadPool& pool, Error& error, bool kv_f16)
+{
+    release();
+    if (pool.size() < 1)
+    {
+        error.set("the shared thread pool is not started");
+        return false;
+    }
+    m_pool = &pool;
+    return init_buffers(model, n_ctx, kv_f16, error);
+}
+
+bool Runner::init_buffers(const LlamaModel& model, uint32_t n_ctx, bool kv_f16, Error& error)
+{
     if (!model.is_loaded())
     {
         error.set("the model is not loaded");
+        release();
         return false;
     }
     if (n_ctx == 0)
     {
         error.set("the context size must be at least 1");
-        return false;
-    }
-    if (!m_pool.start(n_threads, error))
-    {
+        release();
         return false;
     }
 
@@ -98,7 +121,7 @@ bool Runner::init(const LlamaModel& model, uint32_t n_ctx, int n_threads, Error&
     const size_t q8_k_row = (widest / Q8_K_BLOCK) * Q8_K_BLOCK_BYTES;
     m_xq_stride = q8_0_row > q8_k_row ? q8_0_row : q8_k_row;
     m_sums_stride = widest / 16;
-    const size_t threads = static_cast<size_t>(m_pool.size());
+    const size_t threads = static_cast<size_t>(m_pool->size());
     const size_t scores = (static_cast<size_t>(n_ctx) + 15) / 16 * 16;
     const size_t k_cache = static_cast<size_t>(h.n_layer) * h.n_head_kv * (scores * h.head_dim);
     const size_t element = kv_f16 ? sizeof(uint16_t) : sizeof(float);
@@ -137,7 +160,7 @@ bool Runner::init(const LlamaModel& model, uint32_t n_ctx, int n_threads, Error&
     return true;
 }
 
-bool Runner::forward(const int32_t* tokens, size_t count, Array<float>& logits, Error& error)
+bool Runner::forward(const int32_t* tokens, size_t count, Array<float>& logits, Error& error, bool all_logits)
 {
     if (m_model == nullptr)
     {
@@ -164,12 +187,12 @@ bool Runner::forward(const int32_t* tokens, size_t count, Array<float>& logits, 
             return false;
         }
     }
-    if (!logits.resize_uninitialized(h.n_vocab))
+    if (!logits.resize_uninitialized(all_logits ? count * h.n_vocab : h.n_vocab))
     {
         error.set("out of memory");
         return false;
     }
-    if (m_trace != nullptr && !m_logits.resize_uninitialized(BATCH * h.n_vocab))
+    if (m_trace != nullptr && !all_logits && !m_logits.resize_uninitialized(BATCH * h.n_vocab))
     {
         error.set("out of memory");
         return false;
@@ -178,7 +201,7 @@ bool Runner::forward(const int32_t* tokens, size_t count, Array<float>& logits, 
     for (size_t done = 0; done < count;)
     {
         const size_t batch = count - done < BATCH ? count - done : BATCH;
-        forward_batch(tokens + done, batch, m_pos, logits.data());
+        forward_batch(tokens + done, batch, m_pos, logits.data() + (all_logits ? done * h.n_vocab : 0), all_logits);
         m_pos += static_cast<uint32_t>(batch);
         done += batch;
     }
@@ -228,7 +251,7 @@ void Runner::quantize_inputs(const float* x, size_t stride, size_t n_tokens, siz
     m_quantize_tokens = n_tokens;
     m_quantize_n = n;
     m_quantize_kind = kind;
-    m_pool.run(quantize_task, this);
+    m_pool->run(quantize_task, this);
 }
 
 void Runner::token_task(void* user, int thread_index, int thread_count)
@@ -245,7 +268,7 @@ void Runner::token_task(void* user, int thread_index, int thread_count)
 void Runner::for_tokens(TokenStep step, const LlamaLayer* layer, uint32_t pos, size_t n_tokens)
 {
     TokenJob job{this, step, layer, pos, n_tokens};
-    m_pool.run(token_task, &job);
+    m_pool->run(token_task, &job);
 }
 
 void Runner::step_attn_norm(const LlamaLayer* layer, uint32_t, size_t token)
@@ -305,7 +328,7 @@ void Runner::matmul(const Weight& w, const float* x, size_t x_stride, size_t n_t
         quantize_inputs(x, x_stride, n_tokens, w.n_in, w.activation());
     }
     MatmulJob job{this, &w, x, x_stride, n_tokens, out, out_stride};
-    m_pool.run(matmul_task, &job);
+    m_pool->run(matmul_task, &job);
 }
 
 void Runner::attention_task(void* user, int thread_index, int thread_count)
@@ -401,13 +424,13 @@ void Runner::attention(const LlamaLayer& layer, int il, uint32_t pos, size_t n_t
     trace_rows("Vcur", il, v_cur, n_kv, n_tokens, n_kv);
 
     AttentionJob job{this, il, pos, n_tokens};
-    m_pool.run(attention_task, &job);
+    m_pool->run(attention_task, &job);
 
     matmul(layer.wo, m_attn.data(), n_q, n_tokens, m_h.data(), h.n_embd);
     trace_rows("attn_out", il, m_h.data(), h.n_embd, n_tokens, h.n_embd);
 }
 
-void Runner::forward_batch(const int32_t* tokens, size_t count, uint32_t pos, float* logits)
+void Runner::forward_batch(const int32_t* tokens, size_t count, uint32_t pos, float* logits, bool all_logits)
 {
     const LlamaHparams& h = m_model->hparams();
     const size_t n_embd = h.n_embd;
@@ -444,13 +467,17 @@ void Runner::forward_batch(const int32_t* tokens, size_t count, uint32_t pos, fl
         trace_rows("l_out", il, m_x.data(), n_embd, count, n_embd);
     }
 
-    if (m_trace != nullptr)
+    if (m_trace != nullptr || all_logits)
     {
+        float* rows = all_logits ? logits : m_logits.data();
         for_tokens(&Runner::step_output_norm, nullptr, pos, count);
         trace_rows("result_norm", -1, m_h.data(), n_embd, count, n_embd);
-        matmul(m_model->output(), m_h.data(), n_embd, count, m_logits.data(), h.n_vocab);
-        trace_rows("result_output", -1, m_logits.data(), h.n_vocab, count, h.n_vocab);
-        std::memcpy(logits, m_logits.data() + (count - 1) * h.n_vocab, h.n_vocab * sizeof(float));
+        matmul(m_model->output(), m_h.data(), n_embd, count, rows, h.n_vocab);
+        trace_rows("result_output", -1, rows, h.n_vocab, count, h.n_vocab);
+        if (!all_logits)
+        {
+            std::memcpy(logits, rows + (count - 1) * h.n_vocab, h.n_vocab * sizeof(float));
+        }
         return;
     }
 
