@@ -133,7 +133,9 @@ int main(int argc, char** argv)
         return 1;
     }
 #endif
-    if (!vulkan && (!model.load(file, error, dequantize) || !runner.init(model, n_ctx, threads, error, kv_f16)))
+    faisca::ThreadPool pool;
+    if (!vulkan && (!pool.start(threads, error) || !model.load(file, error, dequantize, &pool) ||
+                    !runner.init(model, n_ctx, pool, error, kv_f16)))
     {
         std::fprintf(stderr, "runner_dump: %s\n", error.c_str());
         return 1;

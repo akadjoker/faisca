@@ -63,8 +63,9 @@ the same, only the speed changes, see bench/README.md for when it helps.
 SmolLM2-360M on a 2.1 GHz Xeon, 4 threads: 98 tokens per second from Q8_0,
 about 150 from Q4_0, 118 from Q4_K_M, prompts at 550 to 600 tokens per
 second; SmolLM2-1.7B Q4_K_M: 28 tokens per second, prompts at 125;
-Llama 3.2 1B Q8_0: 25 tokens per second, prompts at 180 (bench/README.md
-has the tables against llama.cpp). The chat template follows the
+Llama 3.2 1B Q8_0: 31 to 37 tokens per second, prompts at 250
+(bench/README.md has the tables against llama.cpp). The quantized weights
+are packed into the kernels' layout by all threads at load. The chat template follows the
 vocabulary: ChatML for SmolLM2, the header tokens for Llama 3.
 
 ## Library

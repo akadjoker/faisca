@@ -368,24 +368,9 @@ Weight LlamaModel::materialize(const GgufTensor* tensor)
         weight.type = tensor->type;
         weight.packed = true;
         weight.data = m_packed + m_packed_used;
-        switch (tensor->type)
-        {
-            case GgmlType::Q4_0:
-                pack_q4_0(tensor->data, weight.n_in, weight.n_out, m_packed + m_packed_used);
-                break;
-            case GgmlType::Q5_0:
-                pack_q5_0(tensor->data, weight.n_in, weight.n_out, m_packed + m_packed_used);
-                break;
-            case GgmlType::Q4_K:
-                pack_q4_k(tensor->data, weight.n_in, weight.n_out, m_packed + m_packed_used);
-                break;
-            case GgmlType::Q6_K:
-                pack_q6_k(tensor->data, weight.n_in, weight.n_out, m_packed + m_packed_used);
-                break;
-            default:
-                pack_q8_0(tensor->data, weight.n_in, weight.n_out, m_packed + m_packed_used);
-                break;
-        }
+        // packed later, by every thread of the pool at once
+        const PackJob job = {tensor, m_packed + m_packed_used};
+        m_pack_jobs.push_back_unchecked(job);
         m_packed_used += packed_bytes(tensor);
         return weight;
     }
@@ -435,6 +420,60 @@ Weight LlamaModel::materialize(const GgufTensor* tensor)
     return weight;
 }
 
+// rows [first_row, first_row + rows) of a tensor into their packed group blocks; rows
+// is a multiple of 16 except for the tail of the tensor, so group blocks never straddle
+void LlamaModel::pack_rows(const GgufTensor* tensor, size_t first_row, size_t rows, uint8_t* out) const
+{
+    const size_t n_in = static_cast<size_t>(tensor->dims[0]);
+    Weight shape;
+    shape.type = tensor->type;
+    shape.n_in = n_in;
+    shape.n_out = rows;
+    const uint8_t* source = tensor->data + first_row * shape.row_bytes();
+    switch (tensor->type)
+    {
+        case GgmlType::Q4_0:
+            pack_q4_0(source, n_in, rows, out);
+            break;
+        case GgmlType::Q5_0:
+            pack_q5_0(source, n_in, rows, out);
+            break;
+        case GgmlType::Q4_K:
+            pack_q4_k(source, n_in, rows, out);
+            break;
+        case GgmlType::Q6_K:
+            pack_q6_k(source, n_in, rows, out);
+            break;
+        default:
+            pack_q8_0(source, n_in, rows, out);
+            break;
+    }
+}
+
+void LlamaModel::pack_task(void* user, int thread_index, int thread_count)
+{
+    const LlamaModel& model = *static_cast<const LlamaModel*>(user);
+    constexpr size_t CHUNK_ROWS = 1024;
+    size_t chunk = 0;
+    for (size_t j = 0; j < model.m_pack_jobs.size(); ++j)
+    {
+        const PackJob& job = model.m_pack_jobs[j];
+        const size_t n_in = static_cast<size_t>(job.tensor->dims[0]);
+        const size_t n_out = static_cast<size_t>(job.tensor->dims[1]);
+        const size_t group_bytes = model.packed_bytes(job.tensor) / (q8_0_padded_rows(n_out) / Q8_0_GROUP);
+        for (size_t first = 0; first < n_out; first += CHUNK_ROWS, ++chunk)
+        {
+            if (chunk % static_cast<size_t>(thread_count) != static_cast<size_t>(thread_index))
+            {
+                continue;
+            }
+            const size_t rows = n_out - first < CHUNK_ROWS ? n_out - first : CHUNK_ROWS;
+            model.pack_rows(job.tensor, first, rows, job.out + (first / Q8_0_GROUP) * group_bytes);
+        }
+        (void)n_in;
+    }
+}
+
 bool LlamaModel::packs(GgmlType type) const
 {
     switch (type)
@@ -481,9 +520,10 @@ bool LlamaModel::read_hparams(const GgufFile& file, LlamaHparams& out, Error& er
     return true;
 }
 
-bool LlamaModel::load(const GgufFile& file, Error& error, bool dequantize)
+bool LlamaModel::load(const GgufFile& file, Error& error, bool dequantize, ThreadPool* pool)
 {
     release();
+    m_pack_jobs.clear();
     m_dequantize = dequantize;
     m_pack = !dequantize && q8_0_packed_supported();
     m_pack_k = !dequantize && k_quants_packed_supported();
@@ -561,11 +601,13 @@ bool LlamaModel::load(const GgufFile& file, Error& error, bool dequantize)
     if (m_pack || m_pack_k)
     {
         size_t packed_bytes = 0;
-        const auto count_packed = [this, &packed_bytes](const GgufTensor* tensor)
+        size_t packed_count = 0;
+        const auto count_packed = [this, &packed_bytes, &packed_count](const GgufTensor* tensor)
         {
             if (tensor != nullptr && packs(tensor->type))
             {
                 packed_bytes += this->packed_bytes(tensor);
+                ++packed_count;
             }
         };
         count_packed(token_embd);
@@ -576,6 +618,11 @@ bool LlamaModel::load(const GgufFile& file, Error& error, bool dequantize)
             {
                 count_packed(tensor);
             }
+        }
+        if (packed_bytes != 0 && !m_pack_jobs.reserve(packed_count))
+        {
+            error.set("out of memory");
+            return false;
         }
         if (packed_bytes != 0)
         {
@@ -611,6 +658,18 @@ bool LlamaModel::load(const GgufFile& file, Error& error, bool dequantize)
         layer.ffn_up = materialize(t.tensors[7]);
         layer.ffn_down = materialize(t.tensors[8]);
         m_layers.push_back_unchecked(layer);
+    }
+    if (!m_pack_jobs.empty())
+    {
+        if (pool != nullptr && pool->size() > 1)
+        {
+            pool->run(pack_task, this);
+        }
+        else
+        {
+            pack_task(this, 0, 1);
+        }
+        m_pack_jobs.clear();
     }
     return true;
 }

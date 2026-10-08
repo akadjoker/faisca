@@ -3,6 +3,7 @@
 #include "faisca/array.h"
 #include "faisca/error.h"
 #include "faisca/gguf.h"
+#include "faisca/thread.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -104,7 +105,8 @@ public:
     LlamaModel(const LlamaModel&) = delete;
     LlamaModel& operator=(const LlamaModel&) = delete;
 
-    bool load(const GgufFile& file, Error& error, bool dequantize = false);
+    // pool, when given, packs the quantized weights with its threads (the result is the same)
+    bool load(const GgufFile& file, Error& error, bool dequantize = false, ThreadPool* pool = nullptr);
 
     // the hyperparameters alone, for runners that keep the weights elsewhere
     static bool read_hparams(const GgufFile& file, LlamaHparams& out, Error& error);
@@ -173,6 +175,15 @@ private:
     Weight materialize(const GgufTensor* tensor);
     bool packs(GgmlType type) const;
     size_t packed_bytes(const GgufTensor* tensor) const;
+
+    struct PackJob
+    {
+        const GgufTensor* tensor;
+        uint8_t* out;
+    };
+    static void pack_task(void* user, int thread_index, int thread_count);
+    void pack_rows(const GgufTensor* tensor, size_t first_row, size_t rows, uint8_t* out) const;
+    Array<PackJob> m_pack_jobs;
 
     LlamaHparams m_hparams;
     bool m_dequantize = false;

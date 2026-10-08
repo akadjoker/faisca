@@ -588,7 +588,7 @@ int command_generate(int argc, char** argv)
         return 1;
     }
 #endif
-    if (!vulkan && (!model.load(file, error, dequantize) || !pool.start(threads, error) ||
+    if (!vulkan && (!pool.start(threads, error) || !model.load(file, error, dequantize, &pool) ||
                     !runner.init(model, static_cast<uint32_t>(context), pool, error, kv_f16)))
     {
         std::fprintf(stderr, "faisca: %s\n", error.c_str());
@@ -609,7 +609,7 @@ int command_generate(int argc, char** argv)
     Runner draft_runner;
     Speculative speculative;
     if (draft_path != nullptr &&
-        (!draft_file.open(draft_path, error) || !draft_model.load(draft_file, error, dequantize) ||
+        (!draft_file.open(draft_path, error) || !draft_model.load(draft_file, error, dequantize, &pool) ||
          !draft_runner.init(draft_model, static_cast<uint32_t>(context), pool, error, kv_f16) ||
          !speculative.init(runner, draft_runner, static_cast<size_t>(draft_n), error)))
     {
@@ -798,8 +798,8 @@ int command_chat(int argc, char** argv)
     ThreadPool pool;
     Runner runner;
     Session session;
-    if (!file.open(path, error) || !tokenizer.load(file, error) || !model.load(file, error) || !pool.start(threads, error) ||
-        !runner.init(model, static_cast<uint32_t>(context), pool, error, kv_f16))
+    if (!file.open(path, error) || !tokenizer.load(file, error) || !pool.start(threads, error) ||
+        !model.load(file, error, false, &pool) || !runner.init(model, static_cast<uint32_t>(context), pool, error, kv_f16))
     {
         std::fprintf(stderr, "faisca: %s\n", error.c_str());
         return 1;
