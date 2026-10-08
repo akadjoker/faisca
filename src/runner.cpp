@@ -529,16 +529,18 @@ void Runner::step_rope_store(const LlamaLayer*, uint32_t pos, size_t token)
     float* k_cur = m_k_batch.data() + token * n_kv;
     float* q = m_q.data() + token * n_q;
     const float* factors = m_model->rope_factors();
-    const float freq_base = h.local_layer(static_cast<uint32_t>(m_layer)) ? h.rope_freq_base_swa : h.rope_freq_base;
+    const bool local = h.local_layer(static_cast<uint32_t>(m_layer));
+    const float freq_base = local ? h.rope_freq_base_swa : h.rope_freq_base;
+    const float freq_scale = local ? 1.0f : h.rope_freq_scale;
     if (h.rope_neox)
     {
-        rope_neox(q, h.n_head, head_dim, h.n_rot, p, freq_base);
-        rope_neox(k_cur, h.n_head_kv, head_dim, h.n_rot, p, freq_base);
+        rope_neox(q, h.n_head, head_dim, h.n_rot, p, freq_base, freq_scale);
+        rope_neox(k_cur, h.n_head_kv, head_dim, h.n_rot, p, freq_base, freq_scale);
     }
     else
     {
-        rope_norm(q, h.n_head, head_dim, h.n_rot, p, freq_base, factors);
-        rope_norm(k_cur, h.n_head_kv, head_dim, h.n_rot, p, freq_base, factors);
+        rope_norm(q, h.n_head, head_dim, h.n_rot, p, freq_base, factors, freq_scale);
+        rope_norm(k_cur, h.n_head_kv, head_dim, h.n_rot, p, freq_base, factors, freq_scale);
     }
 
     const size_t tiles = (static_cast<size_t>(m_n_ctx) + 15) / 16;

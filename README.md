@@ -23,7 +23,7 @@ or exceptions. It has its own containers (`faisca::Array`, `faisca::StringMap`,
 | Own cache format and KV cache on disk | done: sessions with prefix reuse, snapshots and files with an offset table |
 | Whisper (speech to text) | done: tiny, base and small validated layer by layer against whisper.cpp, `transcribe` command, no timestamps yet |
 | Pocket TTS (text to speech) | done: validated against pockettts.cpp, `speak` command, 27 voices, no cloning from a recording yet |
-| Qwen2.5, Qwen3, Gemma 3 | done: validated layer by layer against llama.cpp, SentencePiece tokenizer, sliding window attention; Gemma 3 4B and up need rope scaling |
+| Qwen2.5, Qwen3, Gemma 3 (270M, 1B, 4B) | done: validated layer by layer against llama.cpp, SentencePiece tokenizer, sliding window attention, linear rope scaling; Gemma 3 12B and 27B untried, no vision yet |
 
 ## Build
 
@@ -77,8 +77,9 @@ vocabulary: ChatML for SmolLM2, the header tokens for Llama 3.
 architecture (ChatML, Qwen2.5's default system prompt, Llama 3 headers,
 Gemma's turns). On the same Xeon with 4 threads, 512 token prompt then 32
 tokens: Qwen2.5-0.5B Q8_0 458 and 55 tokens per second, Qwen3-0.6B 279 and
-38, Gemma 3 1B 192 and 24 (llama.cpp without its AMX path: 328 / 42, 245 /
-32, 135 / 20; bench/README.md).
+38, Gemma 3 270M 641 and 77, Gemma 3 1B 192 and 24, Gemma 3 4B 59 and 7.2
+(llama.cpp without its AMX path: 328 / 42, 245 / 32, 643 / 67, 135 / 20,
+38 / 6.0; bench/README.md).
 
 `transcribe` runs a Whisper model from a whisper.cpp `ggml-*.bin` file on a
 16 kHz 16 bit WAV (`ffmpeg -i in.mp3 -ar 16000 -ac 1 out.wav` makes one) and
@@ -377,10 +378,15 @@ python3 tests/compare_with_gguf_py.py build/gguf_dump model.gguf
 
 - **Qwen and Gemma against llama.cpp.** The same `compare_layers.py` on the
   float32 copies: Qwen2.5-0.5B-Instruct 266 tensors at worst 5.5e-6,
-  Qwen3-0.6B 366 at 1.9e-6, Gemma 3 1B 367 at 4.1e-6 on a chat prompt and
-  3.6e-6 on a 600 token prompt, where Gemma's local layers see only the
-  last 512 positions; 16 greedy tokens identical, the Q8_0 files give the
-  same tokens, 1 and 4 threads bit identical, ASan and UBSan clean. The
+  Qwen3-0.6B 366 at 1.9e-6, Gemma 3 270M 255 at 5.3e-6, Gemma 3 1B 367 at
+  4.1e-6 on a chat prompt and 3.6e-6 on a 600 token prompt, where Gemma's
+  local layers see only the last 512 positions; 16 greedy tokens
+  identical, the Q8_0 files give the same tokens, 1 and 4 threads bit
+  identical, ASan and UBSan clean. Gemma 3 4B (rope scaling factor 8 on
+  the global layers) has no float32 copy that fits, so its Q8_0 run is
+  compared with llama.cpp's Q8_0 run: 479 tensors within 6.1e-2 (the
+  activation quantization noise, the 1B is at 8.9e-2 measured the same
+  way), 16 tokens identical. The
   reference copy has ggml's GELU f16 table turned off, so the comparison
   is against the exact GELU. The qwen2 pre-tokenizer and the SentencePiece
   tokenizer give 0 mismatches against llama.cpp over 40062 cases each

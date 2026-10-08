@@ -36,6 +36,7 @@ struct LlamaHparams
     uint32_t n_ctx_train = 0;
     float rms_eps = 1e-5f;
     float rope_freq_base = 10000.0f;
+    float rope_freq_scale = 1.0f; // 1 / factor of linear rope scaling, on the global layers
     bool rope_neox = false; // pairs (i, i + n_rot / 2) instead of (2i, 2i + 1)
     bool qk_norm = false; // RMS norm of every Q and K head before rope
     bool post_norms = false; // RMS norms on the attention and FFN outputs before the residual adds

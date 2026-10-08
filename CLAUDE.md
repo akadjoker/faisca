@@ -237,12 +237,36 @@ top. No third party dependencies. Owner: Luís (akadjoker). "faisca" is a workin
    ready to be used", SIGILL), so the quantized comparison is against the
    float32 reference only, and the speed table uses a llama.cpp built
    with GGML_AMX_INT8 off (bench/README.md): faisca is 1.1 to 1.7x faster
-   on generation and prompts on the three models. Not done: Qwen2.5 and
-   Qwen3 larger than 0.6B (should load, not tried; the 1.7B and 4B files
-   need the disk), Gemma 3 4B and up (rope scaling factor 8 on the global
-   layers is still rejected), the Vulkan runner for these architectures.
-   Next: Mistral / Llama 2 with the SentencePiece tokenizer (needs the
-   add_space_prefix path, which Gemma does not exercise), rope scaling.
+   on generation and prompts on the three models. The rest of the Gemma 3
+   family (the owner wants to work with Gemma): linear rope scaling
+   (`rope.scaling.type` linear with a factor gives `rope_freq_scale` =
+   1 / factor, applied to the angle of every pair like ggml's rope_yarn
+   with ext_factor 0, on the global layers only; the local layers keep
+   1), so Gemma 3 4B (window 1024, factor 8) loads; gemma-3-270m-it and
+   gemma-3-4b-it Q8_0 from unsloth in /home/user/models/gemma. 270M
+   validated like the 1B: tokenizer 0 mismatches, float32 255 tensors at
+   5.3e-6, 16 tokens identical, Q8_0 the same tokens as llama.cpp's Q8_0
+   run, 1 and 4 threads identical, ASan clean. 4B has no float32 copy (17
+   GB on a 15 GB machine), so it is compared Q8_0 against Q8_0: 479
+   tensors at worst 6.1e-2 (the 1B gives 8.9e-2 the same way, the
+   activation quantization noise seen on every model), logits 3.6e-2, 16
+   tokens identical, 1 and 4 threads identical, ASan clean; its window of
+   1024 was not exercised (a 1100 token comparison needs 2 GB of dumps
+   per side, no disk), the 1B's 512 window at 600 tokens covers the code.
+   The reference dump tools of build-bench link llama.cpp's shared libs,
+   and the AMX ones abort on Q8_0 here: run them with
+   LD_LIBRARY_PATH=/home/user/ref/llama.cpp/build-noamx/bin (the build
+   with GGML_AMX_INT8, GGML_AMX_TILE and GGML_AMX_BF16 off). Speed,
+   bench_runner against llama-bench without AMX, 1 / 4 threads: 270M
+   generation 34 / 77 (llama.cpp 24 / 67), prompt 262 / 641 (221 / 643);
+   4B generation 2.3 / 7.2 (1.7 / 6.0), prompt 18 / 59 (10 / 38); the 4B
+   reads 3.9 GiB per token and its load packs them in 25 s on one thread,
+   1.3 s with four. Not done: Gemma 3 12B and 27B (13 and 28 GB in Q8_0,
+   beyond this machine; Q4_K_M files should load), the vision encoder of
+   the 4B and up (SigLIP 400M plus the projector, the mmproj file), Qwen
+   larger than 0.6B (should load, not tried), the Vulkan runner for these
+   architectures. Next: Mistral / Llama 2 with the SentencePiece tokenizer
+   (needs the add_space_prefix path, which Gemma does not exercise).
 
 Target model: SmolLM2-360M-Instruct GGUF, then 1B to 3B models. SmolLM2-1.7B
 Q4_K_M (/home/user/models/1.7b/, official file, its float32 copy and the

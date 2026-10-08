@@ -1187,6 +1187,32 @@ void test_whisper_ops()
 
 }
 
+void test_rope_neox()
+{
+    std::mt19937 rng(29);
+    const size_t n_head = 2;
+    const size_t head_dim = 8;
+    const std::vector<float> original = random_values(rng, n_head * head_dim, 1.0f);
+    for (const float freq_scale : {1.0f, 0.125f})
+    {
+        std::vector<float> x = original;
+        rope_neox(x.data(), n_head, head_dim, head_dim, 23, 10000.0f, freq_scale);
+        bool all_close = true;
+        for (size_t h = 0; h < n_head; ++h)
+        {
+            for (size_t i = 0; i < head_dim / 2; ++i)
+            {
+                const double theta = freq_scale * 23.0 * std::pow(10000.0, -2.0 * static_cast<double>(i) / static_cast<double>(head_dim));
+                const double x0 = original[h * head_dim + i];
+                const double x1 = original[h * head_dim + i + head_dim / 2];
+                all_close = all_close && close(x[h * head_dim + i], x0 * std::cos(theta) - x1 * std::sin(theta), 1e-4);
+                all_close = all_close && close(x[h * head_dim + i + head_dim / 2], x0 * std::sin(theta) + x1 * std::cos(theta), 1e-4);
+            }
+        }
+        CHECK(all_close);
+    }
+}
+
 void test_attention_skip()
 {
     std::mt19937 rng(23);
@@ -1309,6 +1335,7 @@ int main()
     test_whisper_ops();
     test_conv1d_rows();
     test_attention_skip();
+    test_rope_neox();
 
     std::printf("%s ops_unit: %d checks, %d failed\n", g_failures == 0 ? "ok  " : "FAIL", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;

@@ -389,16 +389,27 @@ and GGML_AMX_BF16 off; the SmolLM2 tables above used its AMX build.
 | Qwen3-0.6B generation (tok/s) | 4 | 32.1 | 38.2 |
 | Qwen3-0.6B prompt (tok/s) | 1 | 72 | 96 |
 | Qwen3-0.6B prompt (tok/s) | 4 | 245 | 279 |
+| Gemma 3 270M generation (tok/s) | 1 | 23.5 | 34.2 |
+| Gemma 3 270M generation (tok/s) | 4 | 67 | 77 |
+| Gemma 3 270M prompt (tok/s) | 1 | 221 | 262 |
+| Gemma 3 270M prompt (tok/s) | 4 | 643 | 641 |
 | Gemma 3 1B generation (tok/s) | 1 | 6.5 | 8.7 |
 | Gemma 3 1B generation (tok/s) | 4 | 20.2 | 24.1 |
 | Gemma 3 1B prompt (tok/s) | 1 | 43 | 61 |
 | Gemma 3 1B prompt (tok/s) | 4 | 135 | 192 |
+| Gemma 3 4B generation (tok/s) | 1 | 1.7 | 2.3 |
+| Gemma 3 4B generation (tok/s) | 4 | 6.0 | 7.2 |
+| Gemma 3 4B prompt (tok/s) | 1 | 10.3 | 18.1 |
+| Gemma 3 4B prompt (tok/s) | 4 | 38 | 59 |
 
 Qwen2.5-0.5B reads 500 MiB of weights per token, 136 of them the
 151936 x 896 output matrix; Gemma 3 1B reads 1013 MiB, 302 of them the
-262144 x 1152 output matrix, which bounds its generation. The load of the
-Qwen2.5 file takes 4 s on one thread and 0.2 s with four (packing into
-huge pages).
+262144 x 1152 output matrix, which bounds its generation; Gemma 3 4B reads
+3.9 GiB (best of 2 runs there). The 270M (271 MiB) sits in the L3 of this
+machine, so its generation is bound by the fork/join of the pool, not by
+the memory, and the prompt ties llama-bench at four threads. The load of
+the Qwen2.5 file takes 4 s on one thread and 0.2 s with four, the 4B 25 s
+and 1.3 s (packing into huge pages).
 
 ## Whisper against whisper.cpp
 

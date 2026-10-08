@@ -318,9 +318,13 @@ bool LlamaModel::load_hparams(const GgufFile& file, Error& error)
         error.set("rope scaling '%.*s' is not supported yet", static_cast<int>(scaling.size()), scaling.data());
         return false;
     }
-    if (file.get_float(named("rope.scaling.factor"), value) && value != 1.0)
+    if (scaling == "linear" && file.get_float(named("rope.scaling.factor"), value) && value > 0.0)
     {
-        error.set("rope scaling factor %g is not supported yet", value);
+        h.rope_freq_scale = static_cast<float>(1.0 / value);
+    }
+    else if (scaling != "linear" && file.get_float(named("rope.scaling.factor"), value) && value != 1.0)
+    {
+        error.set("rope scaling factor %g without a linear type is not supported yet", value);
         return false;
     }
 

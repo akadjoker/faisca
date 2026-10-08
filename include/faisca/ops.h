@@ -176,12 +176,14 @@ float dot(const float* a, const float* b, size_t n);
 void rms_norm(const float* x, const float* weight, size_t n, float eps, float* out);
 
 // rotates the first n_rot values of every head in place, pairs (2i, 2i + 1), as ggml's NORM
-// mode; factors, when given, divide the angle of pair i by factors[i] (Llama 3 rope scaling)
+// mode; factors, when given, divide the angle of pair i by factors[i] (Llama 3 rope scaling);
+// freq_scale multiplies every angle (linear rope scaling, 1 / factor)
 void rope_norm(float* x, size_t n_head, size_t head_dim, size_t n_rot, uint32_t pos, float freq_base,
-               const float* factors = nullptr);
+               const float* factors = nullptr, float freq_scale = 1.0f);
 
 // the same with pairs (i, i + n_rot / 2), ggml's NEOX mode (Qwen, Gemma)
-void rope_neox(float* x, size_t n_head, size_t head_dim, size_t n_rot, uint32_t pos, float freq_base);
+void rope_neox(float* x, size_t n_head, size_t head_dim, size_t n_rot, uint32_t pos, float freq_base,
+               float freq_scale = 1.0f);
 
 void softmax(float* x, size_t n);
 
