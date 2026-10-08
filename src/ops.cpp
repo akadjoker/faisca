@@ -2462,6 +2462,16 @@ inline __m512 load_16(const uint16_t* p)
 {
     return _mm512_cvtph_ps(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(p)));
 }
+
+inline __m512 load_16_masked(const float* p, __mmask16 mask)
+{
+    return _mm512_maskz_loadu_ps(mask, p);
+}
+
+inline __m512 load_16_masked(const uint16_t* p, __mmask16 mask)
+{
+    return _mm512_cvtph_ps(_mm256_maskz_loadu_epi16(mask, p));
+}
 #endif
 
 }
@@ -2689,7 +2699,7 @@ template <typename Value>
 void attention_head_impl(const float* q, const Value* k_tiles, const Value* v, size_t v_stride, size_t head_dim,
                          size_t n_past, float scale, float* scores, float* out, size_t skip)
 {
-    if (head_dim % 16 != 0)
+    if (head_dim % 8 != 0)
     {
         attention_head_scalar_impl(q, k_tiles, v, v_stride, head_dim, n_past, scale, scores, out, skip);
         return;
@@ -2737,6 +2747,8 @@ void attention_head_impl(const float* q, const Value* k_tiles, const Value* v, s
     for (size_t d0 = 0; d0 < head_dim; d0 += 64)
     {
         const size_t width = head_dim - d0 < 64 ? head_dim - d0 : 64;
+        const size_t chunks = (width + 15) / 16;
+        const __mmask16 last = static_cast<__mmask16>(width % 16 == 0 ? 0xffffu : (1u << (width % 16)) - 1u);
         __m512 acc[4] = {_mm512_setzero_ps(), _mm512_setzero_ps(), _mm512_setzero_ps(), _mm512_setzero_ps()};
         for (size_t p = 0; p < n_past; ++p)
         {
@@ -2746,10 +2758,18 @@ void attention_head_impl(const float* q, const Value* k_tiles, const Value* v, s
             {
                 acc[c] = _mm512_fmadd_ps(weight, load_16(row + 16 * c), acc[c]);
             }
+            if (width % 16 != 0)
+            {
+                acc[chunks - 1] = _mm512_fmadd_ps(weight, load_16_masked(row + 16 * (chunks - 1), last), acc[chunks - 1]);
+            }
         }
         for (size_t c = 0; c < width / 16; ++c)
         {
             _mm512_storeu_ps(out + d0 + 16 * c, _mm512_mul_ps(acc[c], _mm512_set1_ps(inverse)));
+        }
+        if (width % 16 != 0)
+        {
+            _mm512_mask_storeu_ps(out + d0 + 16 * (chunks - 1), last, _mm512_mul_ps(acc[chunks - 1], _mm512_set1_ps(inverse)));
         }
     }
 }

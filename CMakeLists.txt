@@ -61,6 +61,9 @@ add_library(faisca_lib STATIC
     src/audio.cpp
     src/ops_whisper.cpp
     src/ops_conv.cpp
+    src/image.cpp
+    src/vision_model.cpp
+    src/vision_runner.cpp
     src/whisper_model.cpp
     src/whisper_runner.cpp
     src/pocket_text.cpp
@@ -124,6 +127,10 @@ if(FAISCA_BUILD_TESTS)
     target_link_libraries(whisper_dump PRIVATE faisca_lib)
     add_executable(pocket_dump tests/pocket_dump.cpp)
     target_link_libraries(pocket_dump PRIVATE faisca_lib)
+    add_executable(image_check tests/image_check.cpp)
+    target_link_libraries(image_check PRIVATE faisca_lib)
+    add_executable(vision_dump tests/vision_dump.cpp)
+    target_link_libraries(vision_dump PRIVATE faisca_lib)
     target_link_libraries(runner_dump PRIVATE faisca_lib)
     target_compile_options(runner_dump PRIVATE ${FAISCA_WARNINGS})
 

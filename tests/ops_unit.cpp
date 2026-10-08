@@ -1187,6 +1187,47 @@ void test_whisper_ops()
 
 }
 
+void test_attention_head_72()
+{
+    std::mt19937 rng(31);
+    const size_t head_dim = 72;
+    const size_t n_kv = 2 * head_dim;
+    const size_t n_past = 37;
+    std::vector<float> q = random_values(rng, head_dim, 1.0f);
+    std::vector<float> k = random_values(rng, n_past * head_dim, 1.0f);
+    std::vector<float> v = random_values(rng, (n_past + 1) * n_kv, 1.0f);
+    std::vector<float> k_t(((n_past + 15) / 16) * 16 * head_dim, 0.0f);
+    for (size_t p = 0; p < n_past; ++p)
+    {
+        for (size_t d = 0; d < head_dim; ++d)
+        {
+            k_t[key_index(head_dim, p, d)] = k[p * head_dim + d];
+        }
+    }
+    std::vector<float> scores_a(64), scores_b(64), out_a(head_dim), out_b(head_dim);
+    attention_head_scalar(q.data(), k_t.data(), v.data() + 8, n_kv, head_dim, n_past, 0.125f, scores_a.data(), out_a.data());
+    attention_head(q.data(), k_t.data(), v.data() + 8, n_kv, head_dim, n_past, 0.125f, scores_b.data(), out_b.data());
+    double worst = 0.0;
+    for (size_t d = 0; d < head_dim; ++d)
+    {
+        worst = std::max(worst, std::fabs(static_cast<double>(out_a[d]) - out_b[d]));
+    }
+    CHECK(worst < 1e-5);
+    std::vector<uint16_t> k_half(k_t.size()), v_half(v.size());
+    f32_to_f16_values(k_t.data(), k_t.size(), k_half.data());
+    f32_to_f16_values(v.data(), v.size(), v_half.data());
+    std::vector<float> out_c(head_dim), out_d(head_dim);
+    attention_head_f16_scalar(q.data(), k_half.data(), v_half.data() + 8, n_kv, head_dim, n_past, 0.125f, scores_a.data(), out_c.data());
+    attention_head_f16(q.data(), k_half.data(), v_half.data() + 8, n_kv, head_dim, n_past, 0.125f, scores_b.data(), out_d.data());
+    double worst_half = 0.0;
+    for (size_t d = 0; d < head_dim; ++d)
+    {
+        worst_half = std::max(worst_half, std::fabs(static_cast<double>(out_c[d]) - out_d[d]));
+    }
+    CHECK(worst_half < 1e-5);
+    std::printf("attention_head with head_dim 72: worst %.2e (float32), %.2e (f16)\n", worst, worst_half);
+}
+
 void test_rope_neox()
 {
     std::mt19937 rng(29);
@@ -1336,6 +1377,7 @@ int main()
     test_conv1d_rows();
     test_attention_skip();
     test_rope_neox();
+    test_attention_head_72();
 
     std::printf("%s ops_unit: %d checks, %d failed\n", g_failures == 0 ? "ok  " : "FAIL", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;
