@@ -97,6 +97,22 @@ top. No third party dependencies. Owner: Luís (akadjoker). "faisca" is a workin
    tiles of 16 positions are stored). The Vulkan runner has no state
    export yet.
 
+7. Whisper (speech to text), the owner's priority over more CPU work: loader
+   for whisper.cpp's ggml model format, mel spectrogram, encoder (conv1d,
+   attention), decoder with cross attention, WAV reading, `transcribe` in the
+   CLI; validated layer by layer against whisper.cpp 1.9.5
+   (/home/user/ref/whisper.cpp) with tiny, base and small. Quality (Whisper
+   paper, LibriSpeech WER): tiny 7.6, base 5.0, small 3.4, medium 2.9; the
+   small models degrade outside English and the training data is mostly
+   Brazilian Portuguese, so European Portuguese needs our own measurement.
+8. Text to speech: pick between OuteTTS (llama LLM + WavTokenizer, decoder
+   in libllama as `wavtokenizer-dec`) and Piper (VITS, pt_PT voices, ONNX
+   reference) by listening to Portuguese samples, then the audio decoder,
+   WAV writing, `speak` in the CLI.
+9. Qwen2.5 and Qwen3 text models (`qwen2`: Q, K, V biases and its own
+   pre-tokenizer; `qwen3`: per head Q and K norms), then Gemma 3 and the
+   SentencePiece tokenizer (Llama 2, Mistral).
+
 Target model: SmolLM2-360M-Instruct GGUF, then 1B to 3B models. SmolLM2-1.7B
 Q4_K_M (/home/user/models/1.7b/, official file, its float32 copy and the
 llama dump /home/user/ref/llama_17b_dump.bin) validated: matmul_check zero
