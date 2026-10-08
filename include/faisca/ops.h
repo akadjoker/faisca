@@ -218,6 +218,14 @@ void attention_head_f16(const float* q, const uint16_t* k_tiles, const uint16_t*
 void attention_head_f16_scalar(const float* q, const uint16_t* k_tiles, const uint16_t* v, size_t v_stride,
                                size_t head_dim, size_t n_past, float scale, float* scores, float* out, size_t skip = 0);
 
+// n_q queries (rows q_stride apart) against every one of n_past keys, no mask: the queries
+// of a block share the key tile and value row loads, the result is bit identical to
+// attention_head per query; scores is scratch for attention_block_queries() rows of
+// n_past rounded up to 16; out rows out_stride apart
+size_t attention_block_queries();
+void attention_block(const float* q, size_t q_stride, size_t n_q, const float* k_tiles, const float* v, size_t v_stride,
+                     size_t head_dim, size_t n_past, float scale, float* scores, float* out, size_t out_stride);
+
 // out = silu(gate) * up; the vector one uses exp_values, within a few ulp of the scalar one
 void swiglu(const float* gate, const float* up, size_t n, float* out);
 void swiglu_scalar(const float* gate, const float* up, size_t n, float* out);

@@ -69,7 +69,7 @@ private:
     void gelu_rows(float* x, size_t rows, size_t width);
     void bias_rows(float* x, const float* b, size_t rows, size_t width);
     void add_rows(float* x, const float* y, size_t rows, size_t width);
-    void tile_keys(const float* k, size_t n_kv, float* tiles);
+    void tile_keys(const float* k, const float* v, size_t n_kv, float* tiles, float* v_heads);
     size_t tiles_per_head() const;
 
     const VisionModel* m_model = nullptr;
@@ -91,6 +91,7 @@ private:
     Array<float> m_attn;
     Array<float> m_up;
     Array<float> m_k_tiles;
+    Array<float> m_v_heads; // [head][patch][head_dim]
     Array<float> m_scores;
     Array<float> m_pooled;
     Array<uint8_t> m_xq;

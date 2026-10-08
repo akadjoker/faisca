@@ -3,6 +3,11 @@
 #include <cmath>
 #include <cstring>
 
+#if !defined(FAISCA_ATTENTION_BLOCK_Q)
+#define FAISCA_ATTENTION_BLOCK_Q 16
+#define FAISCA_ATTENTION_BLOCK_C 1
+#endif
+
 #if defined(__AVX2__) && defined(__FMA__) && defined(__F16C__)
 #include <immintrin.h>
 #define FAISCA_AVX2 1
@@ -2864,6 +2869,246 @@ void attention_head_f16(const float* q, const uint16_t* k_tiles, const uint16_t*
     attention_head_impl(q, k_tiles, v, v_stride, head_dim, n_past, scale, scores, out, skip);
 }
 
+#if defined(__AVX512F__)
+
+namespace
+{
+
+// Q queries share every key tile load and every value row load; per query the FMAs run
+// in the order of attention_head_impl, so the result is bit identical to it
+template <size_t Q, size_t C>
+void attention_block_impl(const float* q, size_t q_stride, const float* k_tiles, const float* v, size_t v_stride,
+                          size_t head_dim, size_t n_past, float scale, float* scores, size_t scores_stride, float* out,
+                          size_t out_stride)
+{
+    const __m512 vscale = _mm512_set1_ps(scale);
+    __m512 vmax[Q];
+    for (size_t j = 0; j < Q; ++j)
+    {
+        vmax[j] = _mm512_set1_ps(-INFINITY);
+    }
+    for (size_t p = 0; p < n_past; p += 16)
+    {
+        const __mmask16 mask = static_cast<__mmask16>(p + 16 <= n_past ? 0xffffu : (1u << (n_past - p)) - 1u);
+        const float* tile = k_tiles + (p / KEY_TILE) * head_dim * KEY_TILE;
+        __m512 s[Q];
+        for (size_t j = 0; j < Q; ++j)
+        {
+            s[j] = _mm512_setzero_ps();
+        }
+        for (size_t d = 0; d < head_dim; ++d)
+        {
+            const __m512 t = _mm512_loadu_ps(tile + d * KEY_TILE);
+            for (size_t j = 0; j < Q; ++j)
+            {
+                s[j] = _mm512_fmadd_ps(_mm512_set1_ps(q[j * q_stride + d]), t, s[j]);
+            }
+        }
+        for (size_t j = 0; j < Q; ++j)
+        {
+            s[j] = _mm512_mul_ps(s[j], vscale);
+            _mm512_storeu_ps(scores + j * scores_stride + p, s[j]);
+            vmax[j] = _mm512_mask_max_ps(vmax[j], mask, vmax[j], s[j]);
+        }
+    }
+    float inverse[Q];
+    for (size_t j = 0; j < Q; ++j)
+    {
+        const float max = _mm512_reduce_max_ps(vmax[j]);
+        float* row = scores + j * scores_stride;
+        __m512 vsum = _mm512_setzero_ps();
+        for (size_t p = 0; p < n_past; p += 16)
+        {
+            const __mmask16 mask = static_cast<__mmask16>(p + 16 <= n_past ? 0xffffu : (1u << (n_past - p)) - 1u);
+            const __m512 e = exp_avx512(_mm512_sub_ps(_mm512_loadu_ps(row + p), _mm512_set1_ps(max)));
+            _mm512_storeu_ps(row + p, e);
+            vsum = _mm512_mask_add_ps(vsum, mask, vsum, e);
+        }
+        inverse[j] = softmax_inverse(_mm512_castps512_ps256(vsum),
+                                     _mm256_castpd_ps(_mm512_extractf64x4_pd(_mm512_castps_pd(vsum), 1)));
+    }
+
+    for (size_t d0 = 0; d0 < head_dim; d0 += 16 * C)
+    {
+        const size_t width = head_dim - d0 < 16 * C ? head_dim - d0 : 16 * C;
+        const size_t chunks = (width + 15) / 16;
+        const __mmask16 last = static_cast<__mmask16>(width % 16 == 0 ? 0xffffu : (1u << (width % 16)) - 1u);
+        __m512 acc[Q][C];
+        for (size_t j = 0; j < Q; ++j)
+        {
+            for (size_t c = 0; c < C; ++c)
+            {
+                acc[j][c] = _mm512_setzero_ps();
+            }
+        }
+        for (size_t p = 0; p < n_past; ++p)
+        {
+            const float* row = v + p * v_stride + d0;
+            __m512 r[C];
+            for (size_t c = 0; c < chunks; ++c)
+            {
+                r[c] = c + 1 < chunks || width % 16 == 0 ? _mm512_loadu_ps(row + 16 * c)
+                                                         : _mm512_maskz_loadu_ps(last, row + 16 * c);
+            }
+            for (size_t j = 0; j < Q; ++j)
+            {
+                const __m512 weight = _mm512_set1_ps(scores[j * scores_stride + p]);
+                for (size_t c = 0; c < chunks; ++c)
+                {
+                    acc[j][c] = _mm512_fmadd_ps(weight, r[c], acc[j][c]);
+                }
+            }
+        }
+        for (size_t j = 0; j < Q; ++j)
+        {
+            float* o = out + j * out_stride + d0;
+            const __m512 inv = _mm512_set1_ps(inverse[j]);
+            for (size_t c = 0; c < chunks; ++c)
+            {
+                if (c + 1 < chunks || width % 16 == 0)
+                {
+                    _mm512_storeu_ps(o + 16 * c, _mm512_mul_ps(acc[j][c], inv));
+                }
+                else
+                {
+                    _mm512_mask_storeu_ps(o + 16 * c, last, _mm512_mul_ps(acc[j][c], inv));
+                }
+            }
+        }
+    }
+}
+
+constexpr size_t ATTENTION_BLOCK_Q = FAISCA_ATTENTION_BLOCK_Q;
+constexpr size_t ATTENTION_BLOCK_C = FAISCA_ATTENTION_BLOCK_C;
+
+}
+
+#else
+
+namespace
+{
+
+template <size_t Q, size_t C>
+void attention_block_impl(const float* q, size_t q_stride, const float* k_tiles, const float* v, size_t v_stride,
+                          size_t head_dim, size_t n_past, float scale, float* scores, size_t scores_stride, float* out,
+                          size_t out_stride)
+{
+    const size_t padded = (n_past + 7) / 8 * 8;
+    const __m256 vscale = _mm256_set1_ps(scale);
+    for (size_t p = 0; p < padded; p += 8)
+    {
+        const float* tile = k_tiles + (p / KEY_TILE) * head_dim * KEY_TILE + (p % KEY_TILE);
+        __m256 s[Q];
+        for (size_t j = 0; j < Q; ++j)
+        {
+            s[j] = _mm256_setzero_ps();
+        }
+        for (size_t d = 0; d < head_dim; ++d)
+        {
+            const __m256 t = _mm256_loadu_ps(tile + d * KEY_TILE);
+            for (size_t j = 0; j < Q; ++j)
+            {
+                s[j] = _mm256_fmadd_ps(_mm256_set1_ps(q[j * q_stride + d]), t, s[j]);
+            }
+        }
+        for (size_t j = 0; j < Q; ++j)
+        {
+            _mm256_storeu_ps(scores + j * scores_stride + p, _mm256_mul_ps(s[j], vscale));
+        }
+    }
+    float inverse[Q];
+    const __m256i lanes = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
+    for (size_t j = 0; j < Q; ++j)
+    {
+        float* row = scores + j * scores_stride;
+        float max = row[0];
+        for (size_t p = 1; p < n_past; ++p)
+        {
+            max = row[p] > max ? row[p] : max;
+        }
+        __m256 vsum[2] = {_mm256_setzero_ps(), _mm256_setzero_ps()};
+        for (size_t p = 0; p < padded; p += 8)
+        {
+            const __m256 e = exp_avx2(_mm256_sub_ps(_mm256_loadu_ps(row + p), _mm256_set1_ps(max)));
+            _mm256_storeu_ps(row + p, e);
+            const __m256 keep = _mm256_castsi256_ps(_mm256_cmpgt_epi32(_mm256_set1_epi32(static_cast<int>(n_past - p)), lanes));
+            vsum[(p / 8) & 1] = _mm256_add_ps(vsum[(p / 8) & 1], _mm256_and_ps(e, keep));
+        }
+        inverse[j] = softmax_inverse(vsum[0], vsum[1]);
+    }
+
+    for (size_t d0 = 0; d0 < head_dim; d0 += 8 * C)
+    {
+        const size_t width = head_dim - d0 < 8 * C ? head_dim - d0 : 8 * C;
+        const size_t chunks = width / 8;
+        __m256 acc[Q][C];
+        for (size_t j = 0; j < Q; ++j)
+        {
+            for (size_t c = 0; c < C; ++c)
+            {
+                acc[j][c] = _mm256_setzero_ps();
+            }
+        }
+        for (size_t p = 0; p < n_past; ++p)
+        {
+            const float* row = v + p * v_stride + d0;
+            __m256 r[C];
+            for (size_t c = 0; c < chunks; ++c)
+            {
+                r[c] = _mm256_loadu_ps(row + 8 * c);
+            }
+            for (size_t j = 0; j < Q; ++j)
+            {
+                const __m256 weight = _mm256_set1_ps(scores[j * scores_stride + p]);
+                for (size_t c = 0; c < chunks; ++c)
+                {
+                    acc[j][c] = _mm256_fmadd_ps(weight, r[c], acc[j][c]);
+                }
+            }
+        }
+        for (size_t j = 0; j < Q; ++j)
+        {
+            const __m256 inv = _mm256_set1_ps(inverse[j]);
+            for (size_t c = 0; c < chunks; ++c)
+            {
+                _mm256_storeu_ps(out + j * out_stride + d0 + 8 * c, _mm256_mul_ps(acc[j][c], inv));
+            }
+        }
+    }
+}
+
+constexpr size_t ATTENTION_BLOCK_Q = 4;
+constexpr size_t ATTENTION_BLOCK_C = 2;
+
+}
+
+#endif
+
+size_t attention_block_queries()
+{
+    return ATTENTION_BLOCK_Q;
+}
+
+void attention_block(const float* q, size_t q_stride, size_t n_q, const float* k_tiles, const float* v, size_t v_stride,
+                     size_t head_dim, size_t n_past, float scale, float* scores, float* out, size_t out_stride)
+{
+    const size_t scores_stride = (n_past + 15) / 16 * 16;
+    size_t i = 0;
+    if (head_dim % 8 == 0)
+    {
+        for (; i + ATTENTION_BLOCK_Q <= n_q; i += ATTENTION_BLOCK_Q)
+        {
+            attention_block_impl<ATTENTION_BLOCK_Q, ATTENTION_BLOCK_C>(q + i * q_stride, q_stride, k_tiles, v, v_stride,
+                                                                       head_dim, n_past, scale, scores, scores_stride,
+                                                                       out + i * out_stride, out_stride);
+        }
+    }
+    for (; i < n_q; ++i)
+    {
+        attention_head(q + i * q_stride, k_tiles, v, v_stride, head_dim, n_past, scale, scores, out + i * out_stride);
+    }
+}
+
 #else
 
 void f32_to_f16_values(const float* x, size_t n, uint16_t* out)
@@ -2895,6 +3140,20 @@ void attention_head(const float* q, const float* k_tiles, const float* v, size_t
                     size_t n_past, float scale, float* scores, float* out)
 {
     attention_head_scalar(q, k_tiles, v, v_stride, head_dim, n_past, scale, scores, out);
+}
+
+size_t attention_block_queries()
+{
+    return 1;
+}
+
+void attention_block(const float* q, size_t q_stride, size_t n_q, const float* k_tiles, const float* v, size_t v_stride,
+                     size_t head_dim, size_t n_past, float scale, float* scores, float* out, size_t out_stride)
+{
+    for (size_t i = 0; i < n_q; ++i)
+    {
+        attention_head(q + i * q_stride, k_tiles, v, v_stride, head_dim, n_past, scale, scores, out + i * out_stride);
+    }
 }
 
 void attention_head_f16(const float* q, const uint16_t* k_tiles, const uint16_t* v, size_t v_stride, size_t head_dim,

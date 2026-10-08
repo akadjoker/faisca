@@ -1356,6 +1356,53 @@ void test_conv1d_rows()
     std::printf("conv1d_rows: worst error %.2e\n", worst);
 }
 
+void test_attention_block()
+{
+    std::mt19937 rng(47);
+    size_t differing = 0;
+    size_t compared = 0;
+    for (const size_t head_dim : {72u, 64u, 24u})
+    {
+        for (const size_t n_past : {100u, 1000u, 16u})
+        {
+            const size_t n_q = 37;
+            const size_t stride = 3 * head_dim;
+            std::vector<float> q = random_values(rng, n_q * stride, 1.0f);
+            std::vector<float> k = random_values(rng, n_past * head_dim, 1.0f);
+            std::vector<float> v = random_values(rng, n_past * head_dim, 1.0f);
+            std::vector<float> k_t(((n_past + 15) / 16) * 16 * head_dim, 0.0f);
+            for (size_t p = 0; p < n_past; ++p)
+            {
+                for (size_t d = 0; d < head_dim; ++d)
+                {
+                    k_t[key_index(head_dim, p, d)] = k[p * head_dim + d];
+                }
+            }
+            const size_t padded = (n_past + 15) / 16 * 16;
+            std::vector<float> scores(attention_block_queries() * padded), out_a(n_q * stride, 0.0f), out_b(n_q * stride, 0.0f);
+            for (size_t i = 0; i < n_q; ++i)
+            {
+                attention_head(q.data() + i * stride, k_t.data(), v.data(), head_dim, head_dim, n_past, 0.125f, scores.data(),
+                               out_a.data() + i * stride);
+            }
+            attention_block(q.data(), stride, n_q, k_t.data(), v.data(), head_dim, head_dim, n_past, 0.125f, scores.data(),
+                            out_b.data(), stride);
+            for (size_t i = 0; i < n_q; ++i)
+            {
+                differing += std::memcmp(out_a.data() + i * stride, out_b.data() + i * stride, head_dim * sizeof(float)) != 0;
+                for (size_t d = head_dim; d < stride; ++d)
+                {
+                    differing += out_b[i * stride + d] != 0.0f;
+                }
+                ++compared;
+            }
+        }
+    }
+    CHECK(differing == 0);
+    std::printf("attention_block: %zu query rows bit identical to attention_head (%zu queries per block)\n", compared,
+                attention_block_queries());
+}
+
 int main()
 {
     test_f16();
@@ -1378,6 +1425,7 @@ int main()
     test_attention_skip();
     test_rope_neox();
     test_attention_head_72();
+    test_attention_block();
 
     std::printf("%s ops_unit: %d checks, %d failed\n", g_failures == 0 ? "ok  " : "FAIL", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;

@@ -1007,7 +1007,8 @@ bool decode_jpeg(const uint8_t* data, size_t size, Image& out, Error& error)
                 }
                 for (int k = 0; k < 64; ++k)
                 {
-                    const uint16_t value = precision ? static_cast<uint16_t>((seg[i + 2 * k] << 8) | seg[i + 2 * k + 1]) : seg[i + k];
+                    const uint16_t value =
+                        precision ? static_cast<uint16_t>((static_cast<unsigned>(seg[i + 2 * k]) << 8) | seg[i + 2 * k + 1]) : seg[i + k];
                     dequant[table][DEZIGZAG[k]] = value;
                 }
                 i += precision ? 128 : 64;

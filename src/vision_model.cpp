@@ -201,7 +201,7 @@ bool VisionModel::load(const char* path, Error& error, bool quantize)
         error.set("the vision hyperparameters of '%s' are not consistent", path);
         return false;
     }
-    h.n_ff_padded = (h.n_ff + Q8_0_BLOCK - 1) / Q8_0_BLOCK * Q8_0_BLOCK;
+    h.n_ff_padded = static_cast<uint32_t>((h.n_ff + Q8_0_BLOCK - 1) / Q8_0_BLOCK * Q8_0_BLOCK);
     m_quantize = quantize;
     m_quantized = false;
 

@@ -101,12 +101,14 @@ struct VisionRunner::AttentionJob
 struct VisionRunner::TileJob
 {
     const float* k;
+    const float* v;
     size_t n_kv;
     size_t n_head;
     size_t head_dim;
     size_t stride;
     size_t per_head;
     float* tiles;
+    float* v_heads;
 };
 
 struct VisionRunner::PatchJob
@@ -135,7 +137,9 @@ bool VisionRunner::init(const VisionModel& model, ThreadPool& pool, Error& error
                     m_h.resize_uninitialized(n * dim) && m_q.resize_uninitialized(n * dim) && m_k.resize_uninitialized(n * dim) &&
                     m_v.resize_uninitialized(n * dim) && m_attn.resize_uninitialized(n * dim) &&
                     m_up.resize_uninitialized(n * h.n_ff_padded) && m_k_tiles.resize_uninitialized(h.n_head * tiles_per_head()) &&
-                    m_scores.resize_uninitialized(threads * (n + KEY_TILE)) && m_pooled.resize_uninitialized(h.n_tokens() * dim) &&
+                    m_v_heads.resize_uninitialized(n * dim) &&
+                    m_scores.resize_uninitialized(threads * attention_block_queries() * (n + KEY_TILE)) &&
+                    m_pooled.resize_uninitialized(h.n_tokens() * dim) &&
                     m_xq.resize_uninitialized(n * m_xq_stride) && m_sums.resize_uninitialized(n * m_sums_stride);
     if (!ok)
     {
@@ -288,20 +292,30 @@ void VisionRunner::tile_task(void* user, int thread_index, int thread_count)
                 tiles[key_index(job.head_dim, p, d)] = 0.0f;
             }
         }
+        float* v_head = job.v_heads + head * job.n_kv * job.head_dim;
+        for (size_t p = 0; p < job.n_kv; ++p)
+        {
+            std::memcpy(v_head + p * job.head_dim, job.v + p * job.stride + head * job.head_dim, job.head_dim * sizeof(float));
+        }
     }
 }
 
-void VisionRunner::tile_keys(const float* k, size_t n_kv, float* tiles)
+// the keys of every head in tiles of 16 positions, the values of every head contiguous
+void VisionRunner::tile_keys(const float* k, const float* v, size_t n_kv, float* tiles, float* v_heads)
 {
     const VisionHparams& h = m_model->hparams();
-    TileJob job{k, n_kv, h.n_head, h.n_embd / h.n_head, h.n_embd, tiles_per_head(), tiles};
+    TileJob job{k, v, n_kv, h.n_head, h.n_embd / h.n_head, h.n_embd, tiles_per_head(), tiles, v_heads};
     m_pool->run(tile_task, &job);
 }
 
+// one unit is a head and a block of queries; every block but the last has
+// attention_block_queries() queries, so the thread count does not change the result
 void VisionRunner::attention_task(void* user, int thread_index, int thread_count)
 {
     const AttentionJob& job = *static_cast<const AttentionJob*>(user);
-    const size_t units = job.n_head * job.n_q;
+    const size_t block = attention_block_queries();
+    const size_t blocks = (job.n_q + block - 1) / block;
+    const size_t units = job.n_head * blocks;
     const size_t first = units * static_cast<size_t>(thread_index) / static_cast<size_t>(thread_count);
     const size_t last = units * static_cast<size_t>(thread_index + 1) / static_cast<size_t>(thread_count);
     float* scores = job.runner->m_scores.data() +
@@ -309,10 +323,12 @@ void VisionRunner::attention_task(void* user, int thread_index, int thread_count
     const size_t per_head = job.runner->tiles_per_head();
     for (size_t u = first; u < last; ++u)
     {
-        const size_t head = u / job.n_q;
-        const size_t i = u % job.n_q;
-        attention_head(job.q + i * job.stride + head * job.head_dim, job.k_tiles + head * per_head, job.v + head * job.head_dim,
-                       job.stride, job.head_dim, job.n_kv, job.scale, scores, job.out + i * job.stride + head * job.head_dim);
+        const size_t head = u / blocks;
+        const size_t i = (u % blocks) * block;
+        const size_t n_q = job.n_q - i < block ? job.n_q - i : block;
+        attention_block(job.q + i * job.stride + head * job.head_dim, job.stride, n_q, job.k_tiles + head * per_head,
+                        job.v + head * job.n_kv * job.head_dim, job.head_dim, job.head_dim, job.n_kv, job.scale, scores,
+                        job.out + i * job.stride + head * job.head_dim, job.stride);
     }
 }
 
@@ -389,8 +405,8 @@ bool VisionRunner::encode_planes(const float* planes, Array<float>& embeddings, 
         trace("Qcur", il, m_q.data(), n * dim);
         trace("Kcur", il, m_k.data(), n * dim);
         trace("Vcur", il, m_v.data(), n * dim);
-        tile_keys(m_k.data(), n, m_k_tiles.data());
-        AttentionJob job{this, m_q.data(), m_k_tiles.data(), m_v.data(), n, n, h.n_head, head_dim, dim, scale, m_attn.data()};
+        tile_keys(m_k.data(), m_v.data(), n, m_k_tiles.data(), m_v_heads.data());
+        AttentionJob job{this, m_q.data(), m_k_tiles.data(), m_v_heads.data(), n, n, h.n_head, head_dim, dim, scale, m_attn.data()};
         m_pool->run(attention_task, &job);
         trace("kqv_out", il, m_attn.data(), n * dim);
         matmul(layer.out, m_attn.data(), n, m_h.data());
