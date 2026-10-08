@@ -36,7 +36,7 @@ void print_usage()
         "  faisca chat <model.gguf> [-n <tokens>] [-c <context>] [-t <threads>] [--session <file>] [--kv-f32]\n"
         "  faisca generate <model.gguf> -p <prompt> [-n <tokens>] [-c <context>] [-t <threads>] [--raw] [--f32] [--kv-f32]\n"
         "                                [--draft <draft.gguf>] [--draft-n <tokens>] [--vulkan]\n"
-        "  faisca transcribe <model.bin> <audio.wav> [--language <code>] [-t <threads>]\n"
+        "  faisca transcribe <model.bin> <audio.wav> [--language <code>] [-t <threads>] [--f32]\n"
         "  faisca version\n"
         "\n"
         "info options:\n"
@@ -60,7 +60,8 @@ void print_usage()
         "saves it after every reply.\n"
         "\n"
         "transcribe runs a Whisper model (whisper.cpp ggml file) on a 16 kHz 16 bit WAV, greedy,\n"
-        "without timestamps; --language is the two letter code (default en, pt for Portuguese).\n",
+        "without timestamps; --language is the two letter code (default en, pt for Portuguese);\n"
+        "the matrices run on Q8_0 unless --f32 keeps the file's values.\n",
         FAISCA_VERSION);
 }
 
@@ -938,6 +939,7 @@ int command_transcribe(int argc, char** argv)
 {
     const char* language = "en";
     int threads = 1;
+    bool quantize = true;
     const char* positional[2] = {nullptr, nullptr};
     int n_positional = 0;
     for (int i = 2; i < argc; ++i)
@@ -945,6 +947,10 @@ int command_transcribe(int argc, char** argv)
         if (std::strcmp(argv[i], "--language") == 0 && i + 1 < argc)
         {
             language = argv[++i];
+        }
+        else if (std::strcmp(argv[i], "--f32") == 0)
+        {
+            quantize = false;
         }
         else if (std::strcmp(argv[i], "-t") == 0 && i + 1 < argc)
         {
@@ -978,7 +984,7 @@ int command_transcribe(int argc, char** argv)
     faisca::WhisperRunner runner;
     faisca::Array<float> samples;
     const auto t0 = std::chrono::steady_clock::now();
-    if (!model.load(positional[0], error) || !pool.start(threads, error) || !runner.init(model, pool, error))
+    if (!model.load(positional[0], error, quantize) || !pool.start(threads, error) || !runner.init(model, pool, error))
     {
         std::fprintf(stderr, "faisca transcribe: %s\n", error.c_str());
         return 1;
@@ -1006,8 +1012,8 @@ int command_transcribe(int argc, char** argv)
     const double load = std::chrono::duration<double>(t1 - t0).count();
     const double run = std::chrono::duration<double>(t2 - t1).count();
     const double audio = static_cast<double>(samples.size()) / static_cast<double>(faisca::WHISPER_SAMPLE_RATE);
-    std::fprintf(stderr, "load %.2f s, %.1f s of audio in %.2f s (%.2fx real time), %zu tokens, %d threads\n", load, audio, run,
-                 audio / run, tokens.size(), threads);
+    std::fprintf(stderr, "load %.2f s, %.1f s of audio in %.2f s (%.2fx real time), %zu tokens, %d threads, %s\n", load, audio, run,
+                 audio / run, tokens.size(), threads, model.quantized() ? "Q8_0" : "float32");
     return 0;
 }
 

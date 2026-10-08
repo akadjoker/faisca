@@ -1,7 +1,7 @@
 // Runs the faisca Whisper runner on a 16 kHz WAV and writes every traced tensor in the format of
 // whisper_layer_dump, then the greedy tokens.
 //
-// usage: whisper_dump [--language en] [--threads N] <model.bin> <audio.wav> <out.bin>
+// usage: whisper_dump [--language en] [--threads N] [--f32] <model.bin> <audio.wav> <out.bin>
 
 #include "faisca/audio.h"
 #include "faisca/thread.h"
@@ -84,8 +84,16 @@ int main(int argc, char** argv)
 {
     const char* language = "en";
     int threads = 4;
+    bool quantize = true;
     while (argc > 1 && argv[1][0] == '-')
     {
+        if (std::strcmp(argv[1], "--f32") == 0)
+        {
+            quantize = false;
+            argv += 1;
+            argc -= 1;
+            continue;
+        }
         if (std::strcmp(argv[1], "--language") == 0 && argc > 2)
         {
             language = argv[2];
@@ -106,7 +114,7 @@ int main(int argc, char** argv)
     }
     if (argc != 4)
     {
-        std::fprintf(stderr, "usage: whisper_dump [--language en] [--threads N] <model.bin> <audio.wav> <out.bin>\n");
+        std::fprintf(stderr, "usage: whisper_dump [--language en] [--threads N] [--f32] <model.bin> <audio.wav> <out.bin>\n");
         return 2;
     }
     faisca::Error error;
@@ -114,7 +122,7 @@ int main(int argc, char** argv)
     faisca::ThreadPool pool;
     faisca::WhisperRunner runner;
     faisca::Array<float> samples;
-    if (!model.load(argv[1], error) || !pool.start(threads, error) || !runner.init(model, pool, error) ||
+    if (!model.load(argv[1], error, quantize) || !pool.start(threads, error) || !runner.init(model, pool, error) ||
         !faisca::read_wav(argv[2], samples, error))
     {
         std::fprintf(stderr, "whisper_dump: %s\n", error.c_str());

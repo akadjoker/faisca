@@ -66,6 +66,8 @@ private:
     static void matmul_task(void* user, int thread_index, int thread_count);
 
     void matmul(const Weight& w, const float* x, size_t n_tokens, float* out);
+    static void quantize_task(void* user, int thread_index, int thread_count);
+    void quantize_inputs(const float* x, size_t n_tokens, size_t n);
     void attention(const float* q, const float* k, const float* v, size_t n_q, size_t n_kv, size_t n_head, float scale,
                    bool causal, size_t q_position, float* out);
     void norm_rows(const float* x, const float* w, const float* b, size_t rows, float* out);
@@ -97,6 +99,13 @@ private:
     Array<float> m_self_v;
     Array<float> m_scores;
     Array<float> m_logits;
+    Array<uint8_t> m_xq;
+    Array<int32_t> m_sums;
+    size_t m_xq_stride = 0;
+    size_t m_sums_stride = 0;
+    const float* m_quantize_x = nullptr;
+    size_t m_quantize_tokens = 0;
+    size_t m_quantize_n = 0;
 };
 
 }

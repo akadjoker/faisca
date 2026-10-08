@@ -54,6 +54,10 @@ struct WhisperRunner::MatmulJob
 {
     const Weight* weight;
     const float* x;
+    const uint8_t* xq;
+    size_t xq_stride;
+    const int32_t* sums;
+    size_t sums_stride;
     size_t n_tokens;
     float* out;
 };
@@ -98,7 +102,11 @@ bool WhisperRunner::allocate(Error& error)
                     m_self_k.resize_uninitialized(static_cast<size_t>(h.n_text_layer) * n_text_ctx * n_state) &&
                     m_self_v.resize_uninitialized(static_cast<size_t>(h.n_text_layer) * n_text_ctx * n_state) &&
                     m_scores.resize_uninitialized(threads * rows) &&
-                    m_logits.resize_uninitialized(n_text_ctx * static_cast<size_t>(h.n_vocab));
+                    m_logits.resize_uninitialized(n_text_ctx * static_cast<size_t>(h.n_vocab)) &&
+                    m_xq.resize_uninitialized(rows * (4 * n_state / Q8_0_BLOCK * Q8_0_BLOCK_BYTES)) &&
+                    m_sums.resize_uninitialized(rows * (4 * n_state / Q8_0_BLOCK));
+    m_xq_stride = 4 * n_state / Q8_0_BLOCK * Q8_0_BLOCK_BYTES;
+    m_sums_stride = 4 * n_state / Q8_0_BLOCK;
     if (!ok)
     {
         error.set("out of memory for the Whisper buffers");
@@ -166,12 +174,41 @@ void WhisperRunner::matmul_task(void* user, int thread_index, int thread_count)
     {
         return;
     }
-    w.matmul(job.x, w.n_in, nullptr, 0, nullptr, 0, job.n_tokens, first, last, job.out, w.n_out);
+    w.matmul(job.x, w.n_in, job.xq, job.xq_stride, job.sums, job.sums_stride, job.n_tokens, first, last, job.out, w.n_out);
+}
+
+void WhisperRunner::quantize_task(void* user, int thread_index, int thread_count)
+{
+    WhisperRunner& runner = *static_cast<WhisperRunner*>(user);
+    const size_t first = runner.m_quantize_tokens * static_cast<size_t>(thread_index) / static_cast<size_t>(thread_count);
+    const size_t last = runner.m_quantize_tokens * static_cast<size_t>(thread_index + 1) / static_cast<size_t>(thread_count);
+    for (size_t t = first; t < last; ++t)
+    {
+        uint8_t* xq = runner.m_xq.data() + t * runner.m_xq_stride;
+        quantize_q8_0(runner.m_quantize_x + t * runner.m_quantize_n, runner.m_quantize_n, xq);
+        q8_0_block_sums(xq, runner.m_quantize_n, runner.m_sums.data() + t * runner.m_sums_stride);
+    }
+}
+
+void WhisperRunner::quantize_inputs(const float* x, size_t n_tokens, size_t n)
+{
+    m_quantize_x = x;
+    m_quantize_tokens = n_tokens;
+    m_quantize_n = n;
+    m_pool->run(quantize_task, this);
 }
 
 void WhisperRunner::matmul(const Weight& w, const float* x, size_t n_tokens, float* out)
 {
-    MatmulJob job{&w, x, n_tokens, out};
+    MatmulJob job{&w, x, nullptr, 0, nullptr, 0, n_tokens, out};
+    if (w.activation() != Activation::F32)
+    {
+        quantize_inputs(x, n_tokens, w.n_in);
+        job.xq = m_xq.data();
+        job.xq_stride = m_xq_stride;
+        job.sums = m_sums.data();
+        job.sums_stride = m_sums_stride;
+    }
     m_pool->run(matmul_task, &job);
 }
 
@@ -410,7 +447,7 @@ bool WhisperRunner::decode(const int32_t* tokens, size_t count, Array<float>& lo
         error.set("decode: %zu tokens at position %zu exceed the text context of %zu", count, m_position, n_text_ctx);
         return false;
     }
-    const float* te = m_model->token_embedding().f32();
+    const float* te = m_model->token_embedding_rows();
     const float* pe = m_model->positional_embedding_decoder();
     for (size_t t = 0; t < count; ++t)
     {

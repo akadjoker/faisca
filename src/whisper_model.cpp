@@ -83,7 +83,7 @@ const char* WhisperModel::token(int32_t id, size_t& length) const
     return reinterpret_cast<const char*>(m_vocab_bytes.data() + start);
 }
 
-bool WhisperModel::load(const char* path, Error& error)
+bool WhisperModel::load(const char* path, Error& error, bool quantize)
 {
     MappedFile file;
     if (!file.open(path, error))
@@ -221,6 +221,79 @@ bool WhisperModel::load(const char* path, Error& error)
         {
             return false;
         }
+    }
+    m_d_te_rows = m_d_te.f32();
+    if (quantize && q8_0_packed_supported())
+    {
+        return pack_weights(error);
+    }
+    return true;
+}
+
+void WhisperModel::pack_weight(Weight& w, uint8_t*& cursor, Array<uint8_t>& rows) const
+{
+    const size_t row_bytes = w.n_in / Q8_0_BLOCK * Q8_0_BLOCK_BYTES;
+    const float* source = w.f32();
+    for (size_t r = 0; r < w.n_out; ++r)
+    {
+        quantize_q8_0(source + r * w.n_in, w.n_in, rows.data() + r * row_bytes);
+    }
+    pack_q8_0(rows.data(), w.n_in, w.n_out, cursor);
+    w.type = GgmlType::Q8_0;
+    w.packed = true;
+    w.data = cursor;
+    cursor += q8_0_packed_bytes(w.n_in, w.n_out);
+}
+
+bool WhisperModel::pack_weights(Error& error)
+{
+    Weight* weights[8 * 64 + 1];
+    size_t count = 0;
+    const auto collect = [&](WhisperAttention& a)
+    {
+        weights[count++] = &a.q;
+        weights[count++] = &a.k;
+        weights[count++] = &a.v;
+        weights[count++] = &a.out;
+    };
+    for (size_t i = 0; i < m_encoder.size(); ++i)
+    {
+        collect(m_encoder[i].attn);
+        weights[count++] = &m_encoder[i].mlp_0;
+        weights[count++] = &m_encoder[i].mlp_1;
+    }
+    for (size_t i = 0; i < m_decoder.size(); ++i)
+    {
+        collect(m_decoder[i].attn);
+        collect(m_decoder[i].cross);
+        weights[count++] = &m_decoder[i].mlp_0;
+        weights[count++] = &m_decoder[i].mlp_1;
+    }
+    weights[count++] = &m_d_te;
+
+    size_t total = 0;
+    size_t widest = 0;
+    for (size_t i = 0; i < count; ++i)
+    {
+        if (weights[i]->n_in % Q8_0_BLOCK != 0)
+        {
+            error.set("matrix width %zu is not a multiple of 32", weights[i]->n_in);
+            return false;
+        }
+        total += q8_0_packed_bytes(weights[i]->n_in, weights[i]->n_out);
+        const size_t bytes = weights[i]->n_out * (weights[i]->n_in / Q8_0_BLOCK * Q8_0_BLOCK_BYTES);
+        widest = bytes > widest ? bytes : widest;
+    }
+    Array<uint8_t> rows;
+    if (!m_packed.resize_uninitialized(total) || !rows.resize_uninitialized(widest))
+    {
+        error.set("out of memory for the packed weights");
+        return false;
+    }
+    uint8_t* cursor = m_packed.data();
+    for (size_t i = 0; i < count; ++i)
+    {
+        pack_weight(*weights[i], cursor, rows);
     }
     return true;
 }

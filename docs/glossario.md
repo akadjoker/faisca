@@ -562,6 +562,87 @@ runner_phases). Os resultados ficam nas notas; o código não é commitado.
 
 ---
 
+## 9b. Voz: Whisper e os termos de áudio
+
+**Amostra, taxa de amostragem, 16 kHz**
+Um ficheiro de som é uma lista de números (amostras), cada um a altura da
+onda num instante. 16 kHz quer dizer 16000 amostras por segundo. O Whisper
+foi treinado com 16 kHz mono (um canal); áudio a 44.1 kHz ou estéreo tem
+de ser convertido antes (o `ffmpeg` faz isso; o nosso leitor de WAV recusa
+outras taxas e tira a média dos canais).
+
+**WAV, PCM 16 bits**
+O formato de ficheiro mais simples: um cabeçalho e as amostras cruas, cada
+uma um inteiro de 16 bits. Sem compressão. MP3 e OGG são comprimidos e
+precisariam de um descodificador nosso.
+
+**FFT (transformada de Fourier)**
+A operação que converte um pedaço de som (400 amostras, 25 ms) na lista
+de frequências que o compõem e com que força. Fazemos uma a cada 10 ms
+(160 amostras de salto).
+
+**Janela de Hann**
+Antes da FFT, o pedaço de 400 amostras é multiplicado por uma curva que
+vale zero nas pontas e um no meio, para o corte não inventar frequências
+falsas.
+
+**Espectrograma mel, "mel"**
+A imagem que o modelo realmente ouve: para cada 10 ms, 80 valores que
+dizem quanta energia há em 80 bandas de frequência espaçadas como o
+ouvido humano as separa (escala mel). Os valores são logaritmos,
+cortados a 8 abaixo do máximo e normalizados. 30 segundos dão 3000
+colunas por 80 linhas. O nosso é igual bit a bit ao do whisper.cpp.
+
+**Encoder, decoder**
+O Whisper tem duas metades. O encoder lê o espectrograma inteiro (3000
+colunas, reduzidas a 1500 por uma convolução de passo 2) e produz 1500
+vectores que resumem o som. O decoder é um modelo de linguagem como os
+SmolLM2: gera o texto token a token, mas em cada camada, além de olhar
+para os tokens anteriores, olha para os 1500 vectores do encoder.
+
+**Atenção cruzada (cross attention)**
+Esse olhar do decoder para o encoder. As chaves e os valores vêm do
+encoder (calculados uma vez por janela e guardados), as queries vêm do
+texto.
+
+**Convolução 1D**
+A primeira operação do encoder: cada saída mistura três colunas vizinhas
+do espectrograma com pesos aprendidos. Duas delas, a segunda a saltar de
+duas em duas colunas.
+
+**Layer norm, GELU**
+As variantes que o Whisper usa em vez do rms_norm e do SwiGLU: a layer
+norm subtrai a média e divide pelo desvio, com peso e bias; o GELU é a
+activação, uma curva suave parecida com um ReLU.
+
+**Tokens especiais do Whisper**
+O prompt do decoder é fixo: início (sot), língua (`<|pt|>`), tarefa
+(transcrever ou traduzir) e "sem timestamps". O modelo responde com
+tokens de texto até ao fim de texto (eot). Os tokens de timestamp marcam
+tempos de 20 em 20 ms; ainda não os usamos.
+
+**Janela de 30 segundos**
+O encoder processa sempre 30 s de cada vez (o que falta é preenchido com
+silêncio). Áudio mais longo é cortado em janelas sucessivas; o whisper.cpp
+usa os timestamps para cortar nas pausas, nós por agora cortamos aos 30 s.
+
+**WER (word error rate)**
+A medida de qualidade da transcrição: palavras trocadas, a mais ou a
+menos, a dividir pelo total. 5% quer dizer uma palavra errada em vinte.
+
+**tiny, base, small, medium, large**
+Os tamanhos do Whisper: 39 M, 74 M, 244 M, 769 M e 1550 M de pesos. Os
+ficheiros `ggml-*.bin` do whisper.cpp guardam-nos em f16 (metade do
+tamanho em bytes). O faisca converte para float32 ao carregar e, por
+omissão, quantiza as matrizes para Q8_0 com os kernels que já tinha.
+
+**Tempo real, "6x real time"**
+Quantos segundos de áudio se transcrevem por segundo de relógio. 6x quer
+dizer que um minuto de gravação demora dez segundos. Abaixo de 1x é mais
+lento do que ouvir.
+
+---
+
 ## 10. Os ficheiros em /home/user/models
 
 | Ficheiro | O que é |
@@ -573,6 +654,8 @@ runner_phases). Os resultados ficam nas notas; o código não é commitado.
 | draft/smollm2-135m-instruct-*.gguf | o modelo pequeno para speculative decoding |
 | 1.7b/smollm2-1.7b-instruct-q4_k_m.gguf | modelo maior, oficial, Q4_K e Q6_K a sério |
 | llama32/llama-3.2-1b-instruct-q8_0.gguf | Llama 3.2 1B, com rope factors e tokenizer llama-bpe |
+| whisper/ggml-{tiny,base,small}.bin | Whisper multilingue do whisper.cpp, f16 |
+| whisper/ggml-*-f32.bin | os mesmos em float32, feitos com tests/make_f32_whisper.py (referência) |
 
 Os ficheiros `*-f32.gguf` existem só para validação: os dois lados
 (faisca e llama.cpp) lêem os mesmos números exactos e qualquer diferença

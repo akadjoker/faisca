@@ -85,7 +85,14 @@ public:
     WhisperModel(const WhisperModel&) = delete;
     WhisperModel& operator=(const WhisperModel&) = delete;
 
-    bool load(const char* path, Error& error);
+    // quantize: the matrices are quantized to Q8_0 and packed for the VNNI kernels when this
+    // build has them (the file's values are the float32 reference otherwise)
+    bool load(const char* path, Error& error, bool quantize = true);
+
+    bool quantized() const
+    {
+        return m_packed.size() != 0;
+    }
 
     const WhisperHparams& hparams() const
     {
@@ -157,10 +164,16 @@ public:
         return m_d_pe;
     }
 
-    // n_vocab x n_text_state, also the output matrix
+    // n_vocab x n_text_state, the output matrix (packed when quantized)
     const Weight& token_embedding() const
     {
         return m_d_te;
+    }
+
+    // the same rows in float32 for the embedding lookup
+    const float* token_embedding_rows() const
+    {
+        return m_d_te_rows;
     }
 
     const WhisperLayer& decoder_layer(size_t index) const
@@ -190,6 +203,8 @@ private:
     bool find(const char* name, int32_t ne0, int32_t ne1, int32_t ne2, const float*& out, Error& error) const;
     bool find_weight(const char* name, int32_t n_in, int32_t n_out, Weight& out, Error& error) const;
     bool find_layer(const char* prefix, int layer, bool cross, WhisperLayer& out, Error& error) const;
+    bool pack_weights(Error& error);
+    void pack_weight(Weight& w, uint8_t*& cursor, Array<uint8_t>& rows) const;
 
     WhisperHparams m_hparams;
     WhisperTokens m_tokens;
@@ -197,6 +212,7 @@ private:
     Array<uint8_t> m_vocab_bytes;
     Array<uint32_t> m_vocab_offsets;
     Array<float> m_storage;
+    Array<uint8_t> m_packed;
     Array<Entry> m_entries;
     StringMap m_index;
     Array<WhisperLayer> m_encoder;
@@ -210,6 +226,7 @@ private:
     const float* m_e_ln_b = nullptr;
     const float* m_d_pe = nullptr;
     Weight m_d_te;
+    const float* m_d_te_rows = nullptr;
     const float* m_d_ln_w = nullptr;
     const float* m_d_ln_b = nullptr;
 };
