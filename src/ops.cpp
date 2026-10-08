@@ -866,6 +866,27 @@ void matvec_q6_k_packed_scalar(const uint8_t* packed, const uint8_t* xq, const i
     (void)n_out;
 }
 
+#if defined(FAISCA_AVX512_VNNI) || defined(FAISCA_AVX_VNNI)
+
+namespace
+{
+
+// one input at a time the kernels are bound by the misses in flight, not by compute:
+// asking for the group block 8 KiB ahead keeps the memory pipeline full (bench/README.md)
+constexpr size_t PREFETCH_AHEAD = 8192;
+
+inline void prefetch_group_block(const uint8_t* block, size_t bytes)
+{
+    for (size_t line = 0; line < bytes; line += 64)
+    {
+        _mm_prefetch(reinterpret_cast<const char*>(block + PREFETCH_AHEAD + line), _MM_HINT_T0);
+    }
+}
+
+}
+
+#endif
+
 #if defined(FAISCA_AVX512_VNNI)
 
 namespace
@@ -885,6 +906,7 @@ void gemm_group_avx512(const uint8_t* block, const uint8_t* xq, size_t xq_stride
     }
     for (size_t b = 0; b < blocks; ++b)
     {
+        prefetch_group_block(block, Q8_0_GROUP_BLOCK_BYTES);
         const uint8_t* quants = block + 2 * Q8_0_GROUP;
         __m512i w[8];
         for (size_t j = 0; j < 8; ++j)
@@ -961,6 +983,7 @@ void matvec_q8_0_packed(const uint8_t* packed, const uint8_t* xq, const int32_t*
         __m512 acc = _mm512_setzero_ps();
         for (size_t b = 0; b < blocks; ++b)
         {
+            prefetch_group_block(block, Q8_0_GROUP_BLOCK_BYTES);
             const uint8_t* quants = block + 2 * Q8_0_GROUP;
             __m512i sum = _mm512_setzero_si512();
             for (size_t j = 0; j < 8; ++j)
@@ -1009,6 +1032,7 @@ void gemm_group_q4_avx512(const uint8_t* block, const uint8_t* xq, size_t xq_str
     }
     for (size_t b = 0; b < blocks; ++b)
     {
+        prefetch_group_block(block, Q4_0_GROUP_BLOCK_BYTES);
         const uint8_t* quants = block + 2 * Q8_0_GROUP;
         __m512i w[8];
         for (size_t c = 0; c < 4; ++c)
@@ -1104,6 +1128,7 @@ void gemm_group_q5_avx512(const uint8_t* block, const uint8_t* xq, size_t xq_str
     }
     for (size_t b = 0; b < blocks; ++b)
     {
+        prefetch_group_block(block, Q5_0_GROUP_BLOCK_BYTES);
         const uint8_t* quants = block + 2 * Q8_0_GROUP;
         const __m512i high = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(quants + 4 * 64));
         __m512i w[8];
@@ -1165,6 +1190,7 @@ void gemm_group_q4_k_avx512(const uint8_t* block, const uint8_t* xq, size_t xq_s
     }
     for (size_t b = 0; b < blocks; ++b)
     {
+        prefetch_group_block(block, Q4_K_GROUP_BLOCK_BYTES);
         const uint8_t* quants = block + Q4_K_PACKED_QUANTS;
         __m512i sumi[TOKENS];
         __m512i summ[TOKENS];
@@ -1228,6 +1254,7 @@ void gemm_group_q6_k_avx512(const uint8_t* block, const uint8_t* xq, size_t xq_s
     }
     for (size_t b = 0; b < blocks; ++b)
     {
+        prefetch_group_block(block, Q6_K_GROUP_BLOCK_BYTES);
         const uint8_t* quants = block + Q6_K_PACKED_QUANTS;
         const uint8_t* high = block + Q6_K_PACKED_HIGH;
         __m512i sumi[TOKENS];
@@ -1353,6 +1380,7 @@ void matmul_q4_0_packed(const uint8_t* packed, const uint8_t* xq, size_t xq_stri
             __m256 acc_hi = _mm256_setzero_ps();
             for (size_t b = 0; b < blocks; ++b)
             {
+                prefetch_group_block(block, Q4_0_GROUP_BLOCK_BYTES);
                 const uint8_t* quants = block + 2 * Q8_0_GROUP;
                 const uint8_t* x = xt + b * Q8_0_BLOCK_BYTES;
                 __m256i sum_lo = _mm256_setzero_si256();
@@ -1416,6 +1444,7 @@ void matvec_q8_0_packed(const uint8_t* packed, const uint8_t* xq, const int32_t*
         __m256 acc_hi = _mm256_setzero_ps();
         for (size_t b = 0; b < blocks; ++b)
         {
+            prefetch_group_block(block, Q8_0_GROUP_BLOCK_BYTES);
             const uint8_t* quants = block + 2 * Q8_0_GROUP;
             __m256i sum_lo = _mm256_setzero_si256();
             __m256i sum_hi = _mm256_setzero_si256();

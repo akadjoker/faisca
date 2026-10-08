@@ -175,51 +175,54 @@ SmolLM2-360M-Instruct.
 | Q4_0 prompt (tok/s) | 4 | 147 | 480 |
 
 Q4_K_M (Q5_0 for the 960 wide matrices, Q4_K and Q6_K for `ffn_down`, Q8_0
-for the embeddings and half of `attn_v`), measured with a harness over
-`Runner`: the first 512 tokens of the 1045 token prompt, then 32 greedy
-tokens, best of 3; llama-bench pp512 and tg32. Q8_0 under the same harness is
-the calibration row.
+for the embeddings and half of `attn_v`), Q4_0 and Q8_0 measured with a
+harness over `Runner`: the first 512 tokens of the 1045 token prompt, then
+32 greedy tokens, best of 3; llama-bench pp512 and tg32. The "before" column
+is the same code without the software prefetch described below.
 
-| | threads | llama.cpp | faisca |
-| --- | --- | --- | --- |
-| Q4_K_M generation (tok/s) | 1 | 19.2 | 23.6 |
-| Q4_K_M generation (tok/s) | 4 | 54 | 78 |
-| Q4_K_M prompt (tok/s) | 1 | 83 | 164 |
-| Q4_K_M prompt (tok/s) | 4 | 266 | 492 |
-| Q8_0 generation, same harness (tok/s) | 1 | | 24.6 |
-| Q8_0 generation, same harness (tok/s) | 4 | | 76.5 |
-| Q8_0 prompt, same harness (tok/s) | 1 | | 166 |
-| Q8_0 prompt, same harness (tok/s) | 4 | | 494 |
+| | threads | llama.cpp | faisca before prefetch | faisca |
+| --- | --- | --- | --- | --- |
+| Q8_0 generation (tok/s) | 1 | 24.9 | 24.6 | 31.9 |
+| Q8_0 generation (tok/s) | 4 | 71 | 76.5 | 90 |
+| Q8_0 prompt (tok/s) | 1 | 255 | 166 | 178 |
+| Q8_0 prompt (tok/s) | 4 | 143 | 494 | 494 |
+| Q4_0 generation (tok/s) | 1 | 38.8 | 30.8 | 44.3 |
+| Q4_0 generation (tok/s) | 4 | 70 | 89.7 | 134 |
+| Q4_0 prompt (tok/s) | 1 | 249 | 177 | 189 |
+| Q4_0 prompt (tok/s) | 4 | 147 | 558 | 542 |
+| Q4_K_M generation (tok/s) | 1 | 19.2 | 23.6 | 37.9 |
+| Q4_K_M generation (tok/s) | 4 | 54 | 78 | 117 |
+| Q4_K_M prompt (tok/s) | 1 | 83 | 164 | 177 |
+| Q4_K_M prompt (tok/s) | 4 | 266 | 492 | 521 |
 
 llama.cpp is slower on Q4_K_M than on Q8_0 here because Q5_0 has no AMX
-kernel in its CPU backend. faisca's Q5_0 kernel is compute bound on one
-thread like its Q4_0 one: over the 64 Q5_0 `ffn_gate` and `ffn_up` matrices
-(103 MiB) one token takes 15.4 ms, 7.0 GB/s of weights, while the same values
-expanded to packed Q8_0 at load (exact, 159 MiB) take 14.5 ms at 11.5 GB/s;
-with 16 tokens Q5_0 wins, 25.3 ms against 33.6. The packed Q5_0 is kept: it
-is 35% less memory, faster on the prompt and 6% slower on single thread
-generation, which a cheaper unpack can recover.
+kernel in its CPU backend.
 
-KV cache in f16 against float32, Q8_0 weights, context of 2048 positions,
-prompt of 1045 tokens then 64 greedy tokens (best of 3, `tests/runner_dump`
-style harness over `Runner` with `kv_f16` on and off):
+**Why the generation kernels needed a software prefetch.** One input at a
+time, the Q4_0 kernel streamed weights at 7 GB/s and Q8_0 at 11.5 while the
+same kernels on data in cache run at 39 and 67 GB/s (-O3; at -O2 the
+compiler spills the unpacked chunks and the in-cache numbers are 3x worse,
+which sent the first measurements astray). So the unpack was not the cost.
+Q4_0 spends 36 instructions per block of 4.5 cache lines where Q8_0 spends
+24 per 8.5 lines, so the out of order window holds fewer outstanding lines
+for Q4_0 and the memory pipeline runs below the 10 GB/s one core can pull
+with the hardware prefetchers alone. Asking for the group block 8 KiB ahead
+(one `prefetcht0` per line, measured on a 400 MiB stream, the L3 here is
+260 MiB) fixes it for every type:
 
-| | threads | KV float32 | KV f16 |
-| --- | --- | --- | --- |
-| cache for 2048 positions (MiB) | | 160 | 80 |
-| prompt (tok/s) | 1 | 122 | 132 |
-| prompt (tok/s) | 4 | 393 | 417 |
-| generation at 1045 to 1109 positions (tok/s) | 1 | 20.4 | 21.5 |
-| generation at 1045 to 1109 positions (tok/s) | 4 | 56 | 65 |
+| 400 MiB stream, one token | no prefetch | 4 KiB ahead | 8 KiB | 16 KiB | 32 KiB |
+| --- | --- | --- | --- | --- | --- |
+| Q8_0 (GB/s) | 12.3 | 14.0 | 16.0 | 13.0 | 12.2 |
+| Q4_0 (GB/s) | 7.9 | 13.3 | 13.8 | 13.5 | 11.4 |
+| Q5_0 (GB/s) | 7.0 | 12.9 | 13.2 | 12.9 | 10.3 |
 
-The f16 halves are converted with F16C as they are read; q and the softmax
-weights stay float32, so the kernel's arithmetic is the float32 kernel's and
-its output is bit identical to that kernel fed with the rounded values. The
-cost of the rounding, measured as the relative L2 distance from the float32
-cache run of llama.cpp on the float32 model: faisca f16 1.9e-3 (16 tokens)
-and 2.49e-3 (1045 tokens); llama.cpp's own f16 cache, which also rounds q
-and the softmax weights, 2.2e-3 and 2.50e-3. Greedy tokens identical in
-every case.
+Splitting the `vpdpbusd` chain over 2 or 4 accumulators changed nothing, in
+cache or streaming. The outputs are bit identical with and without the
+prefetch.
+
+Expanding Q5_0 to packed Q8_0 at load (exact values, 1.55x the bytes) was
+measured before the prefetch: 6% faster for one token on one thread, slower
+with 16 tokens; packed Q5_0 is kept.
 
 How the generation speed got there, one thread, Q8_0: float32 weights 4.7
 tok/s; Q8_0 rows with an AVX2 kernel 7.8; block scales converted with F16C
