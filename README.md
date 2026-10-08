@@ -164,17 +164,20 @@ files: `matvec_q8_0` (Q8_0 rows split into packed f16 scales and int8
 quants, float32 activations and arithmetic), `matvec_f32`, the embedding
 gather, `rms_norm`, `rope`, the KV cache store, `attention`, `swiglu` and
 `add`. `VulkanRunner` (vulkan_runner.h) runs the whole model with them,
-one command buffer per batch of 32 tokens, weights on the device (Q8_0 as
-is, every other type as float32), activations and KV cache in float32, and
-the same trace callback as `Runner`; `faisca generate --vulkan` and
+one command buffer per batch of 32 tokens, weights on the device in their
+quantized form (Q8_0, Q4_0, Q5_0, Q4_K and Q6_K each have a matvec shader
+that dequantizes as it reads; F16 is converted to float32), activations and
+KV cache in float32, and the same trace callback as `Runner`; `faisca generate --vulkan` and
 `runner_dump --vulkan` use it. Validation on llvmpipe, Mesa's CPU device
 (there is no GPU on the development machine, so no speed numbers yet):
-`tests/vulkan_check` compares the matvec kernels over block 0 and the
-output matrix with a double precision product, 1.3e-7 to 1.8e-7 on SmolLM2
-Q8_0 and F32 with 1 and 16 inputs; `compare_layers.py --ours-flags=--vulkan`
-puts the float32 model at 1.8e-6 from llama.cpp and 3.4e-6 from the CPU
-runner, and the Q8_0 model at 2.0e-6 from llama.cpp on the float32 copy
-(`--reference-model`), 16 greedy tokens identical in every case. `cmake
+`tests/vulkan_check` compares the matvec kernels over block 0, the output
+matrix and (`--all-down`) every `ffn_down` with a double precision product:
+1.2e-7 to 1.8e-7 for Q8_0, Q4_0, Q5_0, Q6_K and F32, 3e-7 to 5e-7 for Q4_K,
+with 1 to 16 inputs; `compare_layers.py --ours-flags=--vulkan` puts the
+float32 model at 1.8e-6 from llama.cpp and 3.4e-6 from the CPU runner, and
+the Q8_0, Q4_0 and Q4_K_M models at 2.0e-6, 1.9e-6 and 2.3e-6 from llama.cpp
+on their float32 copies (`--reference-model`), 16 greedy tokens identical in
+every case. `cmake
 -DFAISCA_VULKAN=OFF` leaves the backend out.
 
 `GgufFile` is a plain value object: no smart pointers, no heap allocation for

@@ -93,28 +93,69 @@ bool VulkanRunner::upload_vector(const GgufTensor* tensor, VulkanBuffer& out, Er
            m_device->upload(out, values.data(), count * sizeof(float), error);
 }
 
-bool VulkanRunner::upload_matrix(const GgufTensor* tensor, Matrix& out, Error& error)
+bool VulkanRunner::upload_matrix(const GgufTensor* tensor, Matrix& out, Error& error, bool quantized)
 {
     out.n_in = static_cast<uint32_t>(tensor->dims[0]);
     out.n_out = static_cast<uint32_t>(tensor->dims[1]);
     const size_t n_in = out.n_in;
     const size_t n_out = out.n_out;
-    if (tensor->type == GgmlType::Q8_0)
+    const bool split = tensor->type == GgmlType::Q8_0 || tensor->type == GgmlType::Q4_0 || tensor->type == GgmlType::Q5_0;
+    const bool k_quant = tensor->type == GgmlType::Q4_K || tensor->type == GgmlType::Q6_K;
+    if ((split || k_quant) && (quantized || tensor->type == GgmlType::Q8_0))
     {
         Array<uint32_t> scales;
         Array<uint32_t> quants;
-        if (!scales.resize_uninitialized(q8_0_split_scale_words(n_in, n_out)) ||
-            !quants.resize_uninitialized(q8_0_split_quant_words(n_in, n_out)))
+        size_t quant_words = 0;
+        switch (tensor->type)
+        {
+            case GgmlType::Q8_0:
+                quant_words = q8_0_split_quant_words(n_in, n_out);
+                break;
+            case GgmlType::Q4_0:
+                quant_words = q4_0_split_quant_words(n_in, n_out);
+                break;
+            case GgmlType::Q5_0:
+                quant_words = q5_0_split_quant_words(n_in, n_out);
+                break;
+            case GgmlType::Q4_K:
+                quant_words = q4_k_device_words(n_in, n_out);
+                break;
+            default:
+                quant_words = q6_k_device_words(n_in, n_out);
+                break;
+        }
+        if (!quants.resize_uninitialized(quant_words) ||
+            (split && !scales.resize_uninitialized(q8_0_split_scale_words(n_in, n_out))))
         {
             error.set("out of memory");
             return false;
         }
-        split_q8_0(tensor->data, n_in, n_out, scales.data(), quants.data());
-        out.q8 = true;
+        switch (tensor->type)
+        {
+            case GgmlType::Q8_0:
+                split_q8_0(tensor->data, n_in, n_out, scales.data(), quants.data());
+                break;
+            case GgmlType::Q4_0:
+                split_q4_0(tensor->data, n_in, n_out, scales.data(), quants.data());
+                break;
+            case GgmlType::Q5_0:
+                split_q5_0(tensor->data, n_in, n_out, scales.data(), quants.data());
+                break;
+            case GgmlType::Q4_K:
+                pack_q4_k_device(tensor->data, n_in, n_out, quants.data());
+                break;
+            default:
+                pack_q6_k_device(tensor->data, n_in, n_out, quants.data());
+                break;
+        }
+        out.type = tensor->type;
         m_weight_bytes += (scales.size() + quants.size()) * 4;
-        return m_device->create_buffer(scales.size() * 4, out.scales, error) &&
-               m_device->upload(out.scales, scales.data(), scales.size() * 4, error) &&
-               m_device->create_buffer(quants.size() * 4, out.quants, error) &&
+        if (split && (!m_device->create_buffer(scales.size() * 4, out.scales, error) ||
+                      !m_device->upload(out.scales, scales.data(), scales.size() * 4, error)))
+        {
+            return false;
+        }
+        return m_device->create_buffer(quants.size() * 4, out.quants, error) &&
                m_device->upload(out.quants, quants.data(), quants.size() * 4, error);
     }
 
@@ -132,6 +173,8 @@ bool VulkanRunner::upload_matrix(const GgufTensor* tensor, Matrix& out, Error& e
     switch (tensor->type)
     {
         case GgmlType::F32:
+            std::memcpy(values.data(), tensor->data, n_in * n_out * sizeof(float));
+            break;
         case GgmlType::Q4_0:
         case GgmlType::Q5_0:
         case GgmlType::Q4_K:
@@ -154,7 +197,7 @@ bool VulkanRunner::upload_matrix(const GgufTensor* tensor, Matrix& out, Error& e
                       static_cast<int>(tensor->name.size()), tensor->name.data(), ggml_type_info(tensor->type)->name);
             return false;
     }
-    out.q8 = false;
+    out.type = GgmlType::F32;
     m_weight_bytes += values.size() * 4;
     return m_device->create_buffer(values.size() * 4, out.f32, error) &&
            m_device->upload(out.f32, values.data(), values.size() * 4, error);
@@ -192,7 +235,8 @@ bool VulkanRunner::init(VulkanDevice& device, const GgufFile& file, uint32_t n_c
         release();
         return false;
     }
-    if (!upload_matrix(token_embd, m_token_embd, error) || !upload_vector(output_norm, m_output_norm, error))
+    // the embedding gather reads Q8_0 or float32 only
+    if (!upload_matrix(token_embd, m_token_embd, error, false) || !upload_vector(output_norm, m_output_norm, error))
     {
         release();
         return false;
@@ -280,11 +324,21 @@ bool VulkanRunner::init(VulkanDevice& device, const GgufFile& file, uint32_t n_c
 
 bool VulkanRunner::matvec(const Matrix& w, const VulkanBuffer& x, VulkanBuffer& y, uint32_t n_tokens, Error& error)
 {
-    if (w.q8)
+    switch (w.type)
     {
-        return m_kernels.matvec_q8_0(w.scales, w.quants, x, y, w.n_in, w.n_out, n_tokens, w.n_in, w.n_out, error);
+        case GgmlType::Q8_0:
+            return m_kernels.matvec_q8_0(w.scales, w.quants, x, y, w.n_in, w.n_out, n_tokens, w.n_in, w.n_out, error);
+        case GgmlType::Q4_0:
+            return m_kernels.matvec_q4_0(w.scales, w.quants, x, y, w.n_in, w.n_out, n_tokens, w.n_in, w.n_out, error);
+        case GgmlType::Q5_0:
+            return m_kernels.matvec_q5_0(w.scales, w.quants, x, y, w.n_in, w.n_out, n_tokens, w.n_in, w.n_out, error);
+        case GgmlType::Q4_K:
+            return m_kernels.matvec_q4_k(w.quants, x, y, w.n_in, w.n_out, n_tokens, w.n_in, w.n_out, error);
+        case GgmlType::Q6_K:
+            return m_kernels.matvec_q6_k(w.quants, x, y, w.n_in, w.n_out, n_tokens, w.n_in, w.n_out, error);
+        default:
+            return m_kernels.matvec_f32(w.f32, x, y, w.n_in, w.n_out, n_tokens, w.n_in, w.n_out, error);
     }
-    return m_kernels.matvec_f32(w.f32, x, y, w.n_in, w.n_out, n_tokens, w.n_in, w.n_out, error);
 }
 
 bool VulkanRunner::trace(const char* name, int layer, const VulkanBuffer& buffer, size_t count, size_t n_tokens,
@@ -319,8 +373,9 @@ bool VulkanRunner::forward_batch(size_t count, uint32_t pos, float* logits, bool
     {
         return false;
     }
-    bool ok = m_token_embd.q8 ? k.embed_q8_0(m_token_embd.scales, m_token_embd.quants, m_tokens, m_x, h.n_embd, n, error)
-                              : k.embed_f32(m_token_embd.f32, m_tokens, m_x, h.n_embd, n, error);
+    bool ok = m_token_embd.type == GgmlType::Q8_0
+                  ? k.embed_q8_0(m_token_embd.scales, m_token_embd.quants, m_tokens, m_x, h.n_embd, n, error)
+                  : k.embed_f32(m_token_embd.f32, m_tokens, m_x, h.n_embd, n, error);
     ok = ok && trace("inp_embd", -1, m_x, h.n_embd, count, error);
 
     for (uint32_t l = 0; ok && l < h.n_layer; ++l)

@@ -48,16 +48,22 @@ top. No third party dependencies. Owner: Luís (akadjoker). "faisca" is a workin
    tests/vulkan_check (1.3e-7 to 1.8e-7 against double precision, 1 and 16
    inputs), the other ops (embed, rms_norm, rope, kv_store, attention,
    swiglu, add) and VulkanRunner (include/faisca/vulkan_runner.h: weights
-   uploaded from the GgufFile, Q8_0 split, other types as float32; float32
+   uploaded from the GgufFile: Q8_0, Q4_0 and Q5_0 split into packed f16
+   scales and uints of quants, Q4_K as the file's 36 uint blocks, Q6_K as
+   53 uint blocks (2 bytes of padding), each with its own matvec shader
+   that dequantizes as it reads, F16 as float32; the embedding gather
+   reads Q8_0 or float32 only, so other embedding types convert; float32
    activations and KV cache; one command buffer per batch, submitted and
    downloaded after every traced step when a trace is set; `--vulkan` in
    the CLI and runner_dump). Validated with compare_layers
    (`--ours-flags=--vulkan`, `--reference-model` for a different file on
    the reference side): float32 model 1.8e-6 from llama.cpp and 3.4e-6
-   from the CPU runner, Q8_0 model 2.0e-6 from llama.cpp on the float32
-   copy (the GPU does not quantize activations, so it is closer to float32
-   than the CPU Q8_0 path; against llama.cpp Q8_0 it is 8e-2 and the near
-   tie token flips), 16 tokens identical. Only llvmpipe (Mesa CPU, Vulkan
+   from the CPU runner, Q8_0 / Q4_0 / Q4_K_M models 2.0e-6 / 1.9e-6 /
+   2.3e-6 from llama.cpp on their float32 copies (the GPU does not quantize
+   activations, so it is closer to float32 than the CPU quantized paths;
+   against llama.cpp Q8_0 it is 8e-2 and the near tie token flips), 16
+   tokens identical; vulkan_check per matrix 1.2e-7 to 5e-7 for every
+   type (`--all-down` covers the Q4_K layers). Only llvmpipe (Mesa CPU, Vulkan
    1.4, subgroup 8) is available here, so correctness only; speed needs the
    owner's GPU. Next: speed on a real GPU (the kernels are simple: one
    workgroup per row, scalar loads; expected first optimizations: several

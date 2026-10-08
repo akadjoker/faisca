@@ -33,6 +33,69 @@ void split_q8_0(const uint8_t* rows, size_t n_in, size_t n_out, uint32_t* scales
     }
 }
 
+size_t q4_0_split_quant_words(size_t n_in, size_t n_out)
+{
+    return n_out * (n_in / Q4_0_BLOCK) * 4;
+}
+
+void split_q4_0(const uint8_t* rows, size_t n_in, size_t n_out, uint32_t* scales, uint32_t* quants)
+{
+    const size_t blocks = n_in / Q4_0_BLOCK;
+    std::memset(scales, 0, q8_0_split_scale_words(n_in, n_out) * sizeof(uint32_t));
+    for (size_t i = 0; i < n_out * blocks; ++i)
+    {
+        const uint8_t* block = rows + i * Q4_0_BLOCK_BYTES;
+        uint16_t bits = 0;
+        std::memcpy(&bits, block, 2);
+        scales[i / 2] |= static_cast<uint32_t>(bits) << (16 * (i % 2));
+        std::memcpy(quants + i * 4, block + 2, 16);
+    }
+}
+
+size_t q5_0_split_quant_words(size_t n_in, size_t n_out)
+{
+    return n_out * (n_in / Q5_0_BLOCK) * 5;
+}
+
+void split_q5_0(const uint8_t* rows, size_t n_in, size_t n_out, uint32_t* scales, uint32_t* quants)
+{
+    const size_t blocks = n_in / Q5_0_BLOCK;
+    std::memset(scales, 0, q8_0_split_scale_words(n_in, n_out) * sizeof(uint32_t));
+    for (size_t i = 0; i < n_out * blocks; ++i)
+    {
+        const uint8_t* block = rows + i * Q5_0_BLOCK_BYTES;
+        uint16_t bits = 0;
+        std::memcpy(&bits, block, 2);
+        scales[i / 2] |= static_cast<uint32_t>(bits) << (16 * (i % 2));
+        std::memcpy(quants + i * 5, block + 2, 20);
+    }
+}
+
+size_t q4_k_device_words(size_t n_in, size_t n_out)
+{
+    return n_out * (n_in / Q4_K_BLOCK) * (Q4_K_BLOCK_BYTES / 4);
+}
+
+void pack_q4_k_device(const uint8_t* rows, size_t n_in, size_t n_out, uint32_t* out)
+{
+    std::memcpy(out, rows, n_out * (n_in / Q4_K_BLOCK) * Q4_K_BLOCK_BYTES);
+}
+
+size_t q6_k_device_words(size_t n_in, size_t n_out)
+{
+    return n_out * (n_in / Q6_K_BLOCK) * 53;
+}
+
+void pack_q6_k_device(const uint8_t* rows, size_t n_in, size_t n_out, uint32_t* out)
+{
+    const size_t blocks = n_out * (n_in / Q6_K_BLOCK);
+    for (size_t i = 0; i < blocks; ++i)
+    {
+        out[i * 53 + 52] = 0;
+        std::memcpy(out + i * 53, rows + i * Q6_K_BLOCK_BYTES, Q6_K_BLOCK_BYTES);
+    }
+}
+
 VulkanKernels::~VulkanKernels()
 {
     release();
@@ -43,6 +106,10 @@ bool VulkanKernels::init(VulkanDevice& device, Error& error)
     release();
     m_device = &device;
     if (!device.create_pipeline(spv_matvec_q8_0, spv_matvec_q8_0_words, 4, 6 * 4, m_matvec_q8_0, error) ||
+        !device.create_pipeline(spv_matvec_q4_0, spv_matvec_q4_0_words, 4, 6 * 4, m_matvec_q4_0, error) ||
+        !device.create_pipeline(spv_matvec_q5_0, spv_matvec_q5_0_words, 4, 6 * 4, m_matvec_q5_0, error) ||
+        !device.create_pipeline(spv_matvec_q4_k, spv_matvec_q4_k_words, 3, 6 * 4, m_matvec_q4_k, error) ||
+        !device.create_pipeline(spv_matvec_q6_k, spv_matvec_q6_k_words, 3, 6 * 4, m_matvec_q6_k, error) ||
         !device.create_pipeline(spv_matvec_f32, spv_matvec_f32_words, 3, 5 * 4, m_matvec_f32, error) ||
         !device.create_pipeline(spv_embed_q8_0, spv_embed_q8_0_words, 4, 2 * 4, m_embed_q8_0, error) ||
         !device.create_pipeline(spv_embed_f32, spv_embed_f32_words, 3, 1 * 4, m_embed_f32, error) ||
@@ -64,6 +131,10 @@ void VulkanKernels::release()
     if (m_device != nullptr)
     {
         m_device->destroy_pipeline(m_matvec_q8_0);
+        m_device->destroy_pipeline(m_matvec_q4_0);
+        m_device->destroy_pipeline(m_matvec_q5_0);
+        m_device->destroy_pipeline(m_matvec_q4_k);
+        m_device->destroy_pipeline(m_matvec_q6_k);
         m_device->destroy_pipeline(m_matvec_f32);
         m_device->destroy_pipeline(m_embed_q8_0);
         m_device->destroy_pipeline(m_embed_f32);
@@ -167,6 +238,40 @@ bool VulkanKernels::matvec_q8_0(const VulkanBuffer& scales, const VulkanBuffer& 
     const uint32_t push[6] = {n_in, n_out, n_in / static_cast<uint32_t>(Q8_0_BLOCK), x_stride, y_stride, n_tokens};
     const VulkanBuffer* buffers[4] = {&scales, &quants, &x, &y};
     return m_device->dispatch(m_matvec_q8_0, buffers, 4, push, sizeof(push), n_out, n_tokens, 1, error);
+}
+
+bool VulkanKernels::matvec_q4_0(const VulkanBuffer& scales, const VulkanBuffer& quants, const VulkanBuffer& x,
+                                VulkanBuffer& y, uint32_t n_in, uint32_t n_out, uint32_t n_tokens, uint32_t x_stride,
+                                uint32_t y_stride, Error& error)
+{
+    const uint32_t push[6] = {n_in, n_out, n_in / static_cast<uint32_t>(Q4_0_BLOCK), x_stride, y_stride, n_tokens};
+    const VulkanBuffer* buffers[4] = {&scales, &quants, &x, &y};
+    return m_device->dispatch(m_matvec_q4_0, buffers, 4, push, sizeof(push), n_out, n_tokens, 1, error);
+}
+
+bool VulkanKernels::matvec_q5_0(const VulkanBuffer& scales, const VulkanBuffer& quants, const VulkanBuffer& x,
+                                VulkanBuffer& y, uint32_t n_in, uint32_t n_out, uint32_t n_tokens, uint32_t x_stride,
+                                uint32_t y_stride, Error& error)
+{
+    const uint32_t push[6] = {n_in, n_out, n_in / static_cast<uint32_t>(Q5_0_BLOCK), x_stride, y_stride, n_tokens};
+    const VulkanBuffer* buffers[4] = {&scales, &quants, &x, &y};
+    return m_device->dispatch(m_matvec_q5_0, buffers, 4, push, sizeof(push), n_out, n_tokens, 1, error);
+}
+
+bool VulkanKernels::matvec_q4_k(const VulkanBuffer& blocks, const VulkanBuffer& x, VulkanBuffer& y, uint32_t n_in,
+                                uint32_t n_out, uint32_t n_tokens, uint32_t x_stride, uint32_t y_stride, Error& error)
+{
+    const uint32_t push[6] = {n_in, n_out, n_in / static_cast<uint32_t>(Q4_K_BLOCK), x_stride, y_stride, n_tokens};
+    const VulkanBuffer* buffers[3] = {&blocks, &x, &y};
+    return m_device->dispatch(m_matvec_q4_k, buffers, 3, push, sizeof(push), n_out, n_tokens, 1, error);
+}
+
+bool VulkanKernels::matvec_q6_k(const VulkanBuffer& blocks, const VulkanBuffer& x, VulkanBuffer& y, uint32_t n_in,
+                                uint32_t n_out, uint32_t n_tokens, uint32_t x_stride, uint32_t y_stride, Error& error)
+{
+    const uint32_t push[6] = {n_in, n_out, n_in / static_cast<uint32_t>(Q6_K_BLOCK), x_stride, y_stride, n_tokens};
+    const VulkanBuffer* buffers[3] = {&blocks, &x, &y};
+    return m_device->dispatch(m_matvec_q6_k, buffers, 3, push, sizeof(push), n_out, n_tokens, 1, error);
 }
 
 bool VulkanKernels::matvec_f32(const VulkanBuffer& w, const VulkanBuffer& x, VulkanBuffer& y, uint32_t n_in,

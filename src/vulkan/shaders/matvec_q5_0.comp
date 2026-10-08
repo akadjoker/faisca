@@ -1,0 +1,82 @@
+#version 450
+
+// Q5_0 rows: scales as f16 pairs, 5 uints per block (high bits, then 4 of nibbles),
+// value = (q - 16) * scale with bit j of the high word the fifth bit of value j
+
+layout(local_size_x = 32) in;
+
+layout(std430, binding = 0) readonly buffer Scales
+{
+    uint scales[];
+};
+
+layout(std430, binding = 1) readonly buffer Quants
+{
+    uint quants[];
+};
+
+layout(std430, binding = 2) readonly buffer Input
+{
+    float x[];
+};
+
+layout(std430, binding = 3) writeonly buffer Output
+{
+    float y[];
+};
+
+layout(push_constant) uniform Push
+{
+    uint n_in;
+    uint n_out;
+    uint blocks;
+    uint x_stride;
+    uint y_stride;
+    uint n_tokens;
+} p;
+
+shared float partial[32];
+
+void main()
+{
+    const uint row = gl_WorkGroupID.x;
+    const uint token = gl_WorkGroupID.y;
+    const uint tid = gl_LocalInvocationID.x;
+    float sum = 0.0;
+    for (uint b = tid; b < p.blocks; b += 32)
+    {
+        const uint block = row * p.blocks + b;
+        const float d = unpackHalf2x16(scales[block >> 1])[block & 1];
+        const uint high = quants[block * 5];
+        const uint xb = token * p.x_stride + b * 32;
+        float acc = 0.0;
+        for (uint j = 0; j < 4; ++j)
+        {
+            const uint w = quants[block * 5 + 1 + j];
+            for (uint k = 0; k < 4; ++k)
+            {
+                const uint i = 4 * j + k;
+                const uint byte = (w >> (8 * k)) & 0xffu;
+                const uint low = (byte & 0xfu) | (((high >> i) & 1u) << 4);
+                const uint up = (byte >> 4) | (((high >> (i + 16)) & 1u) << 4);
+                acc += (float(low) - 16.0) * x[xb + i];
+                acc += (float(up) - 16.0) * x[xb + 16 + i];
+            }
+        }
+        sum += d * acc;
+    }
+    partial[tid] = sum;
+    barrier();
+    for (uint s = 16; s > 0; s >>= 1)
+    {
+        if (tid < s)
+        {
+            partial[tid] += partial[tid + s];
+        }
+        barrier();
+    }
+    if (tid == 0)
+    {
+        y[token * p.y_stride + row] = partial[0];
+    }
+}

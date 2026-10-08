@@ -1,0 +1,82 @@
+#version 450
+
+// Q6_K super blocks of 256 as 53 uints: 32 of low nibbles, 16 of high bit pairs,
+// 4 of int8 scales for sub blocks of 16, 1 with d as a half; value = d * scale * (q - 32);
+// one thread per sub block of 16
+
+layout(local_size_x = 32) in;
+
+layout(std430, binding = 0) readonly buffer Blocks
+{
+    uint blocks[];
+};
+
+layout(std430, binding = 1) readonly buffer Input
+{
+    float x[];
+};
+
+layout(std430, binding = 2) writeonly buffer Output
+{
+    float y[];
+};
+
+layout(push_constant) uniform Push
+{
+    uint n_in;
+    uint n_out;
+    uint n_blocks;
+    uint x_stride;
+    uint y_stride;
+    uint n_tokens;
+} p;
+
+shared float partial[32];
+
+void main()
+{
+    const uint row = gl_WorkGroupID.x;
+    const uint token = gl_WorkGroupID.y;
+    const uint tid = gl_LocalInvocationID.x;
+    float sum = 0.0;
+    for (uint unit = tid; unit < p.n_blocks * 16; unit += 32)
+    {
+        const uint b = unit / 16;
+        const uint s = unit % 16;
+        const uint base = (row * p.n_blocks + b) * 53;
+        const float d = unpackHalf2x16(blocks[base + 52]).x;
+        const float scale = float(bitfieldExtract(int(blocks[base + 48 + s / 4]), int(8 * (s % 4)), 8));
+        const uint xb = token * p.x_stride + b * 256 + s * 16;
+        // value i of the super block: half n = i / 128, l = i % 32, part = (i % 128) / 32
+        float dot = 0.0;
+        for (uint k = 0; k < 16; ++k)
+        {
+            const uint i = s * 16 + k;
+            const uint half_block = i / 128;
+            const uint l = i % 32;
+            const uint part = (i % 128) / 32;
+            const uint ql_index = half_block * 64 + (part < 2 ? l + 32 * part : l + 32 * (part - 2));
+            const uint ql_byte = (blocks[base + ql_index / 4] >> (8 * (ql_index % 4))) & 0xffu;
+            const uint low = part < 2 ? (ql_byte & 0xfu) : (ql_byte >> 4);
+            const uint qh_index = half_block * 32 + l;
+            const uint qh_byte = (blocks[base + 32 + qh_index / 4] >> (8 * (qh_index % 4))) & 0xffu;
+            const uint high = (qh_byte >> (2 * part)) & 3u;
+            dot += (float(low | (high << 4)) - 32.0) * x[xb + k];
+        }
+        sum += d * scale * dot;
+    }
+    partial[tid] = sum;
+    barrier();
+    for (uint s = 16; s > 0; s >>= 1)
+    {
+        if (tid < s)
+        {
+            partial[tid] += partial[tid + s];
+        }
+        barrier();
+    }
+    if (tid == 0)
+    {
+        y[token * p.y_stride + row] = partial[0];
+    }
+}

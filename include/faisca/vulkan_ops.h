@@ -9,11 +9,22 @@
 namespace faisca
 {
 
-// Q8_0 rows in the layout the shaders read: scales as f16 pairs packed in uints,
-// quants as 8 uints per block of 32, both indexed by row * blocks + block
+// Quantized rows in the layouts the shaders read, every block 4 byte aligned. Q8_0,
+// Q4_0 and Q5_0: scales as f16 pairs packed in uints (q8_0_split_scale_words of them)
+// and 8, 4 or 5 uints of quants per block of 32 (Q5_0: the high bits first), both
+// indexed by row * blocks + block. Q4_K: the file's 144 byte blocks as 36 uints. Q6_K:
+// 53 uints per block, the file's 210 bytes then 2 bytes of padding.
 size_t q8_0_split_scale_words(size_t n_in, size_t n_out);
 size_t q8_0_split_quant_words(size_t n_in, size_t n_out);
 void split_q8_0(const uint8_t* rows, size_t n_in, size_t n_out, uint32_t* scales, uint32_t* quants);
+size_t q4_0_split_quant_words(size_t n_in, size_t n_out);
+void split_q4_0(const uint8_t* rows, size_t n_in, size_t n_out, uint32_t* scales, uint32_t* quants);
+size_t q5_0_split_quant_words(size_t n_in, size_t n_out);
+void split_q5_0(const uint8_t* rows, size_t n_in, size_t n_out, uint32_t* scales, uint32_t* quants);
+size_t q4_k_device_words(size_t n_in, size_t n_out);
+void pack_q4_k_device(const uint8_t* rows, size_t n_in, size_t n_out, uint32_t* out);
+size_t q6_k_device_words(size_t n_in, size_t n_out);
+void pack_q6_k_device(const uint8_t* rows, size_t n_in, size_t n_out, uint32_t* out);
 
 // the compute kernels, one pipeline each, recorded between VulkanDevice::begin and submit
 class VulkanKernels
@@ -32,6 +43,17 @@ public:
     bool matvec_q8_0(const VulkanBuffer& scales, const VulkanBuffer& quants, const VulkanBuffer& x, VulkanBuffer& y,
                      uint32_t n_in, uint32_t n_out, uint32_t n_tokens, uint32_t x_stride, uint32_t y_stride,
                      Error& error);
+
+    bool matvec_q4_0(const VulkanBuffer& scales, const VulkanBuffer& quants, const VulkanBuffer& x, VulkanBuffer& y,
+                     uint32_t n_in, uint32_t n_out, uint32_t n_tokens, uint32_t x_stride, uint32_t y_stride,
+                     Error& error);
+    bool matvec_q5_0(const VulkanBuffer& scales, const VulkanBuffer& quants, const VulkanBuffer& x, VulkanBuffer& y,
+                     uint32_t n_in, uint32_t n_out, uint32_t n_tokens, uint32_t x_stride, uint32_t y_stride,
+                     Error& error);
+    bool matvec_q4_k(const VulkanBuffer& blocks, const VulkanBuffer& x, VulkanBuffer& y, uint32_t n_in, uint32_t n_out,
+                     uint32_t n_tokens, uint32_t x_stride, uint32_t y_stride, Error& error);
+    bool matvec_q6_k(const VulkanBuffer& blocks, const VulkanBuffer& x, VulkanBuffer& y, uint32_t n_in, uint32_t n_out,
+                     uint32_t n_tokens, uint32_t x_stride, uint32_t y_stride, Error& error);
 
     // the same over a float32 matrix of n_out rows of n_in values
     bool matvec_f32(const VulkanBuffer& w, const VulkanBuffer& x, VulkanBuffer& y, uint32_t n_in, uint32_t n_out,
@@ -68,6 +90,10 @@ public:
 private:
     VulkanDevice* m_device = nullptr;
     VulkanPipeline m_matvec_q8_0;
+    VulkanPipeline m_matvec_q4_0;
+    VulkanPipeline m_matvec_q5_0;
+    VulkanPipeline m_matvec_q4_k;
+    VulkanPipeline m_matvec_q6_k;
     VulkanPipeline m_matvec_f32;
     VulkanPipeline m_embed_q8_0;
     VulkanPipeline m_embed_f32;

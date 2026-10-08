@@ -72,9 +72,9 @@ public:
 private:
     struct Matrix
     {
-        bool q8 = false;
-        VulkanBuffer scales;
-        VulkanBuffer quants;
+        GgmlType type = GgmlType::F32; // the type the device holds: Q8_0, Q4_0, Q5_0, Q4_K, Q6_K or F32
+        VulkanBuffer scales; // Q8_0, Q4_0, Q5_0
+        VulkanBuffer quants; // the quants of those, or the whole blocks of Q4_K and Q6_K
         VulkanBuffer f32;
         uint32_t n_in = 0;
         uint32_t n_out = 0;
@@ -93,7 +93,7 @@ private:
         Matrix ffn_down;
     };
 
-    bool upload_matrix(const GgufTensor* tensor, Matrix& out, Error& error);
+    bool upload_matrix(const GgufTensor* tensor, Matrix& out, Error& error, bool quantized = true);
     bool upload_vector(const GgufTensor* tensor, VulkanBuffer& out, Error& error);
     bool matvec(const Matrix& w, const VulkanBuffer& x, VulkanBuffer& y, uint32_t n_tokens, Error& error);
     bool forward_batch(size_t count, uint32_t pos, float* logits, bool all_logits, Error& error);

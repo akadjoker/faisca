@@ -1,0 +1,97 @@
+#version 450
+
+// Q4_K super blocks of 256 in the file layout, 36 uints each: d and dmin as halves,
+// 12 bytes of 6 bit scales and mins for 8 sub blocks, 128 bytes of nibbles;
+// value = d * scale * q - dmin * min; one thread per sub block
+
+layout(local_size_x = 32) in;
+
+layout(std430, binding = 0) readonly buffer Blocks
+{
+    uint blocks[];
+};
+
+layout(std430, binding = 1) readonly buffer Input
+{
+    float x[];
+};
+
+layout(std430, binding = 2) writeonly buffer Output
+{
+    float y[];
+};
+
+layout(push_constant) uniform Push
+{
+    uint n_in;
+    uint n_out;
+    uint n_blocks;
+    uint x_stride;
+    uint y_stride;
+    uint n_tokens;
+} p;
+
+shared float partial[32];
+
+uint byte_of(uint base, uint index)
+{
+    return (blocks[base + index / 4] >> (8 * (index % 4))) & 0xffu;
+}
+
+void main()
+{
+    const uint row = gl_WorkGroupID.x;
+    const uint token = gl_WorkGroupID.y;
+    const uint tid = gl_LocalInvocationID.x;
+    float sum = 0.0;
+    for (uint unit = tid; unit < p.n_blocks * 8; unit += 32)
+    {
+        const uint b = unit / 8;
+        const uint s = unit % 8;
+        const uint base = (row * p.n_blocks + b) * 36;
+        const vec2 dm = unpackHalf2x16(blocks[base]);
+        uint scale;
+        uint minimum;
+        if (s < 4)
+        {
+            scale = byte_of(base + 1, s) & 63u;
+            minimum = byte_of(base + 1, s + 4) & 63u;
+        }
+        else
+        {
+            scale = (byte_of(base + 1, s + 4) & 0xfu) | ((byte_of(base + 1, s - 4) >> 6) << 4);
+            minimum = (byte_of(base + 1, s + 4) >> 4) | ((byte_of(base + 1, s) >> 6) << 4);
+        }
+        const uint xb = token * p.x_stride + b * 256 + s * 32;
+        // sub block s reads 32 bytes at 32 * (s / 2), low nibbles when s is even
+        const uint q_base = base + 4 + (s / 2) * 8;
+        const uint shift = (s % 2) * 4;
+        float dot = 0.0;
+        float xsum = 0.0;
+        for (uint j = 0; j < 8; ++j)
+        {
+            const uint w = blocks[q_base + j];
+            for (uint k = 0; k < 4; ++k)
+            {
+                const float v = x[xb + 4 * j + k];
+                dot += float(((w >> (8 * k)) >> shift) & 0xfu) * v;
+                xsum += v;
+            }
+        }
+        sum += dm.x * float(scale) * dot - dm.y * float(minimum) * xsum;
+    }
+    partial[tid] = sum;
+    barrier();
+    for (uint s = 16; s > 0; s >>= 1)
+    {
+        if (tid < s)
+        {
+            partial[tid] += partial[tid + s];
+        }
+        barrier();
+    }
+    if (tid == 0)
+    {
+        y[token * p.y_stride + row] = partial[0];
+    }
+}
