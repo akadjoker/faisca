@@ -23,7 +23,13 @@ struct Image
 bool read_image(const char* path, Image& out, Error& error);
 bool decode_image(const uint8_t* data, size_t size, Image& out, Error& error);
 
-// Pillow's bilinear resampling in fixed point, as mtmd resizes: separable, 22 fractional bits
-bool resize_bilinear(const Image& in, uint32_t width, uint32_t height, Image& out, Error& error);
+enum class ResizeFilter
+{
+    Bilinear, // support 1
+    Bicubic // support 2, a = -0.5 (Pillow's value, mtmd's default)
+};
+
+// Pillow's resampling in fixed point, as mtmd resizes: separable, 22 fractional bits
+bool resize_image(const Image& in, uint32_t width, uint32_t height, ResizeFilter filter, Image& out, Error& error);
 
 }

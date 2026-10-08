@@ -1328,15 +1328,34 @@ bool read_image(const char* path, Image& out, Error& error)
     return decode_image(file.data(), file.size(), out, error);
 }
 
-bool resize_bilinear(const Image& in, uint32_t width, uint32_t height, Image& out, Error& error)
+bool resize_image(const Image& in, uint32_t width, uint32_t height, ResizeFilter filter, Image& out, Error& error)
 {
     constexpr int PRECISION_BITS = 22;
+    const double filter_support = filter == ResizeFilter::Bicubic ? 2.0 : 1.0;
+    const auto filter_weight = [filter](double x) -> double
+    {
+        x = x < 0.0 ? -x : x;
+        if (filter == ResizeFilter::Bilinear)
+        {
+            return x < 1.0 ? 1.0 - x : 0.0;
+        }
+        constexpr double a = -0.5;
+        if (x < 1.0)
+        {
+            return ((a + 2.0) * x - (a + 3.0)) * x * x + 1;
+        }
+        if (x < 2.0)
+        {
+            return (((x - 5) * x + 8) * x - 4) * a;
+        }
+        return 0.0;
+    };
     const auto weights_for = [&](uint32_t in_size, uint32_t out_size, Array<int32_t>& bounds, Array<int32_t>& weights,
                                  int& ksize) -> bool
     {
         const double scale = static_cast<double>(in_size) / out_size;
         const double filterscale = scale < 1.0 ? 1.0 : scale;
-        const double support = 1.0 * filterscale;
+        const double support = filter_support * filterscale;
         ksize = static_cast<int>(std::ceil(support)) * 2 + 1;
         if (!bounds.resize_uninitialized(static_cast<size_t>(out_size) * 2) ||
             !weights.resize_uninitialized(static_cast<size_t>(out_size) * ksize))
@@ -1360,9 +1379,7 @@ bool resize_bilinear(const Image& in, uint32_t width, uint32_t height, Image& ou
             double ww = 0.0;
             for (int x = 0; x < xmax; ++x)
             {
-                double w = (x + xmin - center + 0.5) * ss;
-                w = w < 0.0 ? -w : w;
-                w = w < 1.0 ? 1.0 - w : 0.0;
+                const double w = filter_weight((x + xmin - center + 0.5) * ss);
                 pre[static_cast<size_t>(x)] = w;
                 ww += w;
             }

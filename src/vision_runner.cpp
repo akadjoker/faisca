@@ -24,7 +24,7 @@ bool preprocess_image(const Image& image, const VisionHparams& h, Array<float>& 
     new_w = new_w < size ? new_w : size;
     new_h = new_h < size ? new_h : size;
     Image resized;
-    if (!resize_bilinear(image, new_w, new_h, resized, error))
+    if (!resize_image(image, new_w, new_h, ResizeFilter::Bicubic, resized, error))
     {
         return false;
     }
