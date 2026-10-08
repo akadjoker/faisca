@@ -1,0 +1,51 @@
+#version 450
+
+// copies the keys and values of the batch into the cache of one layer:
+// cache[(layer * n_kv_head + head) * n_ctx + pos][head_dim]
+
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) readonly buffer Keys
+{
+    float k[];
+};
+
+layout(std430, binding = 1) readonly buffer Values
+{
+    float v[];
+};
+
+layout(std430, binding = 2) writeonly buffer KeyCache
+{
+    float k_cache[];
+};
+
+layout(std430, binding = 3) writeonly buffer ValueCache
+{
+    float v_cache[];
+};
+
+layout(push_constant) uniform Push
+{
+    uint n_kv_head;
+    uint head_dim;
+    uint n_ctx;
+    uint pos0;
+    uint layer;
+} p;
+
+void main()
+{
+    const uint t = gl_WorkGroupID.x;
+    const uint h = gl_WorkGroupID.y;
+    const uint d = gl_LocalInvocationID.x;
+    if (d >= p.head_dim)
+    {
+        return;
+    }
+    const uint n_kv = p.n_kv_head * p.head_dim;
+    const uint src = t * n_kv + h * p.head_dim + d;
+    const uint dst = ((p.layer * p.n_kv_head + h) * p.n_ctx + p.pos0 + t) * p.head_dim + d;
+    k_cache[dst] = k[src];
+    v_cache[dst] = v[src];
+}

@@ -19,7 +19,7 @@ or exceptions. It has its own containers (`faisca::Array`, `faisca::StringMap`,
 | Tokenizer (byte level BPE, validated against llama.cpp) | done |
 | CPU runner, float32, validated layer by layer against llama.cpp | done |
 | CPU optimization: threads, VNNI kernels for Q8_0, Q4_0, Q5_0, Q4_K and Q6_K, batched prompt, f16 KV cache | done, AMX pending |
-| Vulkan compute backend | in progress: device layer and matvec kernels validated on llvmpipe |
+| Vulkan compute backend | runs the whole model, validated layer by layer on llvmpipe; speed on a real GPU not measured yet |
 | Own cache format and KV cache on disk | planned |
 
 ## Build
@@ -160,13 +160,22 @@ and recorded dispatches with push constants. `VulkanKernels`
 (vulkan_ops.h) holds the shaders, GLSL under src/vulkan/shaders compiled to
 SPIR-V by `tools/embed_spirv.py` and committed as arrays in
 src/vulkan/shaders_spv.cpp, so building needs neither glslc nor the shader
-files. So far: `matvec_q8_0` (Q8_0 rows split into packed f16 scales and
-int8 quants, float32 activations and arithmetic) and `matvec_f32`.
-`tests/vulkan_check` runs them over the matrices of block 0 and the output
-of a model and compares with a double precision product: 1.3e-7 to 1.8e-7
-on SmolLM2 Q8_0 and F32 with 1 and 16 inputs (on llvmpipe, Mesa's CPU
-device; there is no GPU on the development machine, so no speed numbers
-yet). `cmake -DFAISCA_VULKAN=OFF` leaves the backend out.
+files: `matvec_q8_0` (Q8_0 rows split into packed f16 scales and int8
+quants, float32 activations and arithmetic), `matvec_f32`, the embedding
+gather, `rms_norm`, `rope`, the KV cache store, `attention`, `swiglu` and
+`add`. `VulkanRunner` (vulkan_runner.h) runs the whole model with them,
+one command buffer per batch of 32 tokens, weights on the device (Q8_0 as
+is, every other type as float32), activations and KV cache in float32, and
+the same trace callback as `Runner`; `faisca generate --vulkan` and
+`runner_dump --vulkan` use it. Validation on llvmpipe, Mesa's CPU device
+(there is no GPU on the development machine, so no speed numbers yet):
+`tests/vulkan_check` compares the matvec kernels over block 0 and the
+output matrix with a double precision product, 1.3e-7 to 1.8e-7 on SmolLM2
+Q8_0 and F32 with 1 and 16 inputs; `compare_layers.py --ours-flags=--vulkan`
+puts the float32 model at 1.8e-6 from llama.cpp and 3.4e-6 from the CPU
+runner, and the Q8_0 model at 2.0e-6 from llama.cpp on the float32 copy
+(`--reference-model`), 16 greedy tokens identical in every case. `cmake
+-DFAISCA_VULKAN=OFF` leaves the backend out.
 
 `GgufFile` is a plain value object: no smart pointers, no heap allocation for
 the object itself. The reader never copies or decodes anything up front.

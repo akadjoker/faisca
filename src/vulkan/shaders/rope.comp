@@ -1,0 +1,45 @@
+#version 450
+
+// rotates the first n_rot values of every head of every token in place, pairs
+// (2i, 2i + 1), theta of pair i = pos * base^(-2i / n_rot) by repeated products
+// like the CPU path; one workgroup per (token, head), one thread per pair
+
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) buffer Data
+{
+    float x[];
+};
+
+layout(push_constant) uniform Push
+{
+    uint n_head;
+    uint head_dim;
+    uint n_rot;
+    uint pos0;
+    float freq_base;
+} p;
+
+void main()
+{
+    const uint t = gl_WorkGroupID.x;
+    const uint h = gl_WorkGroupID.y;
+    const uint pair = gl_LocalInvocationID.x;
+    if (2 * pair >= p.n_rot)
+    {
+        return;
+    }
+    const float theta_scale = pow(p.freq_base, -2.0 / float(p.n_rot));
+    float theta = float(p.pos0 + t);
+    for (uint k = 0; k < pair; ++k)
+    {
+        theta *= theta_scale;
+    }
+    const float c = cos(theta);
+    const float s = sin(theta);
+    const uint at = (t * p.n_head + h) * p.head_dim + 2 * pair;
+    const float x0 = x[at];
+    const float x1 = x[at + 1];
+    x[at] = x0 * c - x1 * s;
+    x[at + 1] = x0 * s + x1 * c;
+}

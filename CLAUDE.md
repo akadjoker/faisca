@@ -46,11 +46,23 @@ top. No third party dependencies. Owner: Luís (akadjoker). "faisca" is a workin
    with matvec_q8_0 and matvec_f32 (GLSL in src/vulkan/shaders, SPIR-V
    embedded by tools/embed_spirv.py, generated file committed),
    tests/vulkan_check (1.3e-7 to 1.8e-7 against double precision, 1 and 16
-   inputs). Only llvmpipe (Mesa CPU, Vulkan 1.4, subgroup 8) is available
-   here, so correctness only; speed needs the owner's GPU. Next: the other
-   ops (rms_norm, rope, attention with the KV cache on the device, swiglu,
-   add, embedding gather), a VulkanRunner with the trace callback so
-   compare_layers validates it layer by layer, then the CLI option.
+   inputs), the other ops (embed, rms_norm, rope, kv_store, attention,
+   swiglu, add) and VulkanRunner (include/faisca/vulkan_runner.h: weights
+   uploaded from the GgufFile, Q8_0 split, other types as float32; float32
+   activations and KV cache; one command buffer per batch, submitted and
+   downloaded after every traced step when a trace is set; `--vulkan` in
+   the CLI and runner_dump). Validated with compare_layers
+   (`--ours-flags=--vulkan`, `--reference-model` for a different file on
+   the reference side): float32 model 1.8e-6 from llama.cpp and 3.4e-6
+   from the CPU runner, Q8_0 model 2.0e-6 from llama.cpp on the float32
+   copy (the GPU does not quantize activations, so it is closer to float32
+   than the CPU Q8_0 path; against llama.cpp Q8_0 it is 8e-2 and the near
+   tie token flips), 16 tokens identical. Only llvmpipe (Mesa CPU, Vulkan
+   1.4, subgroup 8) is available here, so correctness only; speed needs the
+   owner's GPU. Next: speed on a real GPU (the kernels are simple: one
+   workgroup per row, scalar loads; expected first optimizations: several
+   rows per workgroup, vectorized loads, f16 cache, fewer dispatches),
+   Windows loading path untested.
 6. Own cache format with offset tables, KV cache kept between turns and saved to
    disk, longest common prefix reuse, snapshots.
 

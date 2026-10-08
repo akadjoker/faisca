@@ -106,6 +106,9 @@ public:
 
     bool load(const GgufFile& file, Error& error, bool dequantize = false);
 
+    // the hyperparameters alone, for runners that keep the weights elsewhere
+    static bool read_hparams(const GgufFile& file, LlamaHparams& out, Error& error);
+
     void release();
 
     bool is_loaded() const

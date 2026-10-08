@@ -3,6 +3,7 @@
 #include "faisca/ops.h"
 #include "shaders_spv.h"
 
+#include <cmath>
 #include <cstring>
 
 namespace faisca
@@ -41,8 +42,16 @@ bool VulkanKernels::init(VulkanDevice& device, Error& error)
 {
     release();
     m_device = &device;
-    if (!device.create_pipeline(spv_matvec_q8_0, spv_matvec_q8_0_words, 4, 6 * sizeof(uint32_t), m_matvec_q8_0, error) ||
-        !device.create_pipeline(spv_matvec_f32, spv_matvec_f32_words, 3, 5 * sizeof(uint32_t), m_matvec_f32, error))
+    if (!device.create_pipeline(spv_matvec_q8_0, spv_matvec_q8_0_words, 4, 6 * 4, m_matvec_q8_0, error) ||
+        !device.create_pipeline(spv_matvec_f32, spv_matvec_f32_words, 3, 5 * 4, m_matvec_f32, error) ||
+        !device.create_pipeline(spv_embed_q8_0, spv_embed_q8_0_words, 4, 2 * 4, m_embed_q8_0, error) ||
+        !device.create_pipeline(spv_embed_f32, spv_embed_f32_words, 3, 1 * 4, m_embed_f32, error) ||
+        !device.create_pipeline(spv_rms_norm, spv_rms_norm_words, 3, 2 * 4, m_rms_norm, error) ||
+        !device.create_pipeline(spv_rope, spv_rope_words, 1, 5 * 4, m_rope, error) ||
+        !device.create_pipeline(spv_kv_store, spv_kv_store_words, 4, 5 * 4, m_kv_store, error) ||
+        !device.create_pipeline(spv_attention, spv_attention_words, 5, 7 * 4, m_attention, error) ||
+        !device.create_pipeline(spv_swiglu, spv_swiglu_words, 3, 1 * 4, m_swiglu, error) ||
+        !device.create_pipeline(spv_add, spv_add_words, 2, 1 * 4, m_add, error))
     {
         release();
         return false;
@@ -56,8 +65,99 @@ void VulkanKernels::release()
     {
         m_device->destroy_pipeline(m_matvec_q8_0);
         m_device->destroy_pipeline(m_matvec_f32);
+        m_device->destroy_pipeline(m_embed_q8_0);
+        m_device->destroy_pipeline(m_embed_f32);
+        m_device->destroy_pipeline(m_rms_norm);
+        m_device->destroy_pipeline(m_rope);
+        m_device->destroy_pipeline(m_kv_store);
+        m_device->destroy_pipeline(m_attention);
+        m_device->destroy_pipeline(m_swiglu);
+        m_device->destroy_pipeline(m_add);
     }
     m_device = nullptr;
+}
+
+namespace
+{
+
+inline uint32_t float_bits(float value)
+{
+    uint32_t bits = 0;
+    std::memcpy(&bits, &value, 4);
+    return bits;
+}
+
+inline uint32_t groups_of(uint32_t n, uint32_t size)
+{
+    return (n + size - 1) / size;
+}
+
+}
+
+bool VulkanKernels::embed_q8_0(const VulkanBuffer& scales, const VulkanBuffer& quants, const VulkanBuffer& tokens,
+                               VulkanBuffer& x, uint32_t n_embd, uint32_t n_tokens, Error& error)
+{
+    const uint32_t push[2] = {n_embd, n_embd / static_cast<uint32_t>(Q8_0_BLOCK)};
+    const VulkanBuffer* buffers[4] = {&scales, &quants, &tokens, &x};
+    return m_device->dispatch(m_embed_q8_0, buffers, 4, push, sizeof(push), groups_of(n_embd, 64), n_tokens, 1, error);
+}
+
+bool VulkanKernels::embed_f32(const VulkanBuffer& w, const VulkanBuffer& tokens, VulkanBuffer& x, uint32_t n_embd,
+                              uint32_t n_tokens, Error& error)
+{
+    const uint32_t push[1] = {n_embd};
+    const VulkanBuffer* buffers[3] = {&w, &tokens, &x};
+    return m_device->dispatch(m_embed_f32, buffers, 3, push, sizeof(push), groups_of(n_embd, 64), n_tokens, 1, error);
+}
+
+bool VulkanKernels::rms_norm(const VulkanBuffer& x, const VulkanBuffer& weight, VulkanBuffer& y, uint32_t n,
+                             uint32_t n_tokens, float eps, Error& error)
+{
+    const uint32_t push[2] = {n, float_bits(eps)};
+    const VulkanBuffer* buffers[3] = {&x, &weight, &y};
+    return m_device->dispatch(m_rms_norm, buffers, 3, push, sizeof(push), n_tokens, 1, 1, error);
+}
+
+bool VulkanKernels::rope(VulkanBuffer& x, uint32_t n_head, uint32_t head_dim, uint32_t n_rot, uint32_t pos0,
+                         float freq_base, uint32_t n_tokens, Error& error)
+{
+    const uint32_t push[5] = {n_head, head_dim, n_rot, pos0, float_bits(freq_base)};
+    const VulkanBuffer* buffers[1] = {&x};
+    return m_device->dispatch(m_rope, buffers, 1, push, sizeof(push), n_tokens, n_head, 1, error);
+}
+
+bool VulkanKernels::kv_store(const VulkanBuffer& k, const VulkanBuffer& v, VulkanBuffer& k_cache, VulkanBuffer& v_cache,
+                             uint32_t n_kv_head, uint32_t head_dim, uint32_t n_ctx, uint32_t pos0, uint32_t layer,
+                             uint32_t n_tokens, Error& error)
+{
+    const uint32_t push[5] = {n_kv_head, head_dim, n_ctx, pos0, layer};
+    const VulkanBuffer* buffers[4] = {&k, &v, &k_cache, &v_cache};
+    return m_device->dispatch(m_kv_store, buffers, 4, push, sizeof(push), n_tokens, n_kv_head, 1, error);
+}
+
+bool VulkanKernels::attention(const VulkanBuffer& q, const VulkanBuffer& k_cache, const VulkanBuffer& v_cache,
+                              VulkanBuffer& scores, VulkanBuffer& y, uint32_t n_head, uint32_t n_kv_head,
+                              uint32_t head_dim, uint32_t n_ctx, uint32_t pos0, uint32_t layer, uint32_t n_tokens,
+                              Error& error)
+{
+    const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+    const uint32_t push[7] = {n_head, n_kv_head, head_dim, n_ctx, pos0, layer, float_bits(scale)};
+    const VulkanBuffer* buffers[5] = {&q, &k_cache, &v_cache, &scores, &y};
+    return m_device->dispatch(m_attention, buffers, 5, push, sizeof(push), n_tokens, n_head, 1, error);
+}
+
+bool VulkanKernels::swiglu(const VulkanBuffer& gate, const VulkanBuffer& up, VulkanBuffer& y, uint32_t n, Error& error)
+{
+    const uint32_t push[1] = {n};
+    const VulkanBuffer* buffers[3] = {&gate, &up, &y};
+    return m_device->dispatch(m_swiglu, buffers, 3, push, sizeof(push), groups_of(n, 256), 1, 1, error);
+}
+
+bool VulkanKernels::add(VulkanBuffer& x, const VulkanBuffer& y, uint32_t n, Error& error)
+{
+    const uint32_t push[1] = {n};
+    const VulkanBuffer* buffers[2] = {&x, &y};
+    return m_device->dispatch(m_add, buffers, 2, push, sizeof(push), groups_of(n, 256), 1, 1, error);
 }
 
 bool VulkanKernels::matvec_q8_0(const VulkanBuffer& scales, const VulkanBuffer& quants, const VulkanBuffer& x,

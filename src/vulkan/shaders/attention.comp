@@ -1,0 +1,111 @@
+#version 450
+
+// one workgroup per (token, head): scores over the positions up to the token's own,
+// softmax, then the weighted sum of the values; scores kept in a scratch buffer
+
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) readonly buffer Query
+{
+    float q[];
+};
+
+layout(std430, binding = 1) readonly buffer KeyCache
+{
+    float k_cache[];
+};
+
+layout(std430, binding = 2) readonly buffer ValueCache
+{
+    float v_cache[];
+};
+
+layout(std430, binding = 3) buffer Scores
+{
+    float scores[];
+};
+
+layout(std430, binding = 4) writeonly buffer Output
+{
+    float y[];
+};
+
+layout(push_constant) uniform Push
+{
+    uint n_head;
+    uint n_kv_head;
+    uint head_dim;
+    uint n_ctx;
+    uint pos0;
+    uint layer;
+    float scale;
+} p;
+
+shared float partial[64];
+
+void main()
+{
+    const uint t = gl_WorkGroupID.x;
+    const uint h = gl_WorkGroupID.y;
+    const uint tid = gl_LocalInvocationID.x;
+    const uint kv_head = h / (p.n_head / p.n_kv_head);
+    const uint n_past = p.pos0 + t + 1;
+    const uint q_base = (t * p.n_head + h) * p.head_dim;
+    const uint cache_base = (p.layer * p.n_kv_head + kv_head) * p.n_ctx * p.head_dim;
+    const uint s_base = (t * p.n_head + h) * p.n_ctx;
+
+    float local_max = -3.402823466e+38;
+    for (uint pos = tid; pos < n_past; pos += 64)
+    {
+        float s = 0.0;
+        for (uint d = 0; d < p.head_dim; ++d)
+        {
+            s += q[q_base + d] * k_cache[cache_base + pos * p.head_dim + d];
+        }
+        s *= p.scale;
+        scores[s_base + pos] = s;
+        local_max = max(local_max, s);
+    }
+    partial[tid] = local_max;
+    barrier();
+    for (uint s = 32; s > 0; s >>= 1)
+    {
+        if (tid < s)
+        {
+            partial[tid] = max(partial[tid], partial[tid + s]);
+        }
+        barrier();
+    }
+    const float m = partial[0];
+    barrier();
+
+    float local_sum = 0.0;
+    for (uint pos = tid; pos < n_past; pos += 64)
+    {
+        const float e = exp(scores[s_base + pos] - m);
+        scores[s_base + pos] = e;
+        local_sum += e;
+    }
+    partial[tid] = local_sum;
+    barrier();
+    for (uint s = 32; s > 0; s >>= 1)
+    {
+        if (tid < s)
+        {
+            partial[tid] += partial[tid + s];
+        }
+        barrier();
+    }
+    const float inverse = 1.0 / partial[0];
+    barrier();
+
+    for (uint d = tid; d < p.head_dim; d += 64)
+    {
+        float acc = 0.0;
+        for (uint pos = 0; pos < n_past; ++pos)
+        {
+            acc += scores[s_base + pos] * v_cache[cache_base + pos * p.head_dim + d];
+        }
+        y[q_base + d] = acc * inverse;
+    }
+}

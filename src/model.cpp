@@ -470,6 +470,17 @@ size_t LlamaModel::packed_bytes(const GgufTensor* tensor) const
     }
 }
 
+bool LlamaModel::read_hparams(const GgufFile& file, LlamaHparams& out, Error& error)
+{
+    LlamaModel model;
+    if (!model.load_hparams(file, error))
+    {
+        return false;
+    }
+    out = model.m_hparams;
+    return true;
+}
+
 bool LlamaModel::load(const GgufFile& file, Error& error, bool dequantize)
 {
     release();

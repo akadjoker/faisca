@@ -1,0 +1,56 @@
+#version 450
+
+// out[t] = x[t] / sqrt(mean(x[t]^2) + eps) * weight, one workgroup per token
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer Input
+{
+    float x[];
+};
+
+layout(std430, binding = 1) readonly buffer Weight
+{
+    float weight[];
+};
+
+layout(std430, binding = 2) writeonly buffer Output
+{
+    float y[];
+};
+
+layout(push_constant) uniform Push
+{
+    uint n;
+    float eps;
+} p;
+
+shared float partial[256];
+
+void main()
+{
+    const uint t = gl_WorkGroupID.x;
+    const uint tid = gl_LocalInvocationID.x;
+    const uint base = t * p.n;
+    float sum = 0.0;
+    for (uint i = tid; i < p.n; i += 256)
+    {
+        const float v = x[base + i];
+        sum += v * v;
+    }
+    partial[tid] = sum;
+    barrier();
+    for (uint s = 128; s > 0; s >>= 1)
+    {
+        if (tid < s)
+        {
+            partial[tid] += partial[tid + s];
+        }
+        barrier();
+    }
+    const float scale = inversesqrt(partial[0] / float(p.n) + p.eps);
+    for (uint i = tid; i < p.n; i += 256)
+    {
+        y[base + i] = x[base + i] * scale * weight[i];
+    }
+}

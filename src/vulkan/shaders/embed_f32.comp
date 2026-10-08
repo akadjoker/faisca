@@ -1,0 +1,36 @@
+#version 450
+
+// x[t] = row tokens[t] of a float32 matrix
+
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) readonly buffer Weights
+{
+    float w[];
+};
+
+layout(std430, binding = 1) readonly buffer Tokens
+{
+    uint tokens[];
+};
+
+layout(std430, binding = 2) writeonly buffer Output
+{
+    float x[];
+};
+
+layout(push_constant) uniform Push
+{
+    uint n_embd;
+} p;
+
+void main()
+{
+    const uint i = gl_GlobalInvocationID.x;
+    const uint t = gl_WorkGroupID.y;
+    if (i >= p.n_embd)
+    {
+        return;
+    }
+    x[t * p.n_embd + i] = w[tokens[t] * p.n_embd + i];
+}

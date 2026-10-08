@@ -3,6 +3,9 @@
 #include "faisca/ops.h"
 #include "faisca/runner.h"
 #include "faisca/speculative.h"
+#if defined(FAISCA_VULKAN)
+#include "faisca/vulkan_runner.h"
+#endif
 #include "faisca/tokenizer.h"
 
 #include <chrono>
@@ -27,7 +30,7 @@ void print_usage()
         "usage:\n"
         "  faisca info <model.gguf> [--meta] [--tensors]\n"
         "  faisca generate <model.gguf> -p <prompt> [-n <tokens>] [-c <context>] [-t <threads>] [--raw] [--f32] [--kv-f32]\n"
-        "                                [--draft <draft.gguf>] [--draft-n <tokens>]\n"
+        "                                [--draft <draft.gguf>] [--draft-n <tokens>] [--vulkan]\n"
         "  faisca version\n"
         "\n"
         "info options:\n"
@@ -43,7 +46,8 @@ void print_usage()
         "  --f32       convert the weights to float32 at load instead of computing on Q8_0\n"
         "  --kv-f32    keep the KV cache in float32 instead of f16\n"
         "  --draft     a smaller model of the same vocabulary that proposes tokens (speculative decoding)\n"
-        "  --draft-n   tokens proposed per round, default 3\n",
+        "  --draft-n   tokens proposed per round, default 3\n"
+        "  --vulkan    run on the Vulkan device instead of the CPU (float32 activations, no draft)\n",
         FAISCA_VERSION);
 }
 
@@ -450,6 +454,7 @@ int command_generate(int argc, char** argv)
     int threads = 1;
     const char* draft_path = nullptr;
     int draft_n = 3;
+    bool vulkan = false;
 
     for (int i = 2; i < argc; ++i)
     {
@@ -489,6 +494,10 @@ int command_generate(int argc, char** argv)
         {
             draft_n = std::atoi(argv[++i]);
         }
+        else if (std::strcmp(argv[i], "--vulkan") == 0)
+        {
+            vulkan = true;
+        }
         else if (argv[i][0] == '-' && argv[i][1] != '\0')
         {
             std::fprintf(stderr, "faisca: unknown option '%s'\n", argv[i]);
@@ -516,20 +525,59 @@ int command_generate(int argc, char** argv)
         return 2;
     }
 
+    if (vulkan && draft_path != nullptr)
+    {
+        std::fprintf(stderr, "faisca: --draft is not available with --vulkan\n");
+        return 2;
+    }
+#if !defined(FAISCA_VULKAN)
+    if (vulkan)
+    {
+        std::fprintf(stderr, "faisca: built without the Vulkan backend\n");
+        return 1;
+    }
+#endif
+
     Error error;
     GgufFile file;
     Tokenizer tokenizer;
     LlamaModel model;
     ThreadPool pool;
     Runner runner;
+#if defined(FAISCA_VULKAN)
+    VulkanDevice device;
+    VulkanRunner vulkan_runner;
+#endif
 
     const auto load_start = std::chrono::steady_clock::now();
-    if (!file.open(path, error) || !tokenizer.load(file, error) || !model.load(file, error, dequantize) ||
-        !pool.start(threads, error) || !runner.init(model, static_cast<uint32_t>(context), pool, error, kv_f16))
+    if (!file.open(path, error) || !tokenizer.load(file, error))
     {
         std::fprintf(stderr, "faisca: %s\n", error.c_str());
         return 1;
     }
+#if defined(FAISCA_VULKAN)
+    if (vulkan && (!device.init(error) || !vulkan_runner.init(device, file, static_cast<uint32_t>(context), error)))
+    {
+        std::fprintf(stderr, "faisca: %s\n", error.c_str());
+        return 1;
+    }
+#endif
+    if (!vulkan && (!model.load(file, error, dequantize) || !pool.start(threads, error) ||
+                    !runner.init(model, static_cast<uint32_t>(context), pool, error, kv_f16)))
+    {
+        std::fprintf(stderr, "faisca: %s\n", error.c_str());
+        return 1;
+    }
+    const auto run_forward = [&](const int32_t* ids, size_t n, Array<float>& out) -> bool
+    {
+#if defined(FAISCA_VULKAN)
+        if (vulkan)
+        {
+            return vulkan_runner.forward(ids, n, out, error);
+        }
+#endif
+        return runner.forward(ids, n, out, error);
+    };
     GgufFile draft_file;
     LlamaModel draft_model;
     Runner draft_runner;
@@ -562,10 +610,10 @@ int command_generate(int argc, char** argv)
         std::fprintf(stderr, "faisca: the prompt produced no tokens\n");
         return 1;
     }
-    if (tokens.size() + static_cast<size_t>(count) > runner.context_size())
+    if (tokens.size() + static_cast<size_t>(count) > static_cast<size_t>(context))
     {
-        std::fprintf(stderr, "faisca: %zu prompt tokens plus %d generated do not fit a context of %" PRIu32 "\n",
-                     tokens.size(), count, runner.context_size());
+        std::fprintf(stderr, "faisca: %zu prompt tokens plus %d generated do not fit a context of %ld\n", tokens.size(),
+                     count, context);
         return 1;
     }
 
@@ -574,7 +622,7 @@ int command_generate(int argc, char** argv)
     int32_t best = 0;
     const auto prompt_start = std::chrono::steady_clock::now();
     if (draft_path != nullptr ? !speculative.prompt(tokens.data(), tokens.size(), best, error)
-                              : !runner.forward(tokens.data(), tokens.size(), logits, error))
+                              : !run_forward(tokens.data(), tokens.size(), logits))
     {
         std::fprintf(stderr, "faisca: %s\n", error.c_str());
         return 1;
@@ -623,7 +671,7 @@ int command_generate(int argc, char** argv)
         std::fwrite(piece.data(), 1, piece.size(), stdout);
         std::fflush(stdout);
 
-        if (draft_path == nullptr && generated + 1 < count && !runner.forward(&best, 1, logits, error))
+        if (draft_path == nullptr && generated + 1 < count && !run_forward(&best, 1, logits))
         {
             std::fprintf(stderr, "\nfaisca: %s\n", error.c_str());
             return 1;
@@ -632,10 +680,20 @@ int command_generate(int argc, char** argv)
     const double generate_seconds = seconds_since(generate_start);
     std::printf("\n");
 
+    const char* backend = simd_name();
+    int backend_threads = vulkan ? 0 : runner.threads();
+    size_t weight_mib = vulkan ? 0 : model.weight_bytes() >> 20;
+#if defined(FAISCA_VULKAN)
+    if (vulkan)
+    {
+        backend = device.device_name();
+        weight_mib = vulkan_runner.weight_bytes() >> 20;
+    }
+#endif
     std::fprintf(stderr,
                  "\n%s, %d threads, %zu MiB of weights per token, load %.2f s, prompt %zu tokens in %.2f s (%.1f tok/s), "
                  "%d tokens generated in %.2f s (%.1f tok/s)\n",
-                 simd_name(), runner.threads(), model.weight_bytes() >> 20, load_seconds, tokens.size(), prompt_seconds,
+                 backend, backend_threads, weight_mib, load_seconds, tokens.size(), prompt_seconds,
                  static_cast<double>(tokens.size()) / prompt_seconds, generated, generate_seconds,
                  generated > 0 ? static_cast<double>(generated) / generate_seconds : 0.0);
     if (draft_path != nullptr)

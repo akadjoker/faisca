@@ -1,6 +1,9 @@
 #include "faisca/gguf.h"
 #include "faisca/model.h"
 #include "faisca/runner.h"
+#if defined(FAISCA_VULKAN)
+#include "faisca/vulkan_runner.h"
+#endif
 
 #include <cinttypes>
 #include <cstdio>
@@ -10,7 +13,7 @@
 #include <string>
 #include <vector>
 
-// usage: runner_dump [--dequantize] [--kv-f32] [--threads N] <model.gguf> <out.bin> <generate N> <token ids...>
+// usage: runner_dump [--dequantize] [--kv-f32] [--vulkan] [--threads N] <model.gguf> <out.bin> <generate N> <token ids...>
 //
 // Same output as tests/reference/llama_layer_dump.cpp: every traced vector of
 // every prompt token, assembled per name into [values, tokens], then N greedy
@@ -55,9 +58,17 @@ int main(int argc, char** argv)
 {
     bool dequantize = false;
     bool kv_f16 = true;
+    bool vulkan = false;
     int threads = 1;
     while (argc > 1 && argv[1][0] == '-')
     {
+        if (std::strcmp(argv[1], "--vulkan") == 0)
+        {
+            vulkan = true;
+            ++argv;
+            --argc;
+            continue;
+        }
         if (std::strcmp(argv[1], "--dequantize") == 0)
         {
             dequantize = true;
@@ -82,7 +93,7 @@ int main(int argc, char** argv)
     }
     if (argc < 5)
     {
-        std::fprintf(stderr, "usage: runner_dump [--dequantize] [--kv-f32] [--threads N] <model.gguf> <out.bin> <generate N> <token ids...>\n");
+        std::fprintf(stderr, "usage: runner_dump [--dequantize] [--kv-f32] [--vulkan] [--threads N] <model.gguf> <out.bin> <generate N> <token ids...>\n");
         return 2;
     }
 
@@ -98,21 +109,68 @@ int main(int argc, char** argv)
     faisca::LlamaModel model;
     faisca::Runner runner;
     const uint32_t n_ctx = static_cast<uint32_t>(prompt.size() + static_cast<size_t>(generate) + 1);
-    if (!file.open(argv[1], error) || !model.load(file, error, dequantize) || !runner.init(model, n_ctx, threads, error, kv_f16))
+    if (!file.open(argv[1], error))
+    {
+        std::fprintf(stderr, "runner_dump: %s\n", error.c_str());
+        return 1;
+    }
+#if defined(FAISCA_VULKAN)
+    faisca::VulkanDevice device;
+    faisca::VulkanRunner vulkan_runner;
+    if (vulkan && (!device.init(error) || !vulkan_runner.init(device, file, n_ctx, error)))
+    {
+        std::fprintf(stderr, "runner_dump: %s\n", error.c_str());
+        return 1;
+    }
+    if (vulkan)
+    {
+        std::fprintf(stderr, "runner_dump: Vulkan device %s\n", device.device_name());
+    }
+#else
+    if (vulkan)
+    {
+        std::fprintf(stderr, "runner_dump: built without the Vulkan backend\n");
+        return 1;
+    }
+#endif
+    if (!vulkan && (!model.load(file, error, dequantize) || !runner.init(model, n_ctx, threads, error, kv_f16)))
     {
         std::fprintf(stderr, "runner_dump: %s\n", error.c_str());
         return 1;
     }
 
+    // the same calls on either runner
+    const auto run_forward = [&](const int32_t* tokens, size_t count, faisca::Array<float>& out) -> bool
+    {
+#if defined(FAISCA_VULKAN)
+        if (vulkan)
+        {
+            return vulkan_runner.forward(tokens, count, out, error);
+        }
+#endif
+        return runner.forward(tokens, count, out, error);
+    };
+    const auto set_trace = [&](faisca::RunnerTrace callback, void* user)
+    {
+#if defined(FAISCA_VULKAN)
+        if (vulkan)
+        {
+            vulkan_runner.set_trace(callback, user);
+            return;
+        }
+#endif
+        runner.set_trace(callback, user);
+    };
+
     Capture capture;
-    runner.set_trace(trace, &capture);
+    set_trace(trace, &capture);
     faisca::Array<float> logits;
-    if (!runner.forward(prompt.data(), prompt.size(), logits, error))
+    if (!run_forward(prompt.data(), prompt.size(), logits))
     {
         std::fprintf(stderr, "runner_dump: %s\n", error.c_str());
         return 1;
     }
-    runner.set_trace(nullptr, nullptr);
+    set_trace(nullptr, nullptr);
 
     FILE* out = std::fopen(argv[2], "wb");
     if (out == nullptr)
@@ -147,7 +205,7 @@ int main(int argc, char** argv)
             }
         }
         std::printf(" %" PRId32, best);
-        if (!runner.forward(&best, 1, logits, error))
+        if (!run_forward(&best, 1, logits))
         {
             std::fprintf(stderr, "runner_dump: %s\n", error.c_str());
             return 1;
