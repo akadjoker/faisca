@@ -26,6 +26,7 @@ struct WhisperRunner::AttentionJob
     WhisperRunner* runner;
     const float* q;
     const float* k;
+    const float* k_tiles;
     const float* v;
     size_t n_q;
     size_t n_kv;
@@ -48,6 +49,17 @@ struct WhisperRunner::ConvJob
     size_t stride;
     size_t n_out;
     float* out;
+};
+
+struct WhisperRunner::TileJob
+{
+    const float* k;
+    size_t n_kv;
+    size_t n_head;
+    size_t head_dim;
+    size_t stride;
+    size_t per_head;
+    float* tiles;
 };
 
 struct WhisperRunner::MatmulJob
@@ -92,7 +104,10 @@ bool WhisperRunner::allocate(Error& error)
     const size_t n_text_ctx = static_cast<size_t>(h.n_text_ctx);
     const size_t rows = n_ctx > n_text_ctx ? n_ctx : n_text_ctx;
     const size_t threads = static_cast<size_t>(m_pool->size());
-    const bool ok = m_conv1.resize_uninitialized(n_state * 2 * n_ctx) && m_conv2.resize_uninitialized(n_state * n_ctx) &&
+    const size_t per_head = tiles_per_head();
+    const bool ok = m_k_tiles.resize_uninitialized(static_cast<size_t>(h.n_audio_head) * per_head) &&
+                    m_cross_k_tiles.resize_uninitialized(static_cast<size_t>(h.n_text_layer) * static_cast<size_t>(h.n_audio_head) * per_head) &&
+                    m_conv1.resize_uninitialized(n_state * 2 * n_ctx) && m_conv2.resize_uninitialized(n_state * n_ctx) &&
                     m_x.resize_uninitialized(rows * n_state) && m_h.resize_uninitialized(rows * n_state) &&
                     m_q.resize_uninitialized(rows * n_state) && m_k.resize_uninitialized(rows * n_state) &&
                     m_v.resize_uninitialized(rows * n_state) && m_attn.resize_uninitialized(rows * n_state) &&
@@ -101,7 +116,7 @@ bool WhisperRunner::allocate(Error& error)
                     m_cross_v.resize_uninitialized(static_cast<size_t>(h.n_text_layer) * n_ctx * n_state) &&
                     m_self_k.resize_uninitialized(static_cast<size_t>(h.n_text_layer) * n_text_ctx * n_state) &&
                     m_self_v.resize_uninitialized(static_cast<size_t>(h.n_text_layer) * n_text_ctx * n_state) &&
-                    m_scores.resize_uninitialized(threads * rows) &&
+                    m_scores.resize_uninitialized(threads * (rows + KEY_TILE)) &&
                     m_logits.resize_uninitialized(n_text_ctx * static_cast<size_t>(h.n_vocab)) &&
                     m_xq.resize_uninitialized(rows * (4 * n_state / Q8_0_BLOCK * Q8_0_BLOCK_BYTES)) &&
                     m_sums.resize_uninitialized(rows * (4 * n_state / Q8_0_BLOCK));
@@ -212,6 +227,50 @@ void WhisperRunner::matmul(const Weight& w, const float* x, size_t n_tokens, flo
     m_pool->run(matmul_task, &job);
 }
 
+size_t WhisperRunner::tiles_per_head() const
+{
+    const WhisperHparams& h = m_model->hparams();
+    const size_t n_ctx = static_cast<size_t>(h.n_audio_ctx);
+    const size_t head_dim = static_cast<size_t>(h.n_audio_state) / static_cast<size_t>(h.n_audio_head);
+    return (n_ctx + KEY_TILE - 1) / KEY_TILE * KEY_TILE * head_dim;
+}
+
+void WhisperRunner::tile_task(void* user, int thread_index, int thread_count)
+{
+    const TileJob& job = *static_cast<const TileJob*>(user);
+    const size_t first = job.n_head * static_cast<size_t>(thread_index) / static_cast<size_t>(thread_count);
+    const size_t last = job.n_head * static_cast<size_t>(thread_index + 1) / static_cast<size_t>(thread_count);
+    for (size_t head = first; head < last; ++head)
+    {
+        float* tiles = job.tiles + head * job.per_head;
+        for (size_t p = 0; p < job.n_kv; ++p)
+        {
+            const float* row = job.k + p * job.stride + head * job.head_dim;
+            for (size_t d = 0; d < job.head_dim; ++d)
+            {
+                tiles[key_index(job.head_dim, p, d)] = row[d];
+            }
+        }
+        for (size_t p = job.n_kv; p < (job.n_kv + KEY_TILE - 1) / KEY_TILE * KEY_TILE; ++p)
+        {
+            for (size_t d = 0; d < job.head_dim; ++d)
+            {
+                tiles[key_index(job.head_dim, p, d)] = 0.0f;
+            }
+        }
+    }
+}
+
+// the keys of every head in the tile layout of attention_head, the last tile zero padded
+void WhisperRunner::tile_keys(const float* k, size_t n_kv, float* tiles)
+{
+    const WhisperHparams& h = m_model->hparams();
+    const size_t n_state = static_cast<size_t>(h.n_audio_state);
+    const size_t n_head = static_cast<size_t>(h.n_audio_head);
+    TileJob job{k, n_kv, n_head, n_state / n_head, n_state, tiles_per_head(), tiles};
+    m_pool->run(tile_task, &job);
+}
+
 void WhisperRunner::attention_task(void* user, int thread_index, int thread_count)
 {
     const AttentionJob& job = *static_cast<const AttentionJob*>(user);
@@ -219,21 +278,32 @@ void WhisperRunner::attention_task(void* user, int thread_index, int thread_coun
     const size_t first = units * static_cast<size_t>(thread_index) / static_cast<size_t>(thread_count);
     const size_t last = units * static_cast<size_t>(thread_index + 1) / static_cast<size_t>(thread_count);
     float* scores = job.runner->m_scores.data() + static_cast<size_t>(thread_index) * (job.runner->m_scores.size() / static_cast<size_t>(thread_count));
+    const size_t per_head = job.runner->tiles_per_head();
     for (size_t u = first; u < last; ++u)
     {
         const size_t head = u / job.n_q;
         const size_t i = u % job.n_q;
-        const size_t n_kv = job.causal ? job.q_position + i + 1 : job.n_kv;
-        attention_rows(job.q + i * job.stride + head * job.head_dim, job.k + head * job.head_dim, job.v + head * job.head_dim,
-                       job.stride, job.head_dim, n_kv, job.scale, scores, job.out + i * job.stride + head * job.head_dim);
+        const float* q = job.q + i * job.stride + head * job.head_dim;
+        float* out = job.out + i * job.stride + head * job.head_dim;
+        if (job.k_tiles != nullptr)
+        {
+            attention_head(q, job.k_tiles + head * per_head, job.v + head * job.head_dim, job.stride, job.head_dim, job.n_kv,
+                           job.scale, scores, out);
+        }
+        else
+        {
+            const size_t n_kv = job.causal ? job.q_position + i + 1 : job.n_kv;
+            attention_rows(q, job.k + head * job.head_dim, job.v + head * job.head_dim, job.stride, job.head_dim, n_kv,
+                           job.scale, scores, out);
+        }
     }
 }
 
-void WhisperRunner::attention(const float* q, const float* k, const float* v, size_t n_q, size_t n_kv, size_t n_head,
-                              float scale, bool causal, size_t q_position, float* out)
+void WhisperRunner::attention(const float* q, const float* k, const float* k_tiles, const float* v, size_t n_q, size_t n_kv,
+                              size_t n_head, float scale, bool causal, size_t q_position, float* out)
 {
     const size_t n_state = static_cast<size_t>(m_model->hparams().n_audio_state);
-    AttentionJob job{this, q, k, v, n_q, n_kv, n_head, n_state / n_head, n_state, scale, causal, q_position, out};
+    AttentionJob job{this, q, k, k_tiles, v, n_q, n_kv, n_head, n_state / n_head, n_state, scale, causal, q_position, out};
     m_pool->run(attention_task, &job);
 }
 
@@ -286,6 +356,7 @@ void WhisperRunner::attention_block(const WhisperAttention& a, const float* x, s
     trace(qkv("Qcur"), layer, m_q.data(), n_tokens * n_state);
 
     const float* k = k_cache;
+    const float* k_tiles = (!self && decoder) ? k_cache : nullptr;
     const float* v = v_cache;
     if (self)
     {
@@ -308,6 +379,11 @@ void WhisperRunner::attention_block(const WhisperAttention& a, const float* x, s
         trace(qkv("Vcur"), layer, v_rows, n_tokens * n_state);
         k = decoder ? k_cache : m_k.data();
         v = decoder ? v_cache : m_v.data();
+        if (!decoder)
+        {
+            tile_keys(m_k.data(), n_tokens, m_k_tiles.data());
+            k_tiles = m_k_tiles.data();
+        }
     }
 
     float scale = 1.0f;
@@ -319,7 +395,7 @@ void WhisperRunner::attention_block(const WhisperAttention& a, const float* x, s
     {
         scale = quarter;
     }
-    attention(m_q.data(), k, v, n_tokens, n_kv, n_head, scale, self && decoder, position, m_attn.data());
+    attention(m_q.data(), k, k_tiles, v, n_tokens, n_kv, n_head, scale, self && decoder, position, m_attn.data());
 
     matmul(a.out, m_attn.data(), n_tokens, out);
     for (size_t t = 0; t < n_tokens; ++t)
@@ -424,6 +500,7 @@ bool WhisperRunner::encode(const float* mel, Error& error)
             k[i] *= quarter;
         }
         trace("cross_k", il, k, n_ctx * n_state);
+        tile_keys(k, n_ctx, m_cross_k_tiles.data() + static_cast<size_t>(il) * static_cast<size_t>(h.n_audio_head) * tiles_per_head());
         matmul(cross.v, m_enc.data(), n_ctx, v);
         for (size_t t = 0; t < n_ctx; ++t)
         {
@@ -474,7 +551,7 @@ bool WhisperRunner::decode(const int32_t* tokens, size_t count, Array<float>& lo
             add(m_x.data() + t * n_state, m_h.data() + t * n_state, n_state);
         }
         trace("d_cross_inp", il, m_x.data(), count * n_state);
-        const float* cross_k = m_cross_k.data() + static_cast<size_t>(il) * n_ctx * n_state;
+        const float* cross_k = m_cross_k_tiles.data() + static_cast<size_t>(il) * static_cast<size_t>(h.n_audio_head) * tiles_per_head();
         const float* cross_v = m_cross_v.data() + static_cast<size_t>(il) * n_ctx * n_state;
         attention_block(layer.cross, m_x.data(), count, n_ctx, cross_k, cross_v, false, m_position, m_h.data(), "d_cross_", il);
         for (size_t t = 0; t < count; ++t)

@@ -54,6 +54,7 @@ public:
 private:
     struct RowsJob;
     struct AttentionJob;
+    struct TileJob;
     struct ConvJob;
     struct MatmulJob;
 
@@ -68,8 +69,13 @@ private:
     void matmul(const Weight& w, const float* x, size_t n_tokens, float* out);
     static void quantize_task(void* user, int thread_index, int thread_count);
     void quantize_inputs(const float* x, size_t n_tokens, size_t n);
-    void attention(const float* q, const float* k, const float* v, size_t n_q, size_t n_kv, size_t n_head, float scale,
-                   bool causal, size_t q_position, float* out);
+    // tiles: keys in the layout of attention_head per head (null for the causal decoder self
+    // attention, which reads the rows of k)
+    void attention(const float* q, const float* k, const float* k_tiles, const float* v, size_t n_q, size_t n_kv,
+                   size_t n_head, float scale, bool causal, size_t q_position, float* out);
+    void tile_keys(const float* k, size_t n_kv, float* tiles);
+    static void tile_task(void* user, int thread_index, int thread_count);
+    size_t tiles_per_head() const;
     void norm_rows(const float* x, const float* w, const float* b, size_t rows, float* out);
     void gelu_rows(float* x, size_t rows, size_t width);
     void attention_block(const WhisperAttention& a, const float* x, size_t n_tokens, size_t n_kv, const float* k_cache,
@@ -94,7 +100,9 @@ private:
     Array<float> m_up;
     Array<float> m_enc;
     Array<float> m_cross_k;
+    Array<float> m_cross_k_tiles;
     Array<float> m_cross_v;
+    Array<float> m_k_tiles;
     Array<float> m_self_k;
     Array<float> m_self_v;
     Array<float> m_scores;
