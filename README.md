@@ -19,7 +19,7 @@ or exceptions. It has its own containers (`faisca::Array`, `faisca::StringMap`,
 | Tokenizer (byte level BPE, validated against llama.cpp) | done |
 | CPU runner, float32, validated layer by layer against llama.cpp | done |
 | CPU optimization: threads, VNNI kernels for Q8_0, Q4_0, Q5_0, Q4_K and Q6_K, batched prompt, f16 KV cache | done, AMX pending |
-| Vulkan compute backend | planned |
+| Vulkan compute backend | in progress: device layer and matvec kernels validated on llvmpipe |
 | Own cache format and KV cache on disk | planned |
 
 ## Build
@@ -152,6 +152,21 @@ checks them in one batched pass (`Runner::forward` with all logits) and keeps
 the longest agreeing prefix plus one token of its own, then both caches are
 cut back with `Runner::truncate`. The tokens are exactly those of greedy
 decoding with the target alone, which `tests/speculative_check` verifies.
+
+`VulkanDevice` (include/faisca/vulkan.h) opens the system's Vulkan loader at
+run time, so the library has no link time dependency and a machine without
+Vulkan just gets an error from `init`; it exposes buffers, compute pipelines
+and recorded dispatches with push constants. `VulkanKernels`
+(vulkan_ops.h) holds the shaders, GLSL under src/vulkan/shaders compiled to
+SPIR-V by `tools/embed_spirv.py` and committed as arrays in
+src/vulkan/shaders_spv.cpp, so building needs neither glslc nor the shader
+files. So far: `matvec_q8_0` (Q8_0 rows split into packed f16 scales and
+int8 quants, float32 activations and arithmetic) and `matvec_f32`.
+`tests/vulkan_check` runs them over the matrices of block 0 and the output
+of a model and compares with a double precision product: 1.3e-7 to 1.8e-7
+on SmolLM2 Q8_0 and F32 with 1 and 16 inputs (on llvmpipe, Mesa's CPU
+device; there is no GPU on the development machine, so no speed numbers
+yet). `cmake -DFAISCA_VULKAN=OFF` leaves the backend out.
 
 `GgufFile` is a plain value object: no smart pointers, no heap allocation for
 the object itself. The reader never copies or decodes anything up front.

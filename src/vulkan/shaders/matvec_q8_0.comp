@@ -1,0 +1,76 @@
+#version 450
+
+// y[token][row] = sum over the Q8_0 blocks of row of scale * (q . x), 32 threads per row
+
+layout(local_size_x = 32) in;
+
+layout(std430, binding = 0) readonly buffer Scales
+{
+    uint scales[];
+};
+
+layout(std430, binding = 1) readonly buffer Quants
+{
+    uint quants[];
+};
+
+layout(std430, binding = 2) readonly buffer Input
+{
+    float x[];
+};
+
+layout(std430, binding = 3) writeonly buffer Output
+{
+    float y[];
+};
+
+layout(push_constant) uniform Push
+{
+    uint n_in;
+    uint n_out;
+    uint blocks;
+    uint x_stride;
+    uint y_stride;
+    uint n_tokens;
+} p;
+
+shared float partial[32];
+
+void main()
+{
+    const uint row = gl_WorkGroupID.x;
+    const uint token = gl_WorkGroupID.y;
+    const uint tid = gl_LocalInvocationID.x;
+    float sum = 0.0;
+    for (uint b = tid; b < p.blocks; b += 32)
+    {
+        const uint block = row * p.blocks + b;
+        const float d = unpackHalf2x16(scales[block >> 1])[block & 1];
+        const uint base = block * 8;
+        const uint xb = token * p.x_stride + b * 32;
+        float acc = 0.0;
+        for (uint j = 0; j < 8; ++j)
+        {
+            const int w = int(quants[base + j]);
+            acc += float(bitfieldExtract(w, 0, 8)) * x[xb + 4 * j];
+            acc += float(bitfieldExtract(w, 8, 8)) * x[xb + 4 * j + 1];
+            acc += float(bitfieldExtract(w, 16, 8)) * x[xb + 4 * j + 2];
+            acc += float(bitfieldExtract(w, 24, 8)) * x[xb + 4 * j + 3];
+        }
+        sum += d * acc;
+    }
+    partial[tid] = sum;
+    barrier();
+    for (uint s = 16; s > 0; s >>= 1)
+    {
+        if (tid < s)
+        {
+            partial[tid] += partial[tid + s];
+        }
+        barrier();
+    }
+    if (tid == 0)
+    {
+        y[token * p.y_stride + row] = partial[0];
+    }
+}

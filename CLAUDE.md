@@ -39,7 +39,18 @@ top. No third party dependencies. Owner: Luís (akadjoker). "faisca" is a workin
    thread with a Q4_0 draft and about 1.1x with four, 0.9x at a 512 token
    context; the draft costs 0.3 to 0.4 of the target per token, which caps
    it (bench/README.md). Then Vulkan; then the cache format.
-5. Vulkan compute backend (the owner chose Vulkan over CUDA and OpenGL).
+5. Vulkan compute backend (the owner chose Vulkan over CUDA and OpenGL): in
+   progress. Done: VulkanDevice (loader opened at run time with dlopen /
+   LoadLibrary, instance, compute queue, buffers with staging, pipelines,
+   recorded dispatches with a memory barrier after each), VulkanKernels
+   with matvec_q8_0 and matvec_f32 (GLSL in src/vulkan/shaders, SPIR-V
+   embedded by tools/embed_spirv.py, generated file committed),
+   tests/vulkan_check (1.3e-7 to 1.8e-7 against double precision, 1 and 16
+   inputs). Only llvmpipe (Mesa CPU, Vulkan 1.4, subgroup 8) is available
+   here, so correctness only; speed needs the owner's GPU. Next: the other
+   ops (rms_norm, rope, attention with the KV cache on the device, swiglu,
+   add, embedding gather), a VulkanRunner with the trace callback so
+   compare_layers validates it layer by layer, then the CLI option.
 6. Own cache format with offset tables, KV cache kept between turns and saved to
    disk, longest common prefix reuse, snapshots.
 
