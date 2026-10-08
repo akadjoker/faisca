@@ -30,6 +30,13 @@ public:
 
     bool init(const VisionModel& model, ThreadPool& pool, Error& error);
 
+    // rounds the image patches to f16 before the patch embedding, as ggml_conv_2d's im2col
+    // does in llama.cpp; only for the comparison with that reference
+    void set_f16_patches(bool on)
+    {
+        m_f16_patches = on;
+    }
+
     void set_trace(RunnerTrace callback, void* user)
     {
         m_trace = callback;
@@ -67,6 +74,7 @@ private:
 
     const VisionModel* m_model = nullptr;
     ThreadPool* m_pool = nullptr;
+    bool m_f16_patches = false;
     RunnerTrace m_trace = nullptr;
     void* m_trace_user = nullptr;
     const float* m_quantize_x = nullptr;

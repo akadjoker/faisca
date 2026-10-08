@@ -1,11 +1,12 @@
 // Encodes an image with the faisca vision encoder and writes the image embeddings as raw
 // float32 (n_tokens x n_proj), to compare with the reference's mtmd_get_output_embd.
 //
-// usage: vision_dump [--threads N] [--f32] [--trace trace.bin] [--layers N] <mmproj.gguf> <image> <embd.bin>
+// usage: vision_dump [--threads N] [--f32] [--trace trace.bin] [--layers N] [--f16-patches] <mmproj.gguf> <image> <embd.bin>
 //
 // --trace writes every traced tensor in the format of tests/reference/llama_layer_dump.cpp
 // (and of llama_vision_dump --trace), for tests/compare_vision.py; --layers N keeps the
-// per layer tensors of the first N layers only (a whole trace is about 8 GB).
+// per layer tensors of the first N layers only (a whole trace is about 8 GB); --f16-patches
+// rounds the image patches to f16 as llama.cpp's conv does, for that comparison.
 
 #include "faisca/image.h"
 #include "faisca/thread.h"
@@ -89,6 +90,7 @@ int main(int argc, char** argv)
     int threads = 1;
     bool f32 = false;
     const char* trace_path = nullptr;
+    bool f16_patches = false;
     int layers = 1 << 30;
     std::vector<const char*> positional;
     for (int i = 1; i < argc; ++i)
@@ -109,6 +111,10 @@ int main(int argc, char** argv)
         {
             layers = std::atoi(argv[++i]);
         }
+        else if (std::strcmp(argv[i], "--f16-patches") == 0)
+        {
+            f16_patches = true;
+        }
         else
         {
             positional.push_back(argv[i]);
@@ -116,7 +122,7 @@ int main(int argc, char** argv)
     }
     if (positional.size() != 3)
     {
-        std::fprintf(stderr, "usage: vision_dump [--threads N] [--f32] [--trace trace.bin] [--layers N] <mmproj.gguf> <image> <embd.bin>\n");
+        std::fprintf(stderr, "usage: vision_dump [--threads N] [--f32] [--trace trace.bin] [--layers N] [--f16-patches] <mmproj.gguf> <image> <embd.bin>\n");
         return 2;
     }
     faisca::Error error;
@@ -132,6 +138,7 @@ int main(int argc, char** argv)
         return 1;
     }
     const auto t1 = std::chrono::steady_clock::now();
+    runner.set_f16_patches(f16_patches);
     Capture capture;
     capture.layers = layers;
     if (trace_path != nullptr)

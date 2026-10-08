@@ -24,7 +24,7 @@ bool preprocess_image(const Image& image, const VisionHparams& h, Array<float>& 
     new_w = new_w < size ? new_w : size;
     new_h = new_h < size ? new_h : size;
     Image resized;
-    if (!resize_image(image, new_w, new_h, ResizeFilter::Bicubic, resized, error))
+    if (!resize_image(image, new_w, new_h, ResizeFilter::Bilinear, resized, error))
     {
         return false;
     }
@@ -361,6 +361,13 @@ bool VisionRunner::encode_planes(const float* planes, Array<float>& embeddings, 
 
     PatchJob patches{planes, h.image_size, h.patch_size, h.patches_per_side(), m_patches.data()};
     m_pool->run(patch_task, &patches);
+    if (m_f16_patches)
+    {
+        for (size_t i = 0; i < m_patches.size(); ++i)
+        {
+            m_patches[i] = f16_to_f32(f32_to_f16(m_patches[i]));
+        }
+    }
     matmul(m_model->patch_embd(), m_patches.data(), n, m_x.data());
     bias_rows(m_x.data(), m_model->patch_bias(), n, dim);
     trace("patch_bias", -1, m_x.data(), n * dim);
