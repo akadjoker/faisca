@@ -182,18 +182,23 @@ is the same code without the software prefetch described below.
 
 | | threads | llama.cpp | faisca before prefetch | faisca |
 | --- | --- | --- | --- | --- |
-| Q8_0 generation (tok/s) | 1 | 24.9 | 24.6 | 31.9 |
-| Q8_0 generation (tok/s) | 4 | 71 | 76.5 | 90 |
-| Q8_0 prompt (tok/s) | 1 | 255 | 166 | 178 |
-| Q8_0 prompt (tok/s) | 4 | 143 | 494 | 494 |
-| Q4_0 generation (tok/s) | 1 | 38.8 | 30.8 | 44.3 |
-| Q4_0 generation (tok/s) | 4 | 70 | 89.7 | 134 |
-| Q4_0 prompt (tok/s) | 1 | 249 | 177 | 189 |
-| Q4_0 prompt (tok/s) | 4 | 147 | 558 | 542 |
-| Q4_K_M generation (tok/s) | 1 | 19.2 | 23.6 | 37.9 |
-| Q4_K_M generation (tok/s) | 4 | 54 | 78 | 117 |
-| Q4_K_M prompt (tok/s) | 1 | 83 | 164 | 177 |
-| Q4_K_M prompt (tok/s) | 4 | 266 | 492 | 521 |
+| Q8_0 generation (tok/s) | 1 | 24.9 | 24.6 | 33.8 |
+| Q8_0 generation (tok/s) | 4 | 71 | 76.5 | 98 |
+| Q8_0 prompt (tok/s) | 1 | 255 | 166 | 212 |
+| Q8_0 prompt (tok/s) | 4 | 143 | 494 | 603 |
+| Q4_0 generation (tok/s) | 1 | 38.8 | 30.8 | 45 |
+| Q4_0 generation (tok/s) | 4 | 70 | 89.7 | 144 to 183 |
+| Q4_0 prompt (tok/s) | 1 | 249 | 177 | 207 |
+| Q4_0 prompt (tok/s) | 4 | 147 | 558 | 570 to 599 |
+| Q4_K_M generation (tok/s) | 1 | 19.2 | 23.6 | 40.3 |
+| Q4_K_M generation (tok/s) | 4 | 54 | 78 | 118 |
+| Q4_K_M prompt (tok/s) | 1 | 83 | 164 | 204 |
+| Q4_K_M prompt (tok/s) | 4 | 266 | 492 | 550 |
+
+The last column has the software prefetch, the vectorized SwiGLU and the
+vectorized activation quantizers. Four thread numbers on this VM move by up
+to 25% between runs (the Q4_0 rows show the spread of three runs), one
+thread numbers by a few percent.
 
 llama.cpp is slower on Q4_K_M than on Q8_0 here because Q5_0 has no AMX
 kernel in its CPU backend.
@@ -219,6 +224,27 @@ with the hardware prefetchers alone. Asking for the group block 8 KiB ahead
 Splitting the `vpdpbusd` chain over 2 or 4 accumulators changed nothing, in
 cache or streaming. The outputs are bit identical with and without the
 prefetch.
+
+**Where the prompt time goes**, Q8_0, 512 tokens, one thread, from an
+instrumented copy of the runner: matrix products 1.86 s, attention 0.65,
+per token steps 0.37, activation quantization 0.25 (3.14 s in all). The
+per token steps were mostly `std::exp` in SwiGLU, 82 thousand calls per
+token; with the vectorized exp they take 0.18 s, and the quantizers in
+AVX-512 (bit identical bytes: the same product rounded to nearest even)
+take 0.11 s. The products are bound by one 512-bit `vpdpbusd` per cycle, 64
+multiply adds, 131 GMAC/s at 2.1 GHz.
+
+**AMX for the prompt, measured and set aside.** The tile unit itself is fast
+(`tdpbsud` 16 x 16 x 32 in 6 ns, 1.3 TMAC/s), but Q8_0 has a scale per block
+of 32, so every block needs its int32 tile stored and scaled in float32 for
+16 tokens (about 110 vector instructions), and that epilogue is where the
+time goes: on a 400 MiB stream of weights with 16 tokens the VNNI GEMM does
+124 GMAC/s, the AMX kernel 145, and 150 with two tile sets so the next
+product overlaps the epilogue, 1.25x and bit identical outputs. With four
+processes both run memory bound at about 10 GB/s each. The matrix products
+are 59% of the prompt time, so AMX would buy about 10% end to end for a per
+thread tile configuration, a permission syscall and a Windows path; not
+taken.
 
 Expanding Q5_0 to packed Q8_0 at load (exact values, 1.55x the bytes) was
 measured before the prefetch: 6% faster for one token on one thread, slower

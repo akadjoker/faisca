@@ -50,9 +50,9 @@ faisca generate model.gguf -p "What is the capital of France?" -n 64 -t 4
 that), decodes greedily and prints the tokens as they come, then the timings.
 `-t` sets the threads, `--f32` converts the weights to float32 at load (the
 validation path), `--kv-f32` keeps the KV cache in float32 instead of f16.
-SmolLM2-360M on a 2.1 GHz Xeon, 4 threads: 90 tokens per second from Q8_0,
-134 from Q4_0, 117 from Q4_K_M, prompts at 490 to 540 tokens per second
-(bench/README.md has the table against llama.cpp).
+SmolLM2-360M on a 2.1 GHz Xeon, 4 threads: 98 tokens per second from Q8_0,
+about 150 from Q4_0, 118 from Q4_K_M, prompts at 550 to 600 tokens per
+second (bench/README.md has the table against llama.cpp).
 
 ## Library
 

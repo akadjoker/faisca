@@ -505,7 +505,7 @@ void matvec_q5_0_packed_scalar(const uint8_t* packed, const uint8_t* xq, const i
     (void)n_out;
 }
 
-void quantize_q8_k(const float* x, size_t n, uint8_t* out)
+void quantize_q8_k_scalar(const float* x, size_t n, uint8_t* out)
 {
     for (size_t i = 0; i < n; i += Q8_K_BLOCK)
     {
@@ -1627,7 +1627,7 @@ uint16_t f32_to_f16(float value)
     return static_cast<uint16_t>((sign >> 16) | result);
 }
 
-void quantize_q8_0(const float* x, size_t n, uint8_t* out)
+void quantize_q8_0_scalar(const float* x, size_t n, uint8_t* out)
 {
     for (size_t i = 0; i < n; i += Q8_0_BLOCK)
     {
@@ -2126,6 +2126,157 @@ void exp_values(float* x, size_t n)
 #endif
 }
 
+void swiglu(const float* gate, const float* up, size_t n, float* out)
+{
+    size_t i = 0;
+#if defined(__AVX512F__)
+    for (; i + 16 <= n; i += 16)
+    {
+        const __m512 g = _mm512_loadu_ps(gate + i);
+        const __m512 e = exp_avx512(_mm512_sub_ps(_mm512_setzero_ps(), g));
+        const __m512 silu = _mm512_div_ps(g, _mm512_add_ps(_mm512_set1_ps(1.0f), e));
+        _mm512_storeu_ps(out + i, _mm512_mul_ps(silu, _mm512_loadu_ps(up + i)));
+    }
+#endif
+    for (; i + 8 <= n; i += 8)
+    {
+        const __m256 g = _mm256_loadu_ps(gate + i);
+        const __m256 e = exp_avx2(_mm256_sub_ps(_mm256_setzero_ps(), g));
+        const __m256 silu = _mm256_div_ps(g, _mm256_add_ps(_mm256_set1_ps(1.0f), e));
+        _mm256_storeu_ps(out + i, _mm256_mul_ps(silu, _mm256_loadu_ps(up + i)));
+    }
+    if (i < n)
+    {
+        swiglu_scalar(gate + i, up + i, n - i, out + i);
+    }
+}
+
+namespace
+{
+
+#if defined(__AVX512F__)
+inline void store_int8_16(uint8_t* out, __m512i values)
+{
+    _mm_storeu_si128(reinterpret_cast<__m128i*>(out), _mm512_cvtepi32_epi8(values));
+}
+#endif
+
+inline void store_int8_8(uint8_t* out, __m256i values)
+{
+    alignas(32) int32_t v[8];
+    _mm256_store_si256(reinterpret_cast<__m256i*>(v), values);
+    for (size_t k = 0; k < 8; ++k)
+    {
+        out[k] = static_cast<uint8_t>(static_cast<int8_t>(v[k]));
+    }
+}
+
+}
+
+// the same arithmetic as the scalar version: x * id rounded to nearest even, so the bytes are identical
+void quantize_q8_0(const float* x, size_t n, uint8_t* out)
+{
+    for (size_t i = 0; i < n; i += Q8_0_BLOCK)
+    {
+#if defined(__AVX512F__)
+        const __m512 v0 = _mm512_loadu_ps(x + i);
+        const __m512 v1 = _mm512_loadu_ps(x + i + 16);
+        const __m512 amax_v = _mm512_max_ps(_mm512_abs_ps(v0), _mm512_abs_ps(v1));
+        const float amax = _mm512_reduce_max_ps(amax_v);
+        const float d = amax / 127.0f;
+        const float id = amax != 0.0f ? 127.0f / amax : 0.0f;
+        const uint16_t bits = f32_to_f16(d);
+        std::memcpy(out, &bits, 2);
+        const __m512 vid = _mm512_set1_ps(id);
+        store_int8_16(out + 2, _mm512_cvtps_epi32(_mm512_mul_ps(v0, vid)));
+        store_int8_16(out + 18, _mm512_cvtps_epi32(_mm512_mul_ps(v1, vid)));
+#else
+        const __m256 sign = _mm256_set1_ps(-0.0f);
+        __m256 amax_v = _mm256_setzero_ps();
+        for (size_t j = 0; j < Q8_0_BLOCK; j += 8)
+        {
+            amax_v = _mm256_max_ps(amax_v, _mm256_andnot_ps(sign, _mm256_loadu_ps(x + i + j)));
+        }
+        const __m128 m4 = _mm_max_ps(_mm256_castps256_ps128(amax_v), _mm256_extractf128_ps(amax_v, 1));
+        const __m128 m2 = _mm_max_ps(m4, _mm_movehl_ps(m4, m4));
+        const float amax = _mm_cvtss_f32(_mm_max_ss(m2, _mm_movehdup_ps(m2)));
+        const float d = amax / 127.0f;
+        const float id = amax != 0.0f ? 127.0f / amax : 0.0f;
+        const uint16_t bits = f32_to_f16(d);
+        std::memcpy(out, &bits, 2);
+        const __m256 vid = _mm256_set1_ps(id);
+        for (size_t j = 0; j < Q8_0_BLOCK; j += 8)
+        {
+            store_int8_8(out + 2 + j, _mm256_cvtps_epi32(_mm256_mul_ps(_mm256_loadu_ps(x + i + j), vid)));
+        }
+#endif
+        out += Q8_0_BLOCK_BYTES;
+    }
+}
+
+// as quantize_q8_k_scalar: the extreme is the first value whose magnitude is the largest
+void quantize_q8_k(const float* x, size_t n, uint8_t* out)
+{
+    for (size_t i = 0; i < n; i += Q8_K_BLOCK)
+    {
+        const float* block_x = x + i;
+#if defined(__AVX512F__)
+        __m512 amax_v = _mm512_setzero_ps();
+        for (size_t j = 0; j < Q8_K_BLOCK; j += 16)
+        {
+            amax_v = _mm512_max_ps(amax_v, _mm512_abs_ps(_mm512_loadu_ps(block_x + j)));
+        }
+        const float amax = _mm512_reduce_max_ps(amax_v);
+#else
+        const __m256 sign = _mm256_set1_ps(-0.0f);
+        __m256 amax_v = _mm256_setzero_ps();
+        for (size_t j = 0; j < Q8_K_BLOCK; j += 8)
+        {
+            amax_v = _mm256_max_ps(amax_v, _mm256_andnot_ps(sign, _mm256_loadu_ps(block_x + j)));
+        }
+        const __m128 m4 = _mm_max_ps(_mm256_castps256_ps128(amax_v), _mm256_extractf128_ps(amax_v, 1));
+        const __m128 m2 = _mm_max_ps(m4, _mm_movehl_ps(m4, m4));
+        const float amax = _mm_cvtss_f32(_mm_max_ss(m2, _mm_movehdup_ps(m2)));
+#endif
+        if (amax == 0.0f)
+        {
+            std::memset(out, 0, Q8_K_BLOCK_BYTES);
+            out += Q8_K_BLOCK_BYTES;
+            continue;
+        }
+        float max = 0.0f;
+        for (size_t j = 0; j < Q8_K_BLOCK; ++j)
+        {
+            if (std::fabs(block_x[j]) == amax)
+            {
+                max = block_x[j];
+                break;
+            }
+        }
+        const float iscale = -127.0f / max;
+        const float d = 1.0f / iscale;
+        std::memcpy(out, &d, 4);
+#if defined(__AVX512F__)
+        const __m512 vscale = _mm512_set1_ps(iscale);
+        const __m512i limit = _mm512_set1_epi32(127);
+        for (size_t j = 0; j < Q8_K_BLOCK; j += 16)
+        {
+            const __m512i q = _mm512_cvtps_epi32(_mm512_mul_ps(_mm512_loadu_ps(block_x + j), vscale));
+            store_int8_16(out + 4 + j, _mm512_min_epi32(q, limit));
+        }
+#else
+        const __m256 vscale = _mm256_set1_ps(iscale);
+        const __m256i limit = _mm256_set1_epi32(127);
+        for (size_t j = 0; j < Q8_K_BLOCK; j += 8)
+        {
+            const __m256i q = _mm256_cvtps_epi32(_mm256_mul_ps(_mm256_loadu_ps(block_x + j), vscale));
+            store_int8_8(out + 4 + j, _mm256_min_epi32(q, limit));
+        }
+#endif
+        out += Q8_K_BLOCK_BYTES;
+    }
+}
+
 #if defined(__AVX512F__)
 
 namespace
@@ -2287,6 +2438,21 @@ void exp_values(float* x, size_t n)
     exp_values_scalar(x, n);
 }
 
+void swiglu(const float* gate, const float* up, size_t n, float* out)
+{
+    swiglu_scalar(gate, up, n, out);
+}
+
+void quantize_q8_0(const float* x, size_t n, uint8_t* out)
+{
+    quantize_q8_0_scalar(x, n, out);
+}
+
+void quantize_q8_k(const float* x, size_t n, uint8_t* out)
+{
+    quantize_q8_k_scalar(x, n, out);
+}
+
 void attention_head(const float* q, const float* k_tiles, const float* v, size_t v_stride, size_t head_dim,
                     size_t n_past, float scale, float* scores, float* out)
 {
@@ -2301,7 +2467,7 @@ void attention_head_f16(const float* q, const uint16_t* k_tiles, const uint16_t*
 
 #endif
 
-void swiglu(const float* gate, const float* up, size_t n, float* out)
+void swiglu_scalar(const float* gate, const float* up, size_t n, float* out)
 {
     for (size_t i = 0; i < n; ++i)
     {

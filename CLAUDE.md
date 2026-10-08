@@ -30,8 +30,10 @@ top. No third party dependencies. Owner: Luís (akadjoker). "faisca" is a workin
 4. CPU optimization: in progress. Done: Q8_0, Q4_0, Q5_0, Q4_K and Q6_K
    packed VNNI kernels (AVX-512), thread pool, batched prompt, tiled
    attention, KV cache in f16, software prefetch in the generation kernels.
-   Pending: AMX for the prompt, AVX-VNNI (256-bit) kernels for Q5_0 and the
-   K-quants (those types convert to float32 on such builds). Then speculative decoding with SmolLM2-135M as draft;
+   AMX for the prompt was measured (scratch bench_amx) and set aside: the
+   per block float epilogue bounds it at 1.25x over VNNI on the GEMM, about
+   10% of the prompt (bench/README.md). Pending: AVX-VNNI (256-bit) kernels
+   for Q5_0 and the K-quants (those types convert to float32 on such builds). Then speculative decoding with SmolLM2-135M as draft;
    then Vulkan; then the cache format.
 5. Vulkan compute backend (the owner chose Vulkan over CUDA and OpenGL).
 6. Own cache format with offset tables, KV cache kept between turns and saved to
@@ -110,12 +112,14 @@ identical. No rope scaling, no biases, no MoE yet: rejected with an error.
   every position, 16 greedy tokens identical. ASan, UBSan, TSan clean with 4
   threads.
 - Speed, SmolLM2-360M, 2.1 GHz Sapphire Rapids VM, 1 / 4 threads, 512 token
-  prompt then 32 tokens (bench/README.md). Generation: Q8_0 31.9 / 90 tok/s
-  (llama.cpp 24.9 / 71), Q4_0 44.3 / 134 (llama.cpp 38.8 / 70), Q4_K_M 37.9
-  / 117 (llama.cpp 19.2 / 54). Prompt: Q8_0 178 / 494, Q4_0 189 / 542,
-  Q4_K_M 177 / 521 (llama.cpp pp512 255 / 143, 249 / 147, 83 / 266).
-  Before the software prefetch generation was Q8_0 24.6 / 76.5, Q4_0 30.8 /
-  89.7, Q4_K_M 23.6 / 78. At a context of 1045 positions, Q8_0: f16 cache 21.5 / 65 tok/s
+  prompt then 32 tokens (bench/README.md). Generation: Q8_0 33.8 / 98 tok/s
+  (llama.cpp 24.9 / 71), Q4_0 45 / 144 to 183 (llama.cpp 38.8 / 70), Q4_K_M
+  40.3 / 118 (llama.cpp 19.2 / 54). Prompt: Q8_0 212 / 603, Q4_0 207 / 570
+  to 599, Q4_K_M 204 / 550 (llama.cpp pp512 255 / 143, 249 / 147, 83 /
+  266). Four thread numbers move up to 25% between runs on this VM. Before
+  the software prefetch generation was Q8_0 24.6 / 76.5, Q4_0 30.8 / 89.7,
+  Q4_K_M 23.6 / 78; the vectorized SwiGLU and quantizers then took the Q8_0
+  prompt from 178 / 494 to 212 / 603. At a context of 1045 positions, Q8_0: f16 cache 21.5 / 65 tok/s
   against 20.4 / 56 with the float32 cache, prompt 132 / 417 against 122 /
   393, cache 80 MiB instead of 160 for 2048 positions (measured before the
   prefetch). The 512 token file is the first 512 ids of
@@ -138,7 +142,16 @@ identical. No rope scaling, no biases, no MoE yet: rejected with an error.
   13.8 GB/s on a 400 MiB stream (the L3 is 260 MiB, so streaming tests need
   more than that) and Q8_0 from 12.3 to 16.0; 2 or 4 integer accumulators
   changed nothing. Measure micro benchmarks at -O3: at -O2 the compiler
-  spills the unpacked chunks and the in-cache numbers are 3x off.
+  spills the unpacked chunks and the in-cache numbers are 3x off. Prompt
+  phases, Q8_0, 512 tokens, 1 thread, 3.14 s: matmul 1.86 s, attention
+  0.65, token steps 0.37, quantize 0.25 (instrumented copy of runner.cpp in
+  the scratchpad, runner_phases.cpp). Token steps were std::exp in swiglu
+  (82k calls per token): now exp_values, 0.18 s; quantizers vectorized with
+  bit identical bytes (x * id rounded to nearest even, as nearbyint), 0.11
+  s. The VNNI GEMM is bound by one zmm vpdpbusd per cycle (64 MAC/cycle,
+  131 GMAC/s at 2.1 GHz). swiglu now differs from std::exp by a few ulp, so
+  dumps changed; the float32 path against llama.cpp is 4.1e-6 (was 4.5e-6)
+  and Q8_0 keeps the same 16 tokens as llama.cpp.
 - Reference tools: `tests/reference/llama_layer_dump.cpp` and
   `tests/matmul_check.cpp` (see README). Q4_0 and Q4_K_M files of SmolLM2 were
   made with llama-quantize from the float32 copy; the Q4_K_M one is mostly

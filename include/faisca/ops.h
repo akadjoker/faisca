@@ -21,6 +21,7 @@ constexpr size_t Q8_0_BLOCK_BYTES = 34; // f16 scale, 32 int8
 // Q8_0 blocks of x, n a multiple of 32, as llama.cpp quantizes activations on x86:
 // scale amax / 127 stored as f16, values x * 127 / amax rounded to nearest even
 void quantize_q8_0(const float* x, size_t n, uint8_t* out);
+void quantize_q8_0_scalar(const float* x, size_t n, uint8_t* out);
 
 void dequantize_q8_0(const uint8_t* blocks, size_t n, float* out);
 
@@ -109,6 +110,7 @@ constexpr size_t Q8_K_BLOCK = 256;
 constexpr size_t Q8_K_BLOCK_BYTES = 4 + Q8_K_BLOCK;
 
 void quantize_q8_k(const float* x, size_t n, uint8_t* out);
+void quantize_q8_k_scalar(const float* x, size_t n, uint8_t* out);
 void dequantize_q8_k(const uint8_t* blocks, size_t n, float* out);
 
 // sum of every 16 quantized values, n / 16 sums
@@ -206,8 +208,9 @@ void attention_head_f16(const float* q, const uint16_t* k_tiles, const uint16_t*
 void attention_head_f16_scalar(const float* q, const uint16_t* k_tiles, const uint16_t* v, size_t v_stride,
                                size_t head_dim, size_t n_past, float scale, float* scores, float* out);
 
-// out = silu(gate) * up
+// out = silu(gate) * up; the vector one uses exp_values, within a few ulp of the scalar one
 void swiglu(const float* gate, const float* up, size_t n, float* out);
+void swiglu_scalar(const float* gate, const float* up, size_t n, float* out);
 
 void add(float* x, const float* y, size_t n);
 

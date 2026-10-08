@@ -993,6 +993,47 @@ void test_f16_cache()
     }
 }
 
+void test_vector_quantizers_and_swiglu()
+{
+    std::mt19937 rng(53);
+    const size_t n = 8 * Q8_K_BLOCK;
+    std::vector<float> x = random_values(rng, n, 2.0f);
+    for (size_t i = 0; i < Q8_K_BLOCK; ++i)
+    {
+        x[Q8_K_BLOCK + i] = 0.0f;
+    }
+    // a tie between a positive and a negative extreme: the first one wins
+    x[2 * Q8_K_BLOCK + 40] = -7.5f;
+    x[2 * Q8_K_BLOCK + 41] = 7.5f;
+    x[3 * Q8_K_BLOCK + 9] = 7.5f;
+    x[3 * Q8_K_BLOCK + 8] = -7.5f;
+    x[4 * Q8_K_BLOCK + 5] = 1e-30f;
+    std::vector<uint8_t> a(n / Q8_0_BLOCK * Q8_0_BLOCK_BYTES), b(a.size());
+    quantize_q8_0(x.data(), n, a.data());
+    quantize_q8_0_scalar(x.data(), n, b.data());
+    CHECK(std::memcmp(a.data(), b.data(), a.size()) == 0);
+    std::vector<uint8_t> c(n / Q8_K_BLOCK * Q8_K_BLOCK_BYTES), d(c.size());
+    quantize_q8_k(x.data(), n, c.data());
+    quantize_q8_k_scalar(x.data(), n, d.data());
+    CHECK(std::memcmp(c.data(), d.data(), c.size()) == 0);
+
+    std::vector<float> gate = random_values(rng, 2560 + 5, 4.0f);
+    std::vector<float> up = random_values(rng, 2560 + 5, 1.0f);
+    gate[0] = -200.0f;
+    gate[1] = 200.0f;
+    gate[2] = 0.0f;
+    gate[3] = -88.5f;
+    std::vector<float> fast(gate.size()), reference(gate.size());
+    swiglu(gate.data(), up.data(), gate.size(), fast.data());
+    swiglu_scalar(gate.data(), up.data(), gate.size(), reference.data());
+    bool all_close = true;
+    for (size_t i = 0; i < gate.size(); ++i)
+    {
+        all_close = all_close && close(fast[i], reference[i], 4e-7);
+    }
+    CHECK(all_close);
+}
+
 void test_swiglu_and_add()
 {
     const float gate[4] = {0.0f, 1.0f, -1.0f, 20.0f};
@@ -1027,6 +1068,7 @@ int main()
     test_softmax();
     test_exp_and_attention();
     test_f16_cache();
+    test_vector_quantizers_and_swiglu();
     test_swiglu_and_add();
 
     std::printf("%s ops_unit: %d checks, %d failed\n", g_failures == 0 ? "ok  " : "FAIL", g_checks, g_failures);
