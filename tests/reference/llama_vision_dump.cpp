@@ -2,7 +2,7 @@
 // embeddings as raw float32 (n_tokens x n_embd). Built against a llama.cpp build with
 // libmtmd; the Q8_0 and AMX issues of this machine need the no AMX libraries.
 //
-// usage: llama_vision_dump [--trace trace.bin] [--layers N] <model.gguf> <mmproj.gguf> <image> <embd.bin>
+// usage: llama_vision_dump [--trace trace.bin] [--layers N] [--threads N] <model.gguf> <mmproj.gguf> <image> <embd.bin>
 //        llama_vision_dump --lm <lm.bin> <generate N> <model.gguf> <mmproj.gguf> <image> <prompt>
 //
 // --lm runs the language model on the prompt (text with mtmd's <__media__> marker where the
@@ -13,7 +13,8 @@
 //
 // --trace writes the named intermediate tensors of the vision graph (clip.cpp's cb names,
 // the post layer norm as post_ln) in the format of llama_layer_dump, with the flash
-// attention of the encoder disabled so the keys and values stay float32; --layers N keeps
+// attention of the encoder disabled so the keys and values stay float32 (without --trace
+// the encoder keeps mtmd's default, flash attention, for the timing); --layers N keeps
 // the per layer tensors of the first N layers only (a whole trace is about 8 GB).
 
 #include "ggml-backend.h"
@@ -314,6 +315,7 @@ int main(int argc, char** argv)
     }
     const char* trace_path = nullptr;
     int layers = 1 << 30;
+    int threads = 1;
     while (argc >= 3 && argv[1][0] == '-')
     {
         if (std::strcmp(argv[1], "--trace") == 0)
@@ -324,6 +326,10 @@ int main(int argc, char** argv)
         {
             layers = std::atoi(argv[2]);
         }
+        else if (std::strcmp(argv[1], "--threads") == 0)
+        {
+            threads = std::atoi(argv[2]);
+        }
         else
         {
             break;
@@ -333,7 +339,7 @@ int main(int argc, char** argv)
     }
     if (argc != 5)
     {
-        std::fprintf(stderr, "usage: llama_vision_dump [--trace trace.bin] [--layers N] <model.gguf> <mmproj.gguf> <image> <embd.bin>\n");
+        std::fprintf(stderr, "usage: llama_vision_dump [--trace trace.bin] [--layers N] [--threads N] <model.gguf> <mmproj.gguf> <image> <embd.bin>\n");
         return 2;
     }
     Capture capture;
@@ -358,10 +364,10 @@ int main(int argc, char** argv)
     }
     mtmd_context_params params = mtmd_context_params_default();
     params.use_gpu = false;
-    params.n_threads = 1;
+    params.n_threads = threads;
     params.warmup = false;
     params.print_timings = false;
-    params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
+    params.flash_attn_type = capture.out != nullptr ? LLAMA_FLASH_ATTN_TYPE_DISABLED : LLAMA_FLASH_ATTN_TYPE_AUTO;
     if (capture.out != nullptr)
     {
         params.cb_eval = eval_callback;
