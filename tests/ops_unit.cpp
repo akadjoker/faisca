@@ -1187,6 +1187,50 @@ void test_whisper_ops()
 
 }
 
+void test_conv1d_rows()
+{
+    std::mt19937 rng(77);
+    const size_t cases[][5] = {{512, 7, 1, 4, 100}, {64, 3, 3, 5, 200}, {32, 1, 1, 3, 70}, {8, 2, 1, 1, 150}, {16, 3, 1, 6, 15}};
+    double worst = 0.0;
+    for (const size_t* c : cases)
+    {
+        const size_t ic = c[0];
+        const size_t k = c[1];
+        const size_t dilation = c[2];
+        const size_t oc = c[3];
+        const size_t length = c[4];
+        const size_t pad = (k - 1) * dilation;
+        std::vector<float> x = random_values(rng, ic * length, 1.0f);
+        std::vector<float> w = random_values(rng, oc * ic * k, 0.2f);
+        std::vector<float> b = random_values(rng, oc, 0.5f);
+        std::vector<float> out(oc * length, 0.0f);
+        const size_t t_split = length / 3;
+        conv1d_rows(x.data(), length, length, ic, w.data(), k, dilation, pad, b.data(), 0, oc, 0, t_split, out.data(), length);
+        conv1d_rows(x.data(), length, length, ic, w.data(), k, dilation, pad, b.data(), 0, oc, t_split, length, out.data(), length);
+        for (size_t o = 0; o < oc; ++o)
+        {
+            for (size_t t = 0; t < length; ++t)
+            {
+                double expected = b[o];
+                for (size_t i = 0; i < ic; ++i)
+                {
+                    for (size_t j = 0; j < k; ++j)
+                    {
+                        const ptrdiff_t src = static_cast<ptrdiff_t>(t + j * dilation) - static_cast<ptrdiff_t>(pad);
+                        if (src >= 0)
+                        {
+                            expected += static_cast<double>(w[(o * ic + i) * k + j]) * x[i * length + static_cast<size_t>(src)];
+                        }
+                    }
+                }
+                worst = std::max(worst, std::fabs(expected - out[o * length + t]) / (std::fabs(expected) + 1.0));
+            }
+        }
+    }
+    CHECK(worst < 1e-5);
+    std::printf("conv1d_rows: worst error %.2e\n", worst);
+}
+
 int main()
 {
     test_f16();
@@ -1205,6 +1249,7 @@ int main()
     test_vector_quantizers_and_swiglu();
     test_swiglu_and_add();
     test_whisper_ops();
+    test_conv1d_rows();
 
     std::printf("%s ops_unit: %d checks, %d failed\n", g_failures == 0 ? "ok  " : "FAIL", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;

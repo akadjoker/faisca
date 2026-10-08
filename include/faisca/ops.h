@@ -232,6 +232,15 @@ void add_bias(float* x, const float* bias, size_t n);
 void conv1d_k3(const float* x, size_t n_in, size_t length, const float* w, const float* bias, size_t stride,
                size_t first, size_t last, float* out);
 
+// causal 1-d convolution with stride 1 (src/ops_conv.cpp): x holds ic rows x_stride apart,
+// w[oc][ic][k], out[o][t] = bias[o] + sum over i and j of w[o][i][j] x[i][t + j dilation - pad]
+// with the taps before the row counting as zero; rows o in [first, last) and columns t in
+// [t_first, t_last) of length columns, written out_stride apart; the AVX-512 and AVX2 kernels
+// keep tiles of 4 rows x 64 or 32 columns in registers
+void conv1d_rows(const float* x, size_t x_stride, size_t length, size_t ic, const float* w, size_t k, size_t dilation,
+                 size_t pad, const float* bias, size_t first, size_t last, size_t t_first, size_t t_last, float* out,
+                 size_t out_stride);
+
 // one query of one head against n_kv keys and values whose rows are stride apart: scores
 // are scaled, softmax in float32 with a double sum (as softmax), out gets head_dim values
 void attention_rows(const float* q, const float* k, const float* v, size_t stride, size_t head_dim, size_t n_kv,

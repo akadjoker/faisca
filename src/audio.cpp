@@ -3,6 +3,7 @@
 #include "faisca/mapped_file.h"
 
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 
 namespace faisca
@@ -10,6 +11,18 @@ namespace faisca
 
 namespace
 {
+
+void write_u16(uint8_t* p, uint16_t v)
+{
+    p[0] = static_cast<uint8_t>(v);
+    p[1] = static_cast<uint8_t>(v >> 8);
+}
+
+void write_u32(uint8_t* p, uint32_t v)
+{
+    write_u16(p, static_cast<uint16_t>(v));
+    write_u16(p + 2, static_cast<uint16_t>(v >> 16));
+}
 
 constexpr size_t SIN_COS_N = WHISPER_N_FFT;
 
@@ -120,6 +133,50 @@ uint16_t read_u16(const uint8_t* p)
     return v;
 }
 
+}
+
+bool write_wav(const char* path, const float* samples, size_t count, uint32_t sample_rate, Error& error)
+{
+    FILE* f = std::fopen(path, "wb");
+    if (f == nullptr)
+    {
+        error.set("cannot write '%s'", path);
+        return false;
+    }
+    const uint32_t data_bytes = static_cast<uint32_t>(count * 2);
+    uint8_t header[44];
+    std::memcpy(header, "RIFF", 4);
+    write_u32(header + 4, 36 + data_bytes);
+    std::memcpy(header + 8, "WAVEfmt ", 8);
+    write_u32(header + 16, 16);
+    write_u16(header + 20, 1);
+    write_u16(header + 22, 1);
+    write_u32(header + 24, sample_rate);
+    write_u32(header + 28, sample_rate * 2);
+    write_u16(header + 32, 2);
+    write_u16(header + 34, 16);
+    std::memcpy(header + 36, "data", 4);
+    write_u32(header + 40, data_bytes);
+    bool ok = std::fwrite(header, 1, sizeof(header), f) == sizeof(header);
+    uint8_t block[2048];
+    for (size_t i = 0; i < count && ok; i += sizeof(block) / 2)
+    {
+        const size_t n = count - i < sizeof(block) / 2 ? count - i : sizeof(block) / 2;
+        for (size_t j = 0; j < n; ++j)
+        {
+            float v = samples[i + j];
+            v = v < -1.0f ? -1.0f : v > 1.0f ? 1.0f : v;
+            const int16_t pcm = static_cast<int16_t>(lrintf(v * 32767.0f));
+            write_u16(block + 2 * j, static_cast<uint16_t>(pcm));
+        }
+        ok = std::fwrite(block, 1, 2 * n, f) == 2 * n;
+    }
+    ok = std::fclose(f) == 0 && ok;
+    if (!ok)
+    {
+        error.set("write to '%s' failed", path);
+    }
+    return ok;
 }
 
 bool read_wav(const char* path, Array<float>& samples, Error& error)

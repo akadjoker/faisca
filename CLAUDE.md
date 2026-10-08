@@ -139,10 +139,57 @@ top. No third party dependencies. Owner: Luís (akadjoker). "faisca" is a workin
    medium 2.9; on the three Portuguese clips only small gets pt_0 exactly,
    and the training data is mostly Brazilian, so European Portuguese needs
    our own measurement with the owner's recordings.
-8. Text to speech: pick between OuteTTS (llama LLM + WavTokenizer, decoder
-   in libllama as `wavtokenizer-dec`) and Piper (VITS, pt_PT voices, ONNX
-   reference) by listening to Portuguese samples, then the audio decoder,
-   WAV writing, `speak` in the CLI.
+8. Text to speech: done with Pocket TTS (Kyutai, 100M, English and
+   Portuguese packs; the owner heard samples of Pocket, OuteTTS and Piper
+   and the Portuguese voices are all Brazilian, so English quality decided).
+   Reference: /home/user/ref/tts/pockettts.cpp (ggml port with `--dump`),
+   built stock in `build` and as `build-f32` with PT_F32_REFERENCE (no GELU
+   f16 table, im2col in float32, conv kernels kept F32) plus a patch that
+   names the step and prefill nodes (dbg_attn, dbg_attn_out, dbg_res_attn,
+   dbg_norm2, dbg_up, dbg_down, dbg_res_ffn per layer, set as outputs) and
+   writes them with PT_DUMP_NODES=<dir>. Packs in /home/user/models/tts
+   (pocket-tts-english_2026-09 and pocket-tts-portuguese, F32, Q8_0 and
+   voices GGUF). Library: `PocketTokenizer` (SentencePiece unigram, Viterbi
+   per space delimited segment, byte pieces), `pocket_prepare_text` and
+   `pocket_chunk_text` (text_chunking.py: rules from the GGUF keys,
+   chunks of at most 50 tokens cut at sentence then clause boundaries),
+   `PocketModel` (include/faisca/pocket_model.h: flow LM, flow head, Mimi
+   decoder and encoder weights; Q8_0 matrices packed, F32 ones quantized
+   unless `quantize` is false, which also dequantizes a Q8_0 pack;
+   transposed conv kernels stored per output phase as 2 tap causal convs),
+   `PocketVoice` (the `<name>.k` / `.v` rows of the voices GGUF),
+   `TorchRandom` (MT19937, torch's uniform from 24 bits and normal_ by
+   Box-Muller over blocks of 16), `PocketRunner` (pocket_runner.h: voice
+   rows written to a float32 KV cache, text prefill, one step per 80 ms
+   frame: input_linear, 6 layers, out_norm, EOS logit, flow head with the
+   two averaged time embeddings and n LSD steps, noise seeded once per
+   synthesis with one discarded draw after each prefill; the chunk's
+   latents decoded at once by Mimi: quantizer projection, depthwise
+   transposed conv, 2 windowed transformer layers (window 250, layer
+   scales), SEANet decoder with ELU; first 1920 samples of every chunk
+   dropped), `write_wav`, `faisca speak`. Validated with tests/pocket_dump
+   and tests/compare_pocket.py against the f32 reference on "The quick
+   brown fox jumps over the lazy dog.", voice alba, seed 1: prompt ids and
+   text embeddings identical, step 0 hidden 5.9e-7, EOS logits 2.9e-7,
+   37 latents 5.1e-6, audio 4.0e-5 rel L2, same 38 steps; a three chunk
+   text gives the same 51 / 74 / 52 frames; 1 and 4 threads bit
+   identical; ASan/UBSan clean; the plain AVX2 build gives the same
+   float32 numbers (the AVX-VNNI build cannot run on this VM, no avx_vnni
+   flag). With the Q8_0 pack both runners are 1.3e-2 to 1.5e-2 from
+   float32 at step 0 and 1.2e-2 from each other: the activations differ
+   by 1 ulp and one Q8_0 byte of the layer 0 attention output flips at a
+   rounding tie (x times id = 72.5), after which the autoregressive loop
+   keeps the two apart (the matmuls agree to 1e-7 on identical input, 1
+   and 14 tokens); the reference's own stock and f32 builds are as far
+   apart on the Q8_0 pack. Speed (bench/README.md): 13.9 s of audio in
+   6.8 / 3.7 / 2.2 s with 1 / 2 / 4 threads, pocket-tts 6.9 s with its 2
+   threads; the SEANet convolutions run through `conv1d_rows`
+   (src/ops_conv.cpp, 4 rows x 64 columns in AVX-512 registers, 4 x 32 in
+   AVX2, scalar edges), which took the decode from 108 to 22 ms per frame
+   on one thread. Not done: voice cloning from a recording (the Mimi
+   encoder weights load, the encoder does not run), streaming output,
+   `--temperature` and the other pocket-tts knobs, `pt_PT` quality
+   (precisamos de gravações do owner para medir).
 9. Qwen2.5 and Qwen3 text models (`qwen2`: Q, K, V biases and its own
    pre-tokenizer; `qwen3`: per head Q and K norms), then Gemma 3 and the
    SentencePiece tokenizer (Llama 2, Mistral).

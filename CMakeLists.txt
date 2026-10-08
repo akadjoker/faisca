@@ -60,8 +60,12 @@ add_library(faisca_lib STATIC
     src/unicode.cpp
     src/audio.cpp
     src/ops_whisper.cpp
+    src/ops_conv.cpp
     src/whisper_model.cpp
     src/whisper_runner.cpp
+    src/pocket_text.cpp
+    src/pocket_model.cpp
+    src/pocket_runner.cpp
 )
 find_package(Threads REQUIRED)
 target_link_libraries(faisca_lib PUBLIC Threads::Threads)
@@ -118,6 +122,8 @@ if(FAISCA_BUILD_TESTS)
     add_executable(runner_dump tests/runner_dump.cpp)
     add_executable(whisper_dump tests/whisper_dump.cpp)
     target_link_libraries(whisper_dump PRIVATE faisca_lib)
+    add_executable(pocket_dump tests/pocket_dump.cpp)
+    target_link_libraries(pocket_dump PRIVATE faisca_lib)
     target_link_libraries(runner_dump PRIVATE faisca_lib)
     target_compile_options(runner_dump PRIVATE ${FAISCA_WARNINGS})
 

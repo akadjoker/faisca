@@ -409,6 +409,33 @@ attention took 15.0 s of the 20.7 s of small on one thread. The next
 candidates are the convolutions (a scalar loop, 1.5 s) and the GELU
 (tanhf per value, 1.1 s); the matmuls are already the VNNI GEMM.
 
+## Pocket TTS against pockettts.cpp
+
+`faisca speak` against `pocket-tts` (pockettts.cpp, stock build, CPU, which
+picks half the logical cores: 2 threads here) on the English pack, voice
+alba, seed 1, the matrices on Q8_0 on both sides (the convolutions stay
+float32 on both). Time of the synthesis alone, as both tools report it;
+the load is 0.2 s for faisca and 0.15 s for pocket-tts.
+
+| text | audio | faisca 1 thread | 2 threads | 4 threads | pocket-tts (2 threads) |
+| --- | --- | --- | --- | --- | --- |
+| one sentence (14 tokens, 37 frames) | 2.9 s | 1.3 s | 0.76 s | 0.51 s | 1.45 s |
+| three sentences (87 tokens, 177 frames) | 13.9 s | 6.8 s | 3.7 s | 2.2 s | 6.9 s |
+
+Per frame on the one sentence text (trace timestamps, 1 / 2 / 4 threads):
+flow LM step 13.2 / 8.8 / 6.2 ms, Mimi decode 22 / 11.5 / 7.4 ms;
+pocket-tts reports 13 ms per step and 25 ms per frame of decode on its 2
+threads. The step is 6 layers of 1024 with 72 MiB of Q8_0 weights read
+per token plus the flow head, so it is bound by memory and by the
+fork/join of the thread pool, like the LLM generation. The decode was 108
+ms per frame on one thread with a plain loop over the SEANet taps; the
+convolutions are a GEMM of 7.5 GMAC for 3 s of audio and now run through
+`conv1d_rows`, which keeps 4 output channels x 64 positions in AVX-512
+registers (4 x 32 in AVX2) and loads every input vector once per tap:
+22 ms per frame. The transposed convolutions of the upsampling stages are
+run as stride separate 2 tap convolutions, one per output phase, with the
+kernels rearranged at load.
+
 ## What the numbers say
 
 - **Parsing a model does not depend on the containers.** All three land within

@@ -10,6 +10,8 @@
 #include "faisca/tokenizer.h"
 #include "faisca/audio.h"
 #include "faisca/whisper_model.h"
+#include "faisca/pocket_model.h"
+#include "faisca/pocket_runner.h"
 #include "faisca/whisper_runner.h"
 
 #include <chrono>
@@ -61,7 +63,10 @@ void print_usage()
         "\n"
         "transcribe runs a Whisper model (whisper.cpp ggml file) on a 16 kHz 16 bit WAV, greedy,\n"
         "without timestamps; --language is the two letter code (default en, pt for Portuguese);\n"
-        "the matrices run on Q8_0 unless --f32 keeps the file's values.\n",
+        "the matrices run on Q8_0 unless --f32 keeps the file's values.\n"
+        "\n"
+        "speak synthesizes -p (or standard input) with a Pocket TTS pack (pockettts.cpp GGUF) and one\n"
+        "of its voices into a 24 kHz 16 bit WAV (default out.wav); --seed picks the noise (default 0).\n",
         FAISCA_VERSION);
 }
 
@@ -1017,6 +1022,108 @@ int command_transcribe(int argc, char** argv)
     return 0;
 }
 
+int command_speak(int argc, char** argv)
+{
+    const char* text = nullptr;
+    const char* out = "out.wav";
+    int threads = 1;
+    bool quantize = true;
+    uint32_t seed = 0;
+    const char* positional[3] = {nullptr, nullptr, nullptr};
+    int n_positional = 0;
+    for (int i = 2; i < argc; ++i)
+    {
+        if (std::strcmp(argv[i], "-p") == 0 && i + 1 < argc)
+        {
+            text = argv[++i];
+        }
+        else if (std::strcmp(argv[i], "-o") == 0 && i + 1 < argc)
+        {
+            out = argv[++i];
+        }
+        else if (std::strcmp(argv[i], "--seed") == 0 && i + 1 < argc)
+        {
+            seed = static_cast<uint32_t>(std::strtoul(argv[++i], nullptr, 10));
+        }
+        else if (std::strcmp(argv[i], "--f32") == 0)
+        {
+            quantize = false;
+        }
+        else if (std::strcmp(argv[i], "-t") == 0 && i + 1 < argc)
+        {
+            threads = std::atoi(argv[++i]);
+        }
+        else if (argv[i][0] == '-')
+        {
+            std::fprintf(stderr, "faisca speak: unknown option '%s'\n", argv[i]);
+            return 2;
+        }
+        else if (n_positional < 3)
+        {
+            positional[n_positional++] = argv[i];
+        }
+    }
+    if (n_positional != 3 || threads < 1)
+    {
+        print_usage();
+        return 2;
+    }
+    faisca::Array<char> input;
+    if (text == nullptr)
+    {
+        char block[4096];
+        size_t n = 0;
+        while ((n = std::fread(block, 1, sizeof(block), stdin)) > 0)
+        {
+            if (!input.append(block, n))
+            {
+                std::fprintf(stderr, "faisca speak: out of memory\n");
+                return 1;
+            }
+        }
+        if (!input.push_back('\0'))
+        {
+            return 1;
+        }
+        text = input.data();
+    }
+
+    faisca::Error error;
+    faisca::PocketModel model;
+    faisca::PocketVoice voice;
+    faisca::ThreadPool pool;
+    faisca::PocketRunner runner;
+    const auto t0 = std::chrono::steady_clock::now();
+    if (!model.load(positional[0], error, quantize) || !voice.load(positional[1], positional[2], model, error) ||
+        !pool.start(threads, error) || !runner.init(model, pool, error))
+    {
+        std::fprintf(stderr, "faisca speak: %s\n", error.c_str());
+        return 1;
+    }
+    runner.set_seed(seed);
+    const auto t1 = std::chrono::steady_clock::now();
+    faisca::Array<float> samples;
+    if (!runner.synthesize(voice, text, std::strlen(text), samples, error))
+    {
+        std::fprintf(stderr, "faisca speak: %s\n", error.c_str());
+        return 1;
+    }
+    const auto t2 = std::chrono::steady_clock::now();
+    const uint32_t rate = model.hparams().sample_rate;
+    if (!faisca::write_wav(out, samples.data(), samples.size(), rate, error))
+    {
+        std::fprintf(stderr, "faisca speak: %s\n", error.c_str());
+        return 1;
+    }
+    const double load = std::chrono::duration<double>(t1 - t0).count();
+    const double run = std::chrono::duration<double>(t2 - t1).count();
+    const double audio = static_cast<double>(samples.size()) / static_cast<double>(rate);
+    std::fprintf(stderr, "load %.2f s, %.2f s of audio in %.2f s (%.2fx real time), %zu chunks, %zu frames, %d threads, %s -> %s\n",
+                 load, audio, run, audio / run, runner.stats().chunks, runner.stats().frames, threads, quantize ? "Q8_0" : "float32",
+                 out);
+    return 0;
+}
+
 int main(int argc, char** argv)
 {
     if (argc < 2)
@@ -1041,6 +1148,10 @@ int main(int argc, char** argv)
     if (std::strcmp(command, "transcribe") == 0)
     {
         return command_transcribe(argc, argv);
+    }
+    if (std::strcmp(command, "speak") == 0)
+    {
+        return command_speak(argc, argv);
     }
     if (std::strcmp(command, "version") == 0 || std::strcmp(command, "--version") == 0)
     {

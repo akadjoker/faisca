@@ -22,6 +22,7 @@ or exceptions. It has its own containers (`faisca::Array`, `faisca::StringMap`,
 | Vulkan compute backend | runs the whole model, validated layer by layer on llvmpipe; speed on a real GPU not measured yet |
 | Own cache format and KV cache on disk | done: sessions with prefix reuse, snapshots and files with an offset table |
 | Whisper (speech to text) | done: tiny, base and small validated layer by layer against whisper.cpp, `transcribe` command, no timestamps yet |
+| Pocket TTS (text to speech) | done: validated against pockettts.cpp, `speak` command, 27 voices, no cloning from a recording yet |
 
 ## Build
 
@@ -80,6 +81,23 @@ LLM runner (`--f32` keeps the file's values, the validation path). On the
 same Xeon with 4 threads, 11 s of audio: tiny 0.48 s, base 1.1 s, small
 3.3 s, against 0.85 / 1.5 / 4.0 s for whisper-cli with its f16 files and
 0.72 / 1.1 / 2.9 s with its Q8_0 files (bench/README.md).
+
+`speak` turns text into a 24 kHz WAV with a Pocket TTS pack (Kyutai's 100M
+model in pockettts.cpp's GGUF: `pocket-tts-<pack>-Q8_0.gguf` or `-F32`,
+plus `pocket-tts-<pack>-voices.gguf` with 27 voices such as alba, jane,
+george):
+
+```
+faisca speak pocket-tts-english_2026-09-Q8_0.gguf pocket-tts-english_2026-09-voices.gguf alba \
+    -p "The quick brown fox jumps over the lazy dog." -o fox.wav -t 4
+```
+
+The text is cut into chunks of at most 50 tokens at sentence and clause
+boundaries, each chunk runs the flow LM one step per 80 ms frame after the
+voice prompt until it predicts the end, and the Mimi decoder turns the
+latents into audio. `--seed` picks the noise (default 0, the same seed
+gives the same audio as pocket-tts). With 4 threads on the same Xeon
+13.9 s of audio takes 2.2 s (pocket-tts 6.9 s on its 2 threads).
 
 ## Library
 
@@ -347,6 +365,21 @@ python3 tests/compare_with_gguf_py.py build/gguf_dump model.gguf
   encoder GELU and 8e-2 at the logits, small and base keep the same
   tokens, tiny flips one near tie ("you, ask"), the same flip whisper.cpp
   makes with its own Q8_0 file.
+
+- **Pocket TTS against pockettts.cpp.** `pocket_dump` writes what
+  pockettts.cpp writes with `--dump` (the prompt ids, text embeddings, the
+  hidden state and latent of step 0, every EOS logit and latent, the audio)
+  and `tests/compare_pocket.py` compares the two directories. Against a
+  float32 build of the reference (no GELU table, float32 im2col) on the
+  English pack, voice alba, seed 1: ids and embeddings identical, step 0
+  hidden 5.9e-7, EOS 2.9e-7, latents 5.1e-6, audio 4.0e-5 rel L2, the
+  same number of frames, also on a three chunk text; 1 and 4 threads bit
+  identical, ASan and UBSan clean. On the Q8_0 pack the two runners are
+  1.2e-2 apart at step 0 while each is 1.3e-2 to 1.5e-2 from float32: one
+  Q8_0 activation byte of the first layer rounds differently from a 1 ulp
+  difference and the autoregressive loop keeps the runs apart; the
+  reference's own stock and float32 builds are as far apart from each
+  other on that pack.
 
 ## Layout
 
