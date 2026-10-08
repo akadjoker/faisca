@@ -1042,15 +1042,37 @@ void exp_values_scalar(float* x, size_t n)
     }
 }
 
-void attention_head_scalar(const float* q, const float* k_tiles, const float* v, size_t v_stride, size_t head_dim,
-                           size_t n_past, float scale, float* scores, float* out)
+void f32_to_f16_values_scalar(const float* x, size_t n, uint16_t* out)
+{
+    for (size_t i = 0; i < n; ++i)
+    {
+        out[i] = f32_to_f16(x[i]);
+    }
+}
+
+namespace
+{
+
+inline float to_f32(float value)
+{
+    return value;
+}
+
+inline float to_f32(uint16_t bits)
+{
+    return f16_to_f32(bits);
+}
+
+template <typename Value>
+void attention_head_scalar_impl(const float* q, const Value* k_tiles, const Value* v, size_t v_stride, size_t head_dim,
+                                size_t n_past, float scale, float* scores, float* out)
 {
     for (size_t p = 0; p < n_past; ++p)
     {
         float s = 0.0f;
         for (size_t d = 0; d < head_dim; ++d)
         {
-            s += q[d] * k_tiles[key_index(head_dim, p, d)];
+            s += q[d] * to_f32(k_tiles[key_index(head_dim, p, d)]);
         }
         scores[p] = s * scale;
     }
@@ -1062,12 +1084,26 @@ void attention_head_scalar(const float* q, const float* k_tiles, const float* v,
     for (size_t p = 0; p < n_past; ++p)
     {
         const float weight = scores[p];
-        const float* row = v + p * v_stride;
+        const Value* row = v + p * v_stride;
         for (size_t d = 0; d < head_dim; ++d)
         {
-            out[d] += weight * row[d];
+            out[d] += weight * to_f32(row[d]);
         }
     }
+}
+
+}
+
+void attention_head_scalar(const float* q, const float* k_tiles, const float* v, size_t v_stride, size_t head_dim,
+                           size_t n_past, float scale, float* scores, float* out)
+{
+    attention_head_scalar_impl(q, k_tiles, v, v_stride, head_dim, n_past, scale, scores, out);
+}
+
+void attention_head_f16_scalar(const float* q, const uint16_t* k_tiles, const uint16_t* v, size_t v_stride,
+                               size_t head_dim, size_t n_past, float scale, float* scores, float* out)
+{
+    attention_head_scalar_impl(q, k_tiles, v, v_stride, head_dim, n_past, scale, scores, out);
 }
 
 #if defined(FAISCA_AVX2)
@@ -1113,6 +1149,16 @@ inline __m256 exp_avx2(__m256 x)
     return _mm256_and_ps(_mm256_mul_ps(_mm256_mul_ps(p, scale_a), scale_b), keep);
 }
 
+inline __m256 load_8(const float* p)
+{
+    return _mm256_loadu_ps(p);
+}
+
+inline __m256 load_8(const uint16_t* p)
+{
+    return _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(p)));
+}
+
 #if defined(__AVX512F__)
 inline __m512 exp_avx512(__m512 x)
 {
@@ -1130,8 +1176,39 @@ inline __m512 exp_avx512(__m512 x)
     p = _mm512_fmadd_ps(p, r, _mm512_set1_ps(1.0f));
     return _mm512_scalef_ps(p, n);
 }
+
+inline __m512 load_16(const float* p)
+{
+    return _mm512_loadu_ps(p);
+}
+
+inline __m512 load_16(const uint16_t* p)
+{
+    return _mm512_cvtph_ps(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(p)));
+}
 #endif
 
+}
+
+void f32_to_f16_values(const float* x, size_t n, uint16_t* out)
+{
+    size_t i = 0;
+#if defined(__AVX512F__)
+    for (; i + 16 <= n; i += 16)
+    {
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(out + i),
+                            _mm512_cvtps_ph(_mm512_loadu_ps(x + i), _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
+    }
+#endif
+    for (; i + 8 <= n; i += 8)
+    {
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(out + i),
+                         _mm256_cvtps_ph(_mm256_loadu_ps(x + i), _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
+    }
+    for (; i < n; ++i)
+    {
+        out[i] = f32_to_f16(x[i]);
+    }
 }
 
 void exp_values(float* x, size_t n)
@@ -1162,12 +1239,16 @@ void exp_values(float* x, size_t n)
 
 #if defined(__AVX512F__)
 
-void attention_head(const float* q, const float* k_tiles, const float* v, size_t v_stride, size_t head_dim,
-                    size_t n_past, float scale, float* scores, float* out)
+namespace
+{
+
+template <typename Value>
+void attention_head_impl(const float* q, const Value* k_tiles, const Value* v, size_t v_stride, size_t head_dim,
+                         size_t n_past, float scale, float* scores, float* out)
 {
     if (head_dim % 16 != 0)
     {
-        attention_head_scalar(q, k_tiles, v, v_stride, head_dim, n_past, scale, scores, out);
+        attention_head_scalar_impl(q, k_tiles, v, v_stride, head_dim, n_past, scale, scores, out);
         return;
     }
 
@@ -1177,11 +1258,11 @@ void attention_head(const float* q, const float* k_tiles, const float* v, size_t
     for (size_t p = 0; p < n_past; p += 16)
     {
         const __mmask16 mask = static_cast<__mmask16>(p + 16 <= n_past ? 0xffffu : (1u << (n_past - p)) - 1u);
-        const float* tile = k_tiles + (p / KEY_TILE) * head_dim * KEY_TILE;
+        const Value* tile = k_tiles + (p / KEY_TILE) * head_dim * KEY_TILE;
         __m512 s = _mm512_setzero_ps();
         for (size_t d = 0; d < head_dim; ++d)
         {
-            s = _mm512_fmadd_ps(_mm512_set1_ps(q[d]), _mm512_loadu_ps(tile + d * KEY_TILE), s);
+            s = _mm512_fmadd_ps(_mm512_set1_ps(q[d]), load_16(tile + d * KEY_TILE), s);
         }
         s = _mm512_mul_ps(s, vscale);
         _mm512_storeu_ps(scores + p, s);
@@ -1206,10 +1287,10 @@ void attention_head(const float* q, const float* k_tiles, const float* v, size_t
         for (size_t p = 0; p < n_past; ++p)
         {
             const __m512 weight = _mm512_set1_ps(scores[p]);
-            const float* row = v + p * v_stride + d0;
+            const Value* row = v + p * v_stride + d0;
             for (size_t c = 0; c < width / 16; ++c)
             {
-                acc[c] = _mm512_fmadd_ps(weight, _mm512_loadu_ps(row + 16 * c), acc[c]);
+                acc[c] = _mm512_fmadd_ps(weight, load_16(row + 16 * c), acc[c]);
             }
         }
         for (size_t c = 0; c < width / 16; ++c)
@@ -1219,14 +1300,20 @@ void attention_head(const float* q, const float* k_tiles, const float* v, size_t
     }
 }
 
+}
+
 #else
 
-void attention_head(const float* q, const float* k_tiles, const float* v, size_t v_stride, size_t head_dim,
-                    size_t n_past, float scale, float* scores, float* out)
+namespace
+{
+
+template <typename Value>
+void attention_head_impl(const float* q, const Value* k_tiles, const Value* v, size_t v_stride, size_t head_dim,
+                         size_t n_past, float scale, float* scores, float* out)
 {
     if (head_dim % 8 != 0)
     {
-        attention_head_scalar(q, k_tiles, v, v_stride, head_dim, n_past, scale, scores, out);
+        attention_head_scalar_impl(q, k_tiles, v, v_stride, head_dim, n_past, scale, scores, out);
         return;
     }
 
@@ -1235,11 +1322,11 @@ void attention_head(const float* q, const float* k_tiles, const float* v, size_t
     const __m256 vscale = _mm256_set1_ps(scale);
     for (size_t p = 0; p < padded; p += 8)
     {
-        const float* tile = k_tiles + (p / KEY_TILE) * head_dim * KEY_TILE + (p % KEY_TILE);
+        const Value* tile = k_tiles + (p / KEY_TILE) * head_dim * KEY_TILE + (p % KEY_TILE);
         __m256 s = _mm256_setzero_ps();
         for (size_t d = 0; d < head_dim; ++d)
         {
-            s = _mm256_fmadd_ps(_mm256_set1_ps(q[d]), _mm256_loadu_ps(tile + d * KEY_TILE), s);
+            s = _mm256_fmadd_ps(_mm256_set1_ps(q[d]), load_8(tile + d * KEY_TILE), s);
         }
         _mm256_storeu_ps(scores + p, _mm256_mul_ps(s, vscale));
     }
@@ -1270,10 +1357,10 @@ void attention_head(const float* q, const float* k_tiles, const float* v, size_t
         for (size_t p = 0; p < n_past; ++p)
         {
             const __m256 weight = _mm256_set1_ps(scores[p]);
-            const float* row = v + p * v_stride + d0;
+            const Value* row = v + p * v_stride + d0;
             for (size_t c = 0; c < width / 8; ++c)
             {
-                acc[c] = _mm256_fmadd_ps(weight, _mm256_loadu_ps(row + 8 * c), acc[c]);
+                acc[c] = _mm256_fmadd_ps(weight, load_8(row + 8 * c), acc[c]);
             }
         }
         for (size_t c = 0; c < width / 8; ++c)
@@ -1283,9 +1370,28 @@ void attention_head(const float* q, const float* k_tiles, const float* v, size_t
     }
 }
 
+}
+
 #endif
 
+void attention_head(const float* q, const float* k_tiles, const float* v, size_t v_stride, size_t head_dim,
+                    size_t n_past, float scale, float* scores, float* out)
+{
+    attention_head_impl(q, k_tiles, v, v_stride, head_dim, n_past, scale, scores, out);
+}
+
+void attention_head_f16(const float* q, const uint16_t* k_tiles, const uint16_t* v, size_t v_stride, size_t head_dim,
+                        size_t n_past, float scale, float* scores, float* out)
+{
+    attention_head_impl(q, k_tiles, v, v_stride, head_dim, n_past, scale, scores, out);
+}
+
 #else
+
+void f32_to_f16_values(const float* x, size_t n, uint16_t* out)
+{
+    f32_to_f16_values_scalar(x, n, out);
+}
 
 void exp_values(float* x, size_t n)
 {
@@ -1296,6 +1402,12 @@ void attention_head(const float* q, const float* k_tiles, const float* v, size_t
                     size_t n_past, float scale, float* scores, float* out)
 {
     attention_head_scalar(q, k_tiles, v, v_stride, head_dim, n_past, scale, scores, out);
+}
+
+void attention_head_f16(const float* q, const uint16_t* k_tiles, const uint16_t* v, size_t v_stride, size_t head_dim,
+                        size_t n_past, float scale, float* scores, float* out)
+{
+    attention_head_f16_scalar(q, k_tiles, v, v_stride, head_dim, n_past, scale, scores, out);
 }
 
 #endif

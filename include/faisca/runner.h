@@ -18,6 +18,8 @@ typedef void (*RunnerTrace)(void* user, const char* name, int layer, const float
 // batches: every weight is read once per batch, so a prompt costs far less than
 // one token at a time. Every matrix row group and every attention head is
 // computed whole by one thread, so results do not depend on the thread count.
+// The cache holds keys and values as f16 unless kv_f16 is false; q and the
+// softmax weights stay float32 either way.
 class Runner
 {
 public:
@@ -28,7 +30,7 @@ public:
     Runner(const Runner&) = delete;
     Runner& operator=(const Runner&) = delete;
 
-    bool init(const LlamaModel& model, uint32_t n_ctx, int n_threads, Error& error);
+    bool init(const LlamaModel& model, uint32_t n_ctx, int n_threads, Error& error, bool kv_f16 = true);
 
     void release();
 
@@ -50,6 +52,16 @@ public:
     int threads() const
     {
         return m_pool.size();
+    }
+
+    bool kv_f16() const
+    {
+        return m_kv_f16;
+    }
+
+    size_t cache_bytes() const
+    {
+        return m_cache_bytes;
     }
 
     const LlamaModel* model() const
@@ -74,7 +86,7 @@ private:
     typedef void (Runner::*TokenStep)(const LlamaLayer* layer, uint32_t pos, size_t token);
     void for_tokens(TokenStep step, const LlamaLayer* layer, uint32_t pos, size_t n_tokens);
     void step_attn_norm(const LlamaLayer* layer, uint32_t pos, size_t token);
-    void step_rope_scatter(const LlamaLayer* layer, uint32_t pos, size_t token);
+    void step_rope_store(const LlamaLayer* layer, uint32_t pos, size_t token);
     void step_ffn_inp(const LlamaLayer* layer, uint32_t pos, size_t token);
     void step_swiglu(const LlamaLayer* layer, uint32_t pos, size_t token);
     void step_residual(const LlamaLayer* layer, uint32_t pos, size_t token);
@@ -101,12 +113,17 @@ private:
     ThreadPool m_pool;
     uint32_t m_n_ctx = 0;
     uint32_t m_pos = 0;
+    bool m_kv_f16 = true;
+    size_t m_cache_bytes = 0;
     RunnerTrace m_trace = nullptr;
     void* m_trace_user = nullptr;
 
     Array<float> m_k; // [layer][kv head][position tile][head dim][16], see key_index in ops.h
     Array<float> m_v; // [layer][position][kv value]
-    Array<float> m_k_batch; // [token][kv value], the keys of the batch before they go into the cache
+    Array<uint16_t> m_k16; // the same two as f16, used instead when kv_f16 is set
+    Array<uint16_t> m_v16;
+    Array<float> m_k_batch; // [token][kv value], the keys and values of the batch before they go into the cache
+    Array<float> m_v_batch;
 
     Array<float> m_x; // [token][n_embd]
     Array<float> m_h;

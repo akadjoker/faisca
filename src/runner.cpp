@@ -45,7 +45,10 @@ void Runner::release()
     m_pos = 0;
     m_k.release();
     m_v.release();
+    m_k16.release();
+    m_v16.release();
     m_k_batch.release();
+    m_v_batch.release();
     m_x.release();
     m_h.release();
     m_q.release();
@@ -59,9 +62,10 @@ void Runner::release()
     m_sums.release();
     m_xq_stride = 0;
     m_sums_stride = 0;
+    m_cache_bytes = 0;
 }
 
-bool Runner::init(const LlamaModel& model, uint32_t n_ctx, int n_threads, Error& error)
+bool Runner::init(const LlamaModel& model, uint32_t n_ctx, int n_threads, Error& error, bool kv_f16)
 {
     release();
     if (!model.is_loaded())
@@ -95,8 +99,12 @@ bool Runner::init(const LlamaModel& model, uint32_t n_ctx, int n_threads, Error&
     const size_t threads = static_cast<size_t>(m_pool.size());
     const size_t scores = (static_cast<size_t>(n_ctx) + 15) / 16 * 16;
     const size_t k_cache = static_cast<size_t>(h.n_layer) * h.n_head_kv * (scores * h.head_dim);
-    if (!m_k.resize_uninitialized(k_cache) || !m_v.resize_uninitialized(cache) ||
-        !m_k_batch.resize_uninitialized(BATCH * n_kv) || !m_x.resize_uninitialized(BATCH * h.n_embd) ||
+    const size_t element = kv_f16 ? sizeof(uint16_t) : sizeof(float);
+    m_cache_bytes = (k_cache + cache) * element;
+    const bool cache_ok = kv_f16 ? m_k16.resize_uninitialized(k_cache) && m_v16.resize_uninitialized(cache) &&
+                                       m_v_batch.resize_uninitialized(BATCH * n_kv)
+                                 : m_k.resize_uninitialized(k_cache) && m_v.resize_uninitialized(cache);
+    if (!cache_ok || !m_k_batch.resize_uninitialized(BATCH * n_kv) || !m_x.resize_uninitialized(BATCH * h.n_embd) ||
         !m_h.resize_uninitialized(BATCH * h.n_embd) || !m_q.resize_uninitialized(BATCH * n_q) ||
         !m_attn.resize_uninitialized(BATCH * n_q) || !m_gate.resize_uninitialized(BATCH * h.n_ff) ||
         !m_up.resize_uninitialized(BATCH * h.n_ff) || !m_act.resize_uninitialized(BATCH * h.n_ff) ||
@@ -105,16 +113,25 @@ bool Runner::init(const LlamaModel& model, uint32_t n_ctx, int n_threads, Error&
     {
         release();
         error.set("out of memory: the KV cache for %" PRIu32 " positions needs %zu MiB", n_ctx,
-                  2 * cache * sizeof(float) >> 20);
+                  (k_cache + cache) * element >> 20);
         return false;
     }
     // the score kernel reads whole tiles of 16 positions, so unused positions must hold numbers
-    std::memset(m_k.data(), 0, k_cache * sizeof(float));
-    std::memset(m_v.data(), 0, cache * sizeof(float));
+    if (kv_f16)
+    {
+        std::memset(m_k16.data(), 0, k_cache * sizeof(uint16_t));
+        std::memset(m_v16.data(), 0, cache * sizeof(uint16_t));
+    }
+    else
+    {
+        std::memset(m_k.data(), 0, k_cache * sizeof(float));
+        std::memset(m_v.data(), 0, cache * sizeof(float));
+    }
 
     m_model = &model;
     m_n_ctx = n_ctx;
     m_pos = 0;
+    m_kv_f16 = kv_f16;
     return true;
 }
 
@@ -305,14 +322,23 @@ void Runner::attention_unit(int il, uint32_t pos, size_t token, size_t head, flo
     const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
 
     const size_t tiles = (static_cast<size_t>(m_n_ctx) + 15) / 16;
-    const float* k_tiles = m_k.data() + (static_cast<size_t>(il) * h.n_head_kv + kv_head) * tiles * head_dim * KEY_TILE;
-    const float* v = m_v.data() + static_cast<size_t>(il) * m_n_ctx * n_kv + kv_head * head_dim;
+    const size_t k_offset = (static_cast<size_t>(il) * h.n_head_kv + kv_head) * tiles * head_dim * KEY_TILE;
+    const size_t v_offset = static_cast<size_t>(il) * m_n_ctx * n_kv + kv_head * head_dim;
     const float* q = m_q.data() + token * n_q + head * head_dim;
     float* out = m_attn.data() + token * n_q + head * head_dim;
-    attention_head(q, k_tiles, v, n_kv, head_dim, static_cast<size_t>(pos) + token + 1, scale, scores, out);
+    const size_t n_past = static_cast<size_t>(pos) + token + 1;
+    if (m_kv_f16)
+    {
+        attention_head_f16(q, m_k16.data() + k_offset, m_v16.data() + v_offset, n_kv, head_dim, n_past, scale, scores,
+                           out);
+    }
+    else
+    {
+        attention_head(q, m_k.data() + k_offset, m_v.data() + v_offset, n_kv, head_dim, n_past, scale, scores, out);
+    }
 }
 
-void Runner::step_rope_scatter(const LlamaLayer*, uint32_t pos, size_t token)
+void Runner::step_rope_store(const LlamaLayer*, uint32_t pos, size_t token)
 {
     const LlamaHparams& h = m_model->hparams();
     const size_t head_dim = h.head_dim;
@@ -324,13 +350,22 @@ void Runner::step_rope_scatter(const LlamaLayer*, uint32_t pos, size_t token)
     rope_norm(k_cur, h.n_head_kv, head_dim, h.n_rot, p, h.rope_freq_base);
 
     const size_t tiles = (static_cast<size_t>(m_n_ctx) + 15) / 16;
-    for (size_t kv_head = 0; kv_head < h.n_head_kv; ++kv_head)
+    const size_t layer_offset = static_cast<size_t>(m_layer) * h.n_head_kv * tiles * head_dim * KEY_TILE;
+    if (m_kv_f16)
     {
-        float* k_tiles = m_k.data() + (static_cast<size_t>(m_layer) * h.n_head_kv + kv_head) * tiles * head_dim * KEY_TILE;
-        for (size_t d = 0; d < head_dim; ++d)
+        uint16_t* k_half = m_k16.data() + layer_offset;
+        for (size_t i = 0; i < n_kv; ++i)
         {
-            k_tiles[key_index(head_dim, p, d)] = k_cur[kv_head * head_dim + d];
+            k_half[(i / head_dim) * tiles * head_dim * KEY_TILE + key_index(head_dim, p, i % head_dim)] = f32_to_f16(k_cur[i]);
         }
+        f32_to_f16_values(m_v_batch.data() + token * n_kv, n_kv,
+                          m_v16.data() + (static_cast<size_t>(m_layer) * m_n_ctx + p) * n_kv);
+        return;
+    }
+    float* k_tiles = m_k.data() + layer_offset;
+    for (size_t i = 0; i < n_kv; ++i)
+    {
+        k_tiles[(i / head_dim) * tiles * head_dim * KEY_TILE + key_index(head_dim, p, i % head_dim)] = k_cur[i];
     }
 }
 
@@ -341,14 +376,14 @@ void Runner::attention(const LlamaLayer& layer, int il, uint32_t pos, size_t n_t
     const size_t n_kv = static_cast<size_t>(h.n_head_kv) * head_dim;
     const size_t n_q = static_cast<size_t>(h.n_head) * head_dim;
     float* k_cur = m_k_batch.data();
-    float* v_cur = m_v.data() + (static_cast<size_t>(il) * m_n_ctx + pos) * n_kv;
+    float* v_cur = m_kv_f16 ? m_v_batch.data() : m_v.data() + (static_cast<size_t>(il) * m_n_ctx + pos) * n_kv;
 
     matmul(layer.wq, m_h.data(), h.n_embd, n_tokens, m_q.data(), n_q);
     matmul(layer.wk, m_h.data(), h.n_embd, n_tokens, k_cur, n_kv);
     matmul(layer.wv, m_h.data(), h.n_embd, n_tokens, v_cur, n_kv);
 
     m_layer = static_cast<size_t>(il);
-    for_tokens(&Runner::step_rope_scatter, &layer, pos, n_tokens);
+    for_tokens(&Runner::step_rope_store, &layer, pos, n_tokens);
     trace_rows("Qcur", il, m_q.data(), n_q, n_tokens, n_q);
     trace_rows("Kcur", il, k_cur, n_kv, n_tokens, n_kv);
     trace_rows("Vcur", il, v_cur, n_kv, n_tokens, n_kv);

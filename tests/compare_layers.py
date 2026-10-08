@@ -3,6 +3,7 @@
 
     python3 tests/compare_layers.py <runner_dump> <llama_layer_dump> <model.gguf>
                                     --tokens 1 2 3 ... [--generate N] [--rel 1e-4] [--abs 1e-3]
+                                    [--dequantize] [--ours-flags=--kv-f32] [--reference-flags=--kv-f16]
 
 Both tools run the same prompt and write every intermediate tensor. For each
 tensor this prints the largest absolute difference (relative to the largest
@@ -65,12 +66,14 @@ def main() -> int:
     parser.add_argument("--abs", type=float, default=1e-4, help="largest difference, relative to the tensor's largest magnitude")
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--dequantize", action="store_true", help="faisca converts every weight to float32 at load")
+    parser.add_argument("--ours-flags", default="", help="more options for the faisca tool, written as --ours-flags=--kv-f32")
+    parser.add_argument("--reference-flags", default="", help="options for the llama.cpp tool, written as --reference-flags=--kv-f16")
     args = parser.parse_args()
 
     with tempfile.NamedTemporaryFile(suffix=".bin") as ours_file, tempfile.NamedTemporaryFile(suffix=".bin") as ref_file:
         ours_generated = run(args.ours, args.model, ours_file.name, args.generate, args.tokens,
-                             ["--dequantize"] if args.dequantize else [])
-        ref_generated = run(args.reference, args.model, ref_file.name, args.generate, args.tokens, [])
+                             (["--dequantize"] if args.dequantize else []) + args.ours_flags.split())
+        ref_generated = run(args.reference, args.model, ref_file.name, args.generate, args.tokens, args.reference_flags.split())
         ours = read_dump(ours_file.name)
         reference = read_dump(ref_file.name)
 

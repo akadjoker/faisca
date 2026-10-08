@@ -11,7 +11,7 @@
 #include <string>
 #include <vector>
 
-// usage: llama_layer_dump <model.gguf> <out.bin> <generate N> <token ids...>
+// usage: llama_layer_dump [--kv-f16] <model.gguf> <out.bin> <generate N> <token ids...>
 //
 // Runs the prompt with the KV cache in float32, without flash attention and
 // with one thread, writes the named intermediate tensors to out.bin, then
@@ -115,9 +115,24 @@ void quiet(ggml_log_level level, const char* text, void*)
 
 int main(int argc, char** argv)
 {
+    bool kv_f16 = false;
+    while (argc > 1 && argv[1][0] == '-')
+    {
+        if (std::strcmp(argv[1], "--kv-f16") == 0)
+        {
+            kv_f16 = true;
+        }
+        else
+        {
+            std::fprintf(stderr, "llama_layer_dump: unknown option '%s'\n", argv[1]);
+            return 2;
+        }
+        ++argv;
+        --argc;
+    }
     if (argc < 5)
     {
-        std::fprintf(stderr, "usage: llama_layer_dump <model.gguf> <out.bin> <generate N> <token ids...>\n");
+        std::fprintf(stderr, "usage: llama_layer_dump [--kv-f16] <model.gguf> <out.bin> <generate N> <token ids...>\n");
         return 2;
     }
 
@@ -155,8 +170,8 @@ int main(int argc, char** argv)
     ctx_params.n_ubatch = static_cast<uint32_t>(prompt.size());
     ctx_params.n_threads = 1;
     ctx_params.n_threads_batch = 1;
-    ctx_params.type_k = GGML_TYPE_F32;
-    ctx_params.type_v = GGML_TYPE_F32;
+    ctx_params.type_k = kv_f16 ? GGML_TYPE_F16 : GGML_TYPE_F32;
+    ctx_params.type_v = kv_f16 ? GGML_TYPE_F16 : GGML_TYPE_F32;
     ctx_params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
     ctx_params.cb_eval = eval_callback;
     ctx_params.cb_eval_user_data = &capture;

@@ -25,7 +25,7 @@ void print_usage()
         "\n"
         "usage:\n"
         "  faisca info <model.gguf> [--meta] [--tensors]\n"
-        "  faisca generate <model.gguf> -p <prompt> [-n <tokens>] [-c <context>] [-t <threads>] [--raw] [--f32]\n"
+        "  faisca generate <model.gguf> -p <prompt> [-n <tokens>] [-c <context>] [-t <threads>] [--raw] [--f32] [--kv-f32]\n"
         "  faisca version\n"
         "\n"
         "info options:\n"
@@ -38,7 +38,8 @@ void print_usage()
         "  -c <size>   context size in tokens (default 2048)\n"
         "  -t <count>  threads (default 1)\n"
         "  --raw       feed the prompt as is\n"
-        "  --f32       convert the weights to float32 at load instead of computing on Q8_0\n",
+        "  --f32       convert the weights to float32 at load instead of computing on Q8_0\n"
+        "  --kv-f32    keep the KV cache in float32 instead of f16\n",
         FAISCA_VERSION);
 }
 
@@ -441,6 +442,7 @@ int command_generate(int argc, char** argv)
     long context = 2048;
     bool raw = false;
     bool dequantize = false;
+    bool kv_f16 = true;
     int threads = 1;
 
     for (int i = 2; i < argc; ++i)
@@ -468,6 +470,10 @@ int command_generate(int argc, char** argv)
         else if (std::strcmp(argv[i], "--f32") == 0)
         {
             dequantize = true;
+        }
+        else if (std::strcmp(argv[i], "--kv-f32") == 0)
+        {
+            kv_f16 = false;
         }
         else if (argv[i][0] == '-' && argv[i][1] != '\0')
         {
@@ -504,7 +510,7 @@ int command_generate(int argc, char** argv)
 
     const auto load_start = std::chrono::steady_clock::now();
     if (!file.open(path, error) || !tokenizer.load(file, error) || !model.load(file, error, dequantize) ||
-        !runner.init(model, static_cast<uint32_t>(context), threads, error))
+        !runner.init(model, static_cast<uint32_t>(context), threads, error, kv_f16))
     {
         std::fprintf(stderr, "faisca: %s\n", error.c_str());
         return 1;

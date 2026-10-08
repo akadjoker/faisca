@@ -10,7 +10,7 @@
 #include <string>
 #include <vector>
 
-// usage: runner_dump [--dequantize] [--threads N] <model.gguf> <out.bin> <generate N> <token ids...>
+// usage: runner_dump [--dequantize] [--kv-f32] [--threads N] <model.gguf> <out.bin> <generate N> <token ids...>
 //
 // Same output as tests/reference/llama_layer_dump.cpp: every traced vector of
 // every prompt token, assembled per name into [values, tokens], then N greedy
@@ -54,12 +54,17 @@ void trace(void* user, const char* name, int layer, const float* data, size_t co
 int main(int argc, char** argv)
 {
     bool dequantize = false;
+    bool kv_f16 = true;
     int threads = 1;
     while (argc > 1 && argv[1][0] == '-')
     {
         if (std::strcmp(argv[1], "--dequantize") == 0)
         {
             dequantize = true;
+        }
+        else if (std::strcmp(argv[1], "--kv-f32") == 0)
+        {
+            kv_f16 = false;
         }
         else if (std::strcmp(argv[1], "--threads") == 0 && argc > 2)
         {
@@ -77,7 +82,7 @@ int main(int argc, char** argv)
     }
     if (argc < 5)
     {
-        std::fprintf(stderr, "usage: runner_dump [--dequantize] [--threads N] <model.gguf> <out.bin> <generate N> <token ids...>\n");
+        std::fprintf(stderr, "usage: runner_dump [--dequantize] [--kv-f32] [--threads N] <model.gguf> <out.bin> <generate N> <token ids...>\n");
         return 2;
     }
 
@@ -93,7 +98,7 @@ int main(int argc, char** argv)
     faisca::LlamaModel model;
     faisca::Runner runner;
     const uint32_t n_ctx = static_cast<uint32_t>(prompt.size() + static_cast<size_t>(generate) + 1);
-    if (!file.open(argv[1], error) || !model.load(file, error, dequantize) || !runner.init(model, n_ctx, threads, error))
+    if (!file.open(argv[1], error) || !model.load(file, error, dequantize) || !runner.init(model, n_ctx, threads, error, kv_f16))
     {
         std::fprintf(stderr, "runner_dump: %s\n", error.c_str());
         return 1;

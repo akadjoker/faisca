@@ -11,6 +11,10 @@ float f16_to_f32(uint16_t bits);
 // round to nearest even, as ggml and F16C do
 uint16_t f32_to_f16(float value);
 
+// n values at once, every result identical to f32_to_f16; the scalar one is the reference
+void f32_to_f16_values(const float* x, size_t n, uint16_t* out);
+void f32_to_f16_values_scalar(const float* x, size_t n, uint16_t* out);
+
 constexpr size_t Q8_0_BLOCK = 32;
 constexpr size_t Q8_0_BLOCK_BYTES = 34; // f16 scale, 32 int8
 
@@ -114,6 +118,13 @@ void attention_head(const float* q, const float* k_tiles, const float* v, size_t
                     size_t n_past, float scale, float* scores, float* out);
 void attention_head_scalar(const float* q, const float* k_tiles, const float* v, size_t v_stride, size_t head_dim,
                            size_t n_past, float scale, float* scores, float* out);
+
+// the same over keys and values stored as f16, computed in float32: the result is
+// bit identical to attention_head over the float32 values those halves hold
+void attention_head_f16(const float* q, const uint16_t* k_tiles, const uint16_t* v, size_t v_stride, size_t head_dim,
+                        size_t n_past, float scale, float* scores, float* out);
+void attention_head_f16_scalar(const float* q, const uint16_t* k_tiles, const uint16_t* v, size_t v_stride,
+                               size_t head_dim, size_t n_past, float scale, float* scores, float* out);
 
 // out = silu(gate) * up
 void swiglu(const float* gate, const float* up, size_t n, float* out);

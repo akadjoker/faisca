@@ -696,6 +696,76 @@ void test_exp_and_attention()
     }
 }
 
+void test_f16_cache()
+{
+    std::mt19937 rng(41);
+    std::vector<float> x = random_values(rng, 1000, 3.0f);
+    x[3] = 1.0f + 1.0f / 2048.0f;
+    x[4] = 1.0f + 3.0f / 2048.0f;
+    x[5] = 2.98023224e-08f * 1.5f;
+    x[6] = -65520.0f;
+    x[7] = 1e-6f;
+    x[8] = 0.0f;
+    x[9] = -0.0f;
+    for (const size_t n : {1, 7, 8, 9, 16, 23, 24, 31, 32, 40, 1000})
+    {
+        std::vector<uint16_t> fast(n, 0xaaaa), reference(n, 0x5555);
+        f32_to_f16_values(x.data(), n, fast.data());
+        f32_to_f16_values_scalar(x.data(), n, reference.data());
+        bool same = true;
+        for (size_t i = 0; i < n; ++i)
+        {
+            same = same && fast[i] == reference[i] && reference[i] == f32_to_f16(x[i]);
+        }
+        CHECK(same);
+    }
+
+    const size_t n_ctx = 80;
+    const size_t head_dim = 64;
+    const size_t n_kv = 320;
+    std::vector<float> k_t = random_values(rng, head_dim * n_ctx, 1.0f);
+    std::vector<float> v = random_values(rng, n_ctx * n_kv, 1.0f);
+    std::vector<float> q = random_values(rng, head_dim, 3.0f);
+    std::vector<uint16_t> k_half(k_t.size()), v_half(v.size());
+    f32_to_f16_values(k_t.data(), k_t.size(), k_half.data());
+    f32_to_f16_values(v.data(), v.size(), v_half.data());
+    // the float32 kernels fed with the values the halves hold
+    std::vector<float> k_round(k_t.size()), v_round(v.size());
+    for (size_t i = 0; i < k_t.size(); ++i)
+    {
+        k_round[i] = f16_to_f32(k_half[i]);
+    }
+    for (size_t i = 0; i < v.size(); ++i)
+    {
+        v_round[i] = f16_to_f32(v_half[i]);
+    }
+    for (const size_t n_past : {1, 2, 15, 16, 17, 33, 64, 79})
+    {
+        std::vector<float> scores(n_ctx + 16), out_half(head_dim), out_round(head_dim), out_scalar(head_dim),
+            out_scalar_round(head_dim);
+        attention_head_f16(q.data(), k_half.data(), v_half.data() + 64, n_kv, head_dim, n_past, 0.125f, scores.data(),
+                           out_half.data());
+        attention_head(q.data(), k_round.data(), v_round.data() + 64, n_kv, head_dim, n_past, 0.125f, scores.data(),
+                       out_round.data());
+        attention_head_f16_scalar(q.data(), k_half.data(), v_half.data() + 64, n_kv, head_dim, n_past, 0.125f,
+                                  scores.data(), out_scalar.data());
+        attention_head_scalar(q.data(), k_round.data(), v_round.data() + 64, n_kv, head_dim, n_past, 0.125f,
+                              scores.data(), out_scalar_round.data());
+        bool same_fast = true;
+        bool same_scalar = true;
+        bool all_close = true;
+        for (size_t d = 0; d < head_dim; ++d)
+        {
+            same_fast = same_fast && bits_of(out_half[d]) == bits_of(out_round[d]);
+            same_scalar = same_scalar && bits_of(out_scalar[d]) == bits_of(out_scalar_round[d]);
+            all_close = all_close && close(out_half[d], out_scalar[d], 1e-5);
+        }
+        CHECK(same_fast);
+        CHECK(same_scalar);
+        CHECK(all_close);
+    }
+}
+
 void test_swiglu_and_add()
 {
     const float gate[4] = {0.0f, 1.0f, -1.0f, 20.0f};
@@ -727,6 +797,7 @@ int main()
     test_rope();
     test_softmax();
     test_exp_and_attention();
+    test_f16_cache();
     test_swiglu_and_add();
 
     std::printf("%s ops_unit: %d checks, %d failed\n", g_failures == 0 ? "ok  " : "FAIL", g_checks, g_failures);

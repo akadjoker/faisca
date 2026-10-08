@@ -28,8 +28,8 @@ top. No third party dependencies. Owner: Luís (akadjoker). "faisca" is a workin
 3. CPU runner in float32: done, validated layer by layer against llama.cpp,
    see below.
 4. CPU optimization: in progress. Done: Q8_0 and Q4_0 packed VNNI kernels,
-   thread pool, batched prompt, tiled attention. Pending: K-quants (Q4_K,
-   Q6_K, Q5_0 for Q4_K_M files), KV cache in f16, AMX for the prompt, a
+   thread pool, batched prompt, tiled attention, KV cache in f16. Pending:
+   K-quants (Q4_K, Q6_K, Q5_0 for Q4_K_M files), AMX for the prompt, a
    faster Q4_0 unpack. Then speculative decoding with SmolLM2-135M as draft;
    then Vulkan; then the cache format.
 5. Vulkan compute backend (the owner chose Vulkan over CUDA and OpenGL).
@@ -78,21 +78,32 @@ Kernels: AVX-512 VNNI, AVX-VNNI, scalar reference; without VNNI, Q8_0 stays in
 the file layout with an AVX2 kernel and Q4_0 is converted to float32. Prompt
 in batches of 32 (Runner::BATCH), weights read once per batch. Attention over
 keys stored in tiles of 16 positions (key_index), own vectorized exp (1 ulp of
-expf). Thread pool over pthreads/Win32; every row group, head and token step
+expf). KV cache in f16 by default (`Runner::init(..., kv_f16)`, `--kv-f32` in
+the CLI and runner_dump): halves converted with F16C on read, arithmetic in
+float32, q and softmax weights never rounded; the kernels are templates
+shared with the float32 cache, so attention_head_f16 is bit identical to
+attention_head on the rounded values (ops_unit checks it). Thread pool over pthreads/Win32; every row group, head and token step
 whole on one thread, so output is bit identical for 1, 2 or 4 threads (cmp of
 runner_dump files is the test). -ffp-contract=off keeps Debug and Release
 identical. No rope scaling, no biases, no MoE yet: rejected with an error.
 
 - Validation: float32 path against llama.cpp with compare_layers.py: 386
   tensors, worst rel L2 4.5e-6 (16 tokens) and 3.9e-6 (1045 tokens), greedy
-  tokens identical. Quantized kernels with matmul_check against llama.cpp's
+  tokens identical (both caches float32, `--ours-flags=--kv-f32`). f16 cache
+  against the same float32 reference: 1.9e-3 and 2.49e-3, tokens identical;
+  llama.cpp's own f16 cache (`--reference-flags=--kv-f16`) is at 2.2e-3 and
+  2.50e-3, so ours is never further than theirs. On Q8_0 the 8th greedy token
+  of the chat prompt is a near tie (gap 0.03 to 0.04 logits between 7042 and
+  EOS) that flips with any change of rounding, on both runners. Quantized kernels with matmul_check against llama.cpp's
   own inputs: 193 matrices, zero error, Q8_0 and Q4_0. Full quantized pass:
   inherent noise, both runners 4.4e-2 from float32 logits, same argmax at
   every position, 16 greedy tokens identical. ASan, UBSan, TSan clean with 4
   threads.
 - Speed, SmolLM2-360M, 2.1 GHz Sapphire Rapids VM, 1 / 4 threads. Generation:
   Q8_0 24.6 / 83 tok/s (llama.cpp 24.9 / 71), Q4_0 31 / 66 (llama.cpp 38.8 /
-  70). Prompt of 633 tokens: Q8_0 142 / 443 tok/s, Q4_0 165 / 480 (llama.cpp
+  70). At a context of 1045 positions, Q8_0: f16 cache 21.5 / 65 tok/s
+  against 20.4 / 56 with the float32 cache, prompt 132 / 417 against 122 /
+  393, cache 80 MiB instead of 160 for 2048 positions. Prompt of 633 tokens: Q8_0 142 / 443 tok/s, Q4_0 165 / 480 (llama.cpp
   pp512 255 / 143 with AMX; its pp128 with 4 threads was 893). float32 path:
   about 5 tok/s on one thread.
 - What explained the speed (the investigation is in the commit messages): the

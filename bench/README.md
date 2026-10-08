@@ -174,6 +174,27 @@ SmolLM2-360M-Instruct.
 | Q4_0 prompt (tok/s) | 1 | 249 | 165 |
 | Q4_0 prompt (tok/s) | 4 | 147 | 480 |
 
+KV cache in f16 against float32, Q8_0 weights, context of 2048 positions,
+prompt of 1045 tokens then 64 greedy tokens (best of 3, `tests/runner_dump`
+style harness over `Runner` with `kv_f16` on and off):
+
+| | threads | KV float32 | KV f16 |
+| --- | --- | --- | --- |
+| cache for 2048 positions (MiB) | | 160 | 80 |
+| prompt (tok/s) | 1 | 122 | 132 |
+| prompt (tok/s) | 4 | 393 | 417 |
+| generation at 1045 to 1109 positions (tok/s) | 1 | 20.4 | 21.5 |
+| generation at 1045 to 1109 positions (tok/s) | 4 | 56 | 65 |
+
+The f16 halves are converted with F16C as they are read; q and the softmax
+weights stay float32, so the kernel's arithmetic is the float32 kernel's and
+its output is bit identical to that kernel fed with the rounded values. The
+cost of the rounding, measured as the relative L2 distance from the float32
+cache run of llama.cpp on the float32 model: faisca f16 1.9e-3 (16 tokens)
+and 2.49e-3 (1045 tokens); llama.cpp's own f16 cache, which also rounds q
+and the softmax weights, 2.2e-3 and 2.50e-3. Greedy tokens identical in
+every case.
+
 How the generation speed got there, one thread, Q8_0: float32 weights 4.7
 tok/s; Q8_0 rows with an AVX2 kernel 7.8; block scales converted with F16C
 13.4; packed groups of 16 rows with VNNI 24.6. The kernels are checked

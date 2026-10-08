@@ -18,7 +18,7 @@ or exceptions. It has its own containers (`faisca::Array`, `faisca::StringMap`,
 | GGUF loader (memory mapped, zero-copy) | done |
 | Tokenizer (byte level BPE, validated against llama.cpp) | done |
 | CPU runner, float32, validated layer by layer against llama.cpp | done |
-| CPU optimization: threads, VNNI kernels for Q8_0 and Q4_0, batched prompt | done, K-quants and f16 KV cache pending |
+| CPU optimization: threads, VNNI kernels for Q8_0 and Q4_0, batched prompt, f16 KV cache | done, K-quants pending |
 | Vulkan compute backend | planned |
 | Own cache format and KV cache on disk | planned |
 
@@ -49,8 +49,9 @@ faisca generate model.gguf -p "What is the capital of France?" -n 64 -t 4
 `generate` wraps the prompt in the SmolLM2 chat template (`--raw` to skip
 that), decodes greedily and prints the tokens as they come, then the timings.
 `-t` sets the threads, `--f32` converts the weights to float32 at load (the
-validation path). SmolLM2-360M on a 2.1 GHz Xeon, 4 threads: 83 tokens per
-second from Q8_0, 66 from Q4_0, prompts at 440 to 480 tokens per second.
+validation path), `--kv-f32` keeps the KV cache in float32 instead of f16.
+SmolLM2-360M on a 2.1 GHz Xeon, 4 threads: 83 tokens per second from Q8_0, 66
+from Q4_0, prompts at 440 to 480 tokens per second.
 
 ## Library
 
@@ -126,8 +127,11 @@ pages where the system allows), the layout the VNNI kernels want: one
 does on x86. Builds without VNNI keep Q8_0 in place with an AVX2 kernel and
 convert Q4_0 to float32.
 
-`Runner` holds the KV cache (`n_ctx` positions, float32, keys in tiles of 16
-positions) and a thread pool. Every matrix row group, attention head and
+`Runner` holds the KV cache (`n_ctx` positions, keys and values in f16 unless
+`init` is told otherwise, keys in tiles of 16 positions) and a thread pool.
+The f16 halves are converted with F16C as they are read and the arithmetic
+stays float32; q and the softmax weights are never rounded, unlike llama.cpp
+which rounds both to f16 for its f16 cache. Every matrix row group, attention head and
 token step is computed whole by one thread, so the output is bit identical
 for any thread count. The prompt is processed in batches; generation reuses
 the same kernels one token at a time.
@@ -208,6 +212,13 @@ python3 tests/compare_with_gguf_py.py build/gguf_dump model.gguf
   | --- | --- | --- | --- |
   | chat prompt, 16 tokens | 386 | 4.5e-6 (`l_out-31`) | 16, identical |
   | chat prompt, 1045 tokens | 386 | 3.9e-6 (`ffn_out-13`) | 8, identical |
+
+  Those rows keep both caches in float32 (`--ours-flags=--kv-f32`). With the
+  default f16 cache on the faisca side and the same float32 reference, the
+  error is the rounding of the keys and values: 1.9e-3 (16 tokens) and
+  2.49e-3 (1045 tokens), tokens still identical. llama.cpp with its own f16
+  cache (`--reference-flags=--kv-f16`) sits at 2.2e-3 and 2.50e-3 from its
+  float32 run.
 
   The Q8_0 model converted to float32 by faisca gives bit identical tensors
   and tokens to the float32 copy, so the dequantization matches gguf-py.
