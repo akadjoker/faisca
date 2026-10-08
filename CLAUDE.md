@@ -32,8 +32,12 @@ top. No third party dependencies. Owner: Luís (akadjoker). "faisca" is a workin
    attention, KV cache in f16, software prefetch in the generation kernels.
    AMX for the prompt was measured (scratch bench_amx) and set aside: the
    per block float epilogue bounds it at 1.25x over VNNI on the GEMM, about
-   10% of the prompt (bench/README.md). Pending: AVX-VNNI (256-bit) kernels
-   for Q5_0 and the K-quants (those types convert to float32 on such builds).
+   10% of the prompt (bench/README.md). AVX-VNNI (256-bit) kernels for
+   Q5_0, Q4_K and Q6_K: done, the AVX-VNNI build is bit identical to the
+   AVX-512 one on every model (the softmax denominator of the attention is
+   16 partial sums reduced by one fixed tree in both; before, the two
+   builds differed by ulps there, invisible under f16 scales and visible
+   under the float32 scale of Q8_K).
    Speculative decoding with SmolLM2-135M as draft: done (`Speculative`,
    `--draft`), output identical to plain greedy, gain 1.3 to 1.4x on one
    thread with a Q4_0 draft and about 1.1x with four, 0.9x at a 512 token
@@ -146,9 +150,12 @@ int32 (Q6_K subtracts 32 x sum16 first), then fmadd(sumi, d*dx) and, for
 Q4_K, fnmadd(summ, dmin*dx), the structure of llama.cpp's AMX tile and VNNI
 kernels, so matmul_check gives zero error; the scalar kernels use std::fma
 and are bit identical to the AVX-512 ones (ops_unit checks it). Kernels:
-AVX-512 VNNI, AVX-VNNI (Q8_0 and Q4_0 only), scalar reference; without the
-kernel for a type the loader converts it to float32 (Q8_0 without VNNI stays
-in the file layout with an AVX2 kernel). Prompt
+AVX-512 VNNI, AVX-VNNI (256-bit, all five types, runner output bit
+identical to the AVX-512 build: ops_unit on build-avxvnni, runner_dump cmp
+on Q8_0 / Q4_0 / Q4_K_M / 1.7B, matmul_check zero error on the K-quants),
+scalar reference; without the kernel for a type the loader converts it to
+float32 (Q8_0 without VNNI stays in the file layout with an AVX2 kernel).
+Prompt
 in batches of 32 (Runner::BATCH), weights read once per batch. Attention over
 keys stored in tiles of 16 positions (key_index), own vectorized exp (1 ulp of
 expf). KV cache in f16 by default (`Runner::init(..., kv_f16)`, `--kv-f32` in

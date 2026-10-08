@@ -144,9 +144,10 @@ Activations are quantized the way llama.cpp does on x86: Q8_0 per block of 32
 for the Q8_0, Q4_0 and Q5_0 kernels, Q8_K per block of 256 (float32 scale,
 sums of 16) for the K-quants, whose kernels sum every super block exactly in
 integers with the sub block scales before two fused multiply adds in float32.
-Builds with AVX-VNNI but no AVX-512 have kernels for Q8_0 and Q4_0 only and
-convert the other types to float32; builds without VNNI keep Q8_0 in place
-with an AVX2 kernel and convert the rest.
+Builds with AVX-VNNI but no AVX-512 run the same five types with 256-bit
+kernels (each 64 byte chunk of a group as two halves of 8 rows) and give bit
+identical output to the AVX-512 build; builds without VNNI keep Q8_0 in place
+with an AVX2 kernel and convert the rest to float32.
 
 `Runner` holds the KV cache (`n_ctx` positions, keys and values in f16 unless
 `init` is told otherwise, keys in tiles of 16 positions) and a thread pool.

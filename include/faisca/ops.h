@@ -197,7 +197,8 @@ inline size_t key_index(size_t head_dim, size_t p, size_t d)
 }
 
 // one query against the cache of one head: v holds position p at v + p * v_stride; out
-// gets head_dim values and scores is scratch for n_past values rounded up to 16
+// gets head_dim values and scores is scratch for n_past values rounded up to 16; the
+// AVX-512 and AVX2 kernels give the same bits (same sums, same softmax reduction tree)
 void attention_head(const float* q, const float* k_tiles, const float* v, size_t v_stride, size_t head_dim,
                     size_t n_past, float scale, float* scores, float* out);
 void attention_head_scalar(const float* q, const float* k_tiles, const float* v, size_t v_stride, size_t head_dim,
