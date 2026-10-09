@@ -343,6 +343,66 @@ top. No third party dependencies. Owner: Luís (akadjoker). "faisca" is a workin
    27B vision (same mmproj layout, files beyond this machine), Whisper's
    encoder through attention_block (same shape of problem), the Vulkan
    runner.
+11. CUDA runner: planned, not started. Context: this VM has no GPU, no
+   nvcc and no NVIDIA driver, so everything here compiles only; every
+   measurement needs the owner's machine. The Vulkan runner was never
+   measured on a real GPU. On generation (memory bound) a well made
+   Vulkan and a well made CUDA kernel land close to each other; CUDA
+   earns its place with int8 tensor cores for the prompt (mma.sync /
+   WMMA, the GPU version of our VNNI GEMM), the tooling, and the async
+   host to device copies an expert cache needs (Strata's idea, see the
+   MoE note below). Rules for whoever works on it (the owner wants the
+   mechanical parts done by a cheaper model): never touch the CPU path;
+   one kernel per commit; a commit goes in only when its check passes;
+   when a comparison fails, stop and write down what was seen instead
+   of guessing (precisamos de mais investigação); the expensive model
+   does phase 0, the CudaDevice design, the first matvec kernel as the
+   template, the phase 4 GEMM, and any comparison that fails without an
+   obvious cause; the cheap model ports the remaining kernels from the
+   template, writes cuda_check and CudaRunner from the Vulkan ones, runs
+   compare_layers and cmp, updates the docs. The owner runs the GPU
+   measurements and pastes the numbers.
+   Phase 0, measure first (owner's GPU, one day): bench_runner with
+   --vulkan on SmolLM2-360M and Gemma 3 4B, generation and prompt,
+   against the card's bandwidth (nvidia-smi) and llama-bench with CUDA.
+   If Vulkan reaches about 70% of the bandwidth on generation, CUDA is
+   justified by the prompt and the MoE only; decide then.
+   Phase 1, device without third parties: CudaDevice like VulkanDevice,
+   the driver API opened at run time (dlopen libcuda.so.1 / LoadLibrary
+   nvcuda.dll: cuInit, context, streams, cuMemAlloc, async copies from
+   pinned host memory, modules from embedded PTX). Kernels in .cu files,
+   nvcc -ptx once, tools/embed_ptx.py embeds the PTX as embed_spirv.py
+   does, generated file committed: building faisca needs no CUDA
+   toolkit. No CUDA runtime, no cuBLAS, no NVRTC.
+   Phase 2, kernels one by one against a reference: the 14 shaders in
+   vulkan_check's order (matvec_f32, matvec_q8_0, Q4_0, Q5_0, Q4_K,
+   Q6_K, embed, rms_norm, rope, kv_store, attention, swiglu, add), each
+   validated by tests/cuda_check (same as vulkan_check: 1 and 16 inputs
+   against a double precision product, thresholds 1e-7 to 5e-7).
+   Designed for generation from the start: one warp per row with 16
+   byte loads, 4 rows per block, the weights in the packed layout the
+   CPU already uses (same bytes, no second copy), float32 activations.
+   Phase 3, CudaRunner with VulkanRunner's interface (init(device, file,
+   n_ctx), forward, set_trace), one stream per batch, f16 KV cache on
+   the device, --cuda in the CLI and runner_dump. Validation:
+   compare_layers --ours-flags=--cuda against llama.cpp in float32 on
+   the four architectures, 16 tokens identical, cmp of runner_dump
+   across block configurations.
+   Phase 4, prompt on tensor cores: int8 GEMM by mma.sync or WMMA over
+   packed Q8_0 weights and Q8_0 activations, validated with
+   matmul_check (zero error against llama.cpp's inputs), then measured
+   against llama-bench CUDA on the same card.
+   Phase 5, after MoE exists on the CPU: experts resident in VRAM,
+   async copies of the missing ones, hit rate measured on our corpus.
+   Size: phases 1 to 3 are the size of the Vulkan work already done;
+   phase 4 is the hard part.
+   MoE note: the loader rejects MoE today. The CPU MoE (router with
+   top-k and weight normalization, experts as groups of packed
+   matrices read only when chosen, shared expert, validated layer by
+   layer against llama.cpp) comes before phase 5; this VM has 15 GB of
+   RAM, so the development model must be a small MoE in Q8_0 (OLMoE-
+   1B-7B or Qwen1.5-MoE-A2.7B class), to be confirmed with llama.cpp
+   running on it here before the loader is designed.
 
 Target model: SmolLM2-360M-Instruct GGUF, then 1B to 3B models. SmolLM2-1.7B
 Q4_K_M (/home/user/models/1.7b/, official file, its float32 copy and the
