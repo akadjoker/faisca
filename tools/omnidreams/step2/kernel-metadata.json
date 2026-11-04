@@ -1,0 +1,13 @@
+{
+  "id": "akadjoker/omnidreams-step2",
+  "title": "omnidreams step2",
+  "code_file": "step2_run.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_internet": true,
+  "dataset_sources": [],
+  "competition_sources": [],
+  "kernel_sources": ["akadjoker/omnidreams-weights"]
+}
