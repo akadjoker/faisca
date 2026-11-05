@@ -96,6 +96,16 @@ below, `overlay_0000.png` hdmap over the real first frame).
   correction_sensor_R_FLU), the way apps/interactive_drive rasterizer.py
   `_render_one_camera` does; frames at the photo's timestamp plus k / 30 s
   instead of the next 30 Hz ego sample (that was 23 ms late).
+- Checked locally 2026-11-05 (RTX 4060, tools/omnidreams/hdmap_ref/hdmap_ref.py,
+  ludus only, env /media/ctw04578/data/pytorch: torch 2.11 cu130, ludus JIT
+  build with nvcc 12.8 in ~30 s, 21 frames in 0.04 s): with the step2 poses it
+  reproduces the Kaggle drawing (same geometry, ~12% pixels differ in line
+  details, camera scaled by ludus instead of world_scenario); with the fixed
+  poses the drawing sits on the photo (overlay_fixed_0000.png): yellow line on
+  the painted one, boxes on the parked cars and on the black car.
+- ludus prints "1280x704 cannot be supersampled ... drawing it unsmoothed":
+  the MSAA 4 of the callers does nothing at this size. The scene camera
+  reports max ray angle 0.4152 (not ~1.1 rad), not understood yet.
 - Calibration of the front camera in this scene: nominal rpy (0.29, 0.46,
   -0.19) deg, t (1.690, 0.006, 1.453) m; correction rpy (-0.16, 0.12, 0.50)
   deg (yaw 0.5 deg is about 5 px at 1280 wide); correction_rig_T
