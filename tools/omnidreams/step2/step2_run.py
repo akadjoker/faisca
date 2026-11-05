@@ -76,7 +76,7 @@ if not os.path.exists("/tmp/cudalink/libcuda.so"):
 with open(os.path.join(WORK, "driver.py"), "w") as handle:
     handle.write(DRIVER_SOURCE)
 env = (
-    f"STEP_OUT={OUT} STEP_CHECKPOINT={checkpoint} STEP_SCENE={scene} STEP_CHUNKS=3 "
+    f"STEP_OUT={OUT} STEP_CHECKPOINT={checkpoint} STEP_SCENE={scene} STEP_CHUNKS=8 "
     "LIBRARY_PATH=/tmp/cudalink:$LIBRARY_PATH PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True"
 )
 run("driver", f"cd {src} && {env} uv run --no-sync python {WORK}/driver.py 2>&1 | grep -v -E -e '-MMD|-MD -MF'", timeout=7200, keep=200)
