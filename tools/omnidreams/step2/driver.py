@@ -138,20 +138,26 @@ say(f"scene loaded {time.time() - started:.1f} s, ego poses {scene.num_frames}, 
 
 first_frames = sorted(glob.glob(os.path.join(SCENE, "frames", CAMERA, "*.jpeg")))
 first_timestamp = int(os.path.splitext(os.path.basename(first_frames[0]))[0])
-timestamps = scene.timestamps
-start = int(np.searchsorted(timestamps, first_timestamp))
-say(f"first frame ts {first_timestamp}, ego ts range {timestamps[0]}..{timestamps[-1]}, start index {start} (ts {timestamps[start]})")
+say(f"first frame ts {first_timestamp}, ego ts range {scene.timestamps[0]}..{scene.timestamps[-1]}")
 
 frame_counts = [pipeline.get_num_output_frames(i) for i in range(N_CHUNKS)]
 total_frames = sum(frame_counts)
-indices = list(range(start, start + total_frames))
-extrinsic = np.asarray(scene.camera_extrinsics[CAMERA], dtype=np.float32)
-poses = np.stack([scene.ego_poses[i].transformation_matrix @ extrinsic for i in indices]).astype(np.float32)
+frame_timestamps = [first_timestamp + round(k * 1e6 / 30.0) for k in range(total_frames)]
+
+# scene.ego_poses and scene.camera_extrinsics are OpenCV RDF, ludus wants FLU camera to world:
+# rig to world from the ludus ego track times ludus' sensor_to_rig (nominal with the
+# correction rotation), as apps/interactive_drive rasterizer.py _render_one_camera does.
+ludus_scene = scene.metadata["ludus_scene"]
+rig_to_world = ludus_scene.ego_tracks.get_transforms_at_timestamp(torch.tensor(frame_timestamps, dtype=torch.int64))[:, 0]
+sensor_to_rig = ludus_scene.cameras[CAMERA.replace("_", ":")].sensor_to_rig.to(rig_to_world.device)
+camera_poses = (rig_to_world @ sensor_to_rig).float().cuda()
+poses = camera_poses.cpu().numpy()
+say(f"camera position first {poses[0][:3, 3]} last {poses[-1][:3, 3]}")
 started = time.time()
 hdmap = renderer.render_all_frames_and_cameras(
     camera_names=[CAMERA],
-    camera_poses_per_camera={CAMERA: torch.from_numpy(poses).cuda()},
-    frame_timestamps_us=[int(timestamps[i]) for i in indices],
+    camera_poses_per_camera={CAMERA: camera_poses},
+    frame_timestamps_us=frame_timestamps,
 )
 say(f"hdmap rendered {tuple(hdmap.shape)} {hdmap.dtype} min {hdmap.min().item()} max {hdmap.max().item()} in {time.time() - started:.1f} s")
 hdmap = hdmap[0]
@@ -162,7 +168,7 @@ elif hdmap.max() > 1.5:
 else:
     hdmap_unit = hdmap.float().clamp(0, 1)
 hdmap_uint8 = (hdmap_unit * 255).round().byte().permute(0, 2, 3, 1).cpu().numpy()
-np.savez_compressed(os.path.join(OUT, "hdmap_frames.npz"), frames=hdmap_uint8, timestamps=np.array([timestamps[i] for i in indices]), poses=poses)
+np.savez_compressed(os.path.join(OUT, "hdmap_frames.npz"), frames=hdmap_uint8, timestamps=np.array(frame_timestamps), poses=poses)
 Image.fromarray(hdmap_uint8[0]).save(os.path.join(OUT, "hdmap_0000.png"))
 
 with Image.open(first_frames[0]) as image:

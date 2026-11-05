@@ -79,6 +79,8 @@ not in it: context, state, and how to work with the owner on this topic.
    scenes/clipgt-0d404ff7-2b66-498c-b047-1ed8cded60d4.usdz --repo-type
    dataset`, unzip; ludus reference frames for camera_front_wide_120fov.
 2. Solve the hdmap alignment (see above) before anything is compared.
+   Cause found 2026-11-05 (RDF poses read as FLU, docs/omnidreams.md, First
+   result); driver.py fixed, not rerun yet.
 3. Lucent conditioning mode (spec in docs/omnidreams.md), compared pixel by
    pixel with the ludus frames of the same scene and timestamps.
 4. Lucent frames into the model on Kaggle, look at the video.

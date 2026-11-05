@@ -83,10 +83,23 @@ below, `overlay_0000.png` hdmap over the real first frame).
   in the first chunk; its box in the hdmap does not sit on it (see below).
 - Alignment of the hdmap over the real frame is close but not exact: the
   drawn yellow line is about 100 px left of the painted one near the hood, and
-  the left car's box is low and left. Camera pose = ego pose times
-  camera_extrinsics (camera_to_vehicle), passed as FLU; the hdmap starts 23 ms
-  after the photo. Not explained yet: compare with ludus' own
-  render_hdmap_scene.py at the same timestamp.
+  the left car's box is low and left.
+- Cause (found 2026-11-05, not yet rerun): the driver multiplied
+  `scene.ego_poses` by `scene.camera_extrinsics`; the world_scenario loader
+  converts both to OpenCV RDF (clipgt_loader.py 312-337 and 560-579), ludus
+  reads the product as FLU. Read back from hdmap_frames.npz the drawing camera
+  sat 1.45 m right of the ego and 3.6 m up, and rose to 13 m over the 21
+  frames instead of driving 3.6 -> 13 m forward at 1.45 m height. So the
+  conditioning of that first video was wrong, which fits the smeared car.
+- Fix in step2/driver.py: rig to world from the ludus ego track times ludus'
+  `sensor_to_rig` (nominalSensor2Rig_FLU, Euler "xyz", times
+  correction_sensor_R_FLU), the way apps/interactive_drive rasterizer.py
+  `_render_one_camera` does; frames at the photo's timestamp plus k / 30 s
+  instead of the next 30 Hz ego sample (that was 23 ms late).
+- Calibration of the front camera in this scene: nominal rpy (0.29, 0.46,
+  -0.19) deg, t (1.690, 0.006, 1.453) m; correction rpy (-0.16, 0.12, 0.50)
+  deg (yaw 0.5 deg is about 5 px at 1280 wide); correction_rig_T
+  (-0.057, -0.003, 0.009) m, which no ludus loader applies.
 
 ## The conditioning drawing (ludus), what Lucent has to reproduce
 
@@ -113,7 +126,13 @@ Image and pass
   (+0.5) [CU 2479-2488]. So the pixels are NOT the plain palette: things fade to
   black at 200 m. z is the camera depth when the camera's max ray angle is at
   most 90 degrees, the ray length otherwise.
-- No antialiasing at this size: supersampling is skipped past 2048 px a side.
+- No supersampling at this size (skipped past 2048 px a side), but both
+  callers (conditioning/renderer.py LudusRenderer, apps/interactive_drive
+  rasterizer.py) call `set_msaa_samples(4)` and `set_depth_scaling(True)`; what
+  that MSAA does in the CUDA rasterizer is not read yet.
+- The two callers differ: LudusRenderer uses cube tessellation 0 and the
+  default wireframe width, interactive_drive cube tessellation 3 (box faces
+  curve under f-theta) and `set_line_widths(..., wireframe=4.0)`.
 - Spatial cull at 300 m around the camera; beyond 200 m things are drawn black
   with zero width.
 
@@ -166,8 +185,7 @@ Boxes
 - Actor poses between samples: position lerped and extrapolated up to 0.5 s,
   rotation slerped and held at the ends.
 
-Still open: how the real caller builds the FLU poses and camera intrinsics
-(the gRPC server is not in the tree), whether the front camera's max ray angle
+Still open: whether the front camera's max ray angle
 is above 90 degrees, the rasterizer fill rule beyond the 1/16 px snap.
 
 Lucent changes:
