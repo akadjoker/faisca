@@ -404,6 +404,9 @@ top. No third party dependencies. Owner: Luís (akadjoker). "faisca" is a workin
    1B-7B or Qwen1.5-MoE-A2.7B class), to be confirmed with llama.cpp
    running on it here before the loader is designed.
 
+OmniDreams (NVIDIA video world model) is an exploration, not a plan step:
+read docs/omnidreams_handoff.md first, then docs/omnidreams.md.
+
 Target model: SmolLM2-360M-Instruct GGUF, then 1B to 3B models. SmolLM2-1.7B
 Q4_K_M (/home/user/models/1.7b/, official file, its float32 copy and the
 llama dump /home/user/ref/llama_17b_dump.bin) validated: matmul_check zero
