@@ -53,7 +53,12 @@ generated in chunks of 8 frames (5 for the first chunk).
   (T4 has neither), CUDA graphs off, text encoder on the CPU, local checkpoint
   path. The ClipGT folder must be staged with `prepare_clipgt_dir`. ludus needs
   `LIBRARY_PATH` with a `libcuda.so` link to `/usr/local/cuda-13.0/compat`.
-- Scripts in tools/omnidreams: `weights/` (the download notebook) and `step2/`
+- Scripts in tools/omnidreams, in the order they were run: `recon/` (machine
+  probe and ludus build test; rebuilt from the session, the Kaggle copy was
+  overwritten), `secret_test/` (shows secrets fail for API pushes; same
+  notebook id as recon), `weights/` (the download notebook), `step1/`
+  (checkpoint check, tensor list, scene download, ludus example render) and
+  `step2/`
   (`driver.py` is the reference; `step2_run.py` embeds it for Kaggle, push
   with `kaggle kernels push -p tools/omnidreams/step2 --accelerator
   NvidiaTeslaT4`). On a local NVIDIA machine run `driver.py` directly inside
