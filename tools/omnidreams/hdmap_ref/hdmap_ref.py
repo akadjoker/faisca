@@ -31,6 +31,8 @@ parser.add_argument("--frames", type=int, default=21)
 parser.add_argument("--width", type=int, default=1280)
 parser.add_argument("--height", type=int, default=704)
 parser.add_argument("--poses-npz", default=None)
+parser.add_argument("--start-us", type=int, default=None, help="first frame time, default the first photo")
+parser.add_argument("--fps", type=float, default=30.0)
 args = parser.parse_args()
 
 os.makedirs(args.out, exist_ok=True)
@@ -61,15 +63,21 @@ print(f"camera {args.camera}: size {camera.image_size.tolist()} centre {camera.p
       f"max ray angle {float(camera.max_ray_angle):.4f} fw_poly {camera.fw_poly.tolist()}")
 
 frame_dir = os.path.join(args.scene, "frames", args.camera.replace(":", "_"))
-first_image = sorted(glob.glob(os.path.join(frame_dir, "*.jpeg")))[0]
-first_timestamp = int(os.path.splitext(os.path.basename(first_image))[0])
+images = sorted(glob.glob(os.path.join(frame_dir, "*.jpeg")))
+first_image = images[0] if images else None
+if args.start_us is not None:
+    first_timestamp = args.start_us
+elif first_image:
+    first_timestamp = int(os.path.splitext(os.path.basename(first_image))[0])
+else:
+    first_timestamp = int(scene.ego_tracks._ego_track.timestamps[0].item())
 
 if args.poses_npz:
     stored = np.load(args.poses_npz)
     timestamps = [int(t) for t in stored["timestamps"]]
     camera_to_world = torch.from_numpy(stored["poses"]).float().to(device)
 else:
-    timestamps = [first_timestamp + round(k * 1e6 / 30.0) for k in range(args.frames)]
+    timestamps = [first_timestamp + round(k * 1e6 / args.fps) for k in range(args.frames)]
     rig_to_world = scene.ego_tracks.get_transforms_at_timestamp(torch.tensor(timestamps, dtype=torch.int64))[:, 0]
     sensor_to_rig = scene.cameras[args.camera].sensor_to_rig.to(rig_to_world.device)
     camera_to_world = (rig_to_world @ sensor_to_rig).float().to(device)
@@ -100,10 +108,11 @@ for index, frame in enumerate(frames):
 np.savez_compressed(os.path.join(args.out, "hdmap_frames.npz"), frames=frames,
                     timestamps=np.array(timestamps), poses=camera_to_world.cpu().numpy())
 
-with Image.open(first_image) as image:
-    photo = np.asarray(image.convert("RGB").resize((args.width, args.height), resample=Image.Resampling.BILINEAR), dtype=np.uint8)
-overlay = photo.copy()
-mask = frames[0].max(axis=2) > 0
-overlay[mask] = (0.4 * overlay[mask] + 0.6 * frames[0][mask]).astype(np.uint8)
-Image.fromarray(overlay).save(os.path.join(args.out, "overlay_0000.png"))
+if first_image and args.start_us is None:
+    with Image.open(first_image) as image:
+        photo = np.asarray(image.convert("RGB").resize((args.width, args.height), resample=Image.Resampling.BILINEAR), dtype=np.uint8)
+    overlay = photo.copy()
+    mask = frames[0].max(axis=2) > 0
+    overlay[mask] = (0.4 * overlay[mask] + 0.6 * frames[0][mask]).astype(np.uint8)
+    Image.fromarray(overlay).save(os.path.join(args.out, "overlay_0000.png"))
 print(f"written to {args.out}")

@@ -111,6 +111,20 @@ below, `overlay_0000.png` hdmap over the real first frame).
   deg (yaw 0.5 deg is about 5 px at 1280 wide); correction_rig_T
   (-0.057, -0.003, 0.009) m, which no ludus loader applies.
 
+## ASTAS scenarios through ludus (2026-11-05)
+
+lucent tools/omnidreams/osi_to_clipgt.py writes a ClipGT folder from an OSI
+trace (ego, obstacles, lane lines, road edges, calibration copied from the
+public scene); hdmap_ref.py --start-us 0 draws it. highway_cut_in (1402 frames,
+CM_H102F_TUNNEL map) converts in 2.5 s and 420 frames draw in 0.23 s; BEV and
+camera views look right (lane 3.5 m, ego centred, cut-in car passing).
+What the OSI from ASTAS lacks: lane types (shoulder, stop, border all come as
+NONDRIVING / OTHER, so road edges are a 3 m rule), marking colours (OTHER,
+drawn white) and dash phases (ludus applies 3 on 9 off; German motorways are
+6 / 12), signs and poles (none in this map). The first ego sample has yaw 0
+before the simulator sets the heading. Better source for types and dashes:
+the OpenDRIVE (roadMark, lane types), once Lucent reads spirals.
+
 ## The conditioning drawing (ludus), what Lucent has to reproduce
 
 Lucent (github.com/akadjoker/lucent, branch `osi-playback`) already has the
