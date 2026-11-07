@@ -141,6 +141,55 @@ __device__ __forceinline__ void qk_norm_rope(unsigned short* data, unsigned int 
 
 }
 
+// out[n] = add[n] + sum_k w[n][k] * f(x[k]), f = SiLU when silu (nn.SiLU before the linear of
+// the AdaLN and time embedding MLPs), bf16 weights, f32 vectors; one warp per row, k a multiple
+// of 256
+extern "C" __global__ void __launch_bounds__(256)
+    dit_matvec_bf16(const unsigned short* w, const float* x, const float* add, float* out, unsigned int n,
+                    unsigned int k, unsigned int silu)
+{
+    const unsigned int lane = threadIdx.x & 31;
+    const unsigned int row = blockIdx.x * 8 + threadIdx.x / 32;
+    if (row >= n)
+    {
+        return;
+    }
+    const unsigned short* wr = w + static_cast<unsigned long long>(row) * k;
+    float sum = 0.0f;
+    for (unsigned int c = lane * 8; c < k; c += 256)
+    {
+        const uint4 packed = *reinterpret_cast<const uint4*>(wr + c);
+        const unsigned short* h = reinterpret_cast<const unsigned short*>(&packed);
+        for (unsigned int i = 0; i < 8; ++i)
+        {
+            float v = x[c + i];
+            if (silu != 0)
+            {
+                v = v / (1.0f + expf(-v));
+            }
+            sum = fmaf(load_half<true>(h + i), v, sum);
+        }
+    }
+    for (unsigned int offset = 16; offset > 0; offset /= 2)
+    {
+        sum += __shfl_xor_sync(0xffffffffu, sum, offset);
+    }
+    if (lane == 0)
+    {
+        out[row] = add != nullptr ? sum + add[row] : sum;
+    }
+}
+
+// count 16 byte words from src to dst, the ranges not overlapping
+extern "C" __global__ void __launch_bounds__(256)
+    dit_copy(const uint4* src, uint4* dst, unsigned long long count)
+{
+    for (unsigned long long i = blockIdx.x * 256ull + threadIdx.x; i < count; i += gridDim.x * 256ull)
+    {
+        dst[i] = src[i];
+    }
+}
+
 extern "C" __global__ void __launch_bounds__(256)
     dit_modulate_norm_f16(const float* x, const float* shift, const float* scale, unsigned short* out,
                           unsigned int width)

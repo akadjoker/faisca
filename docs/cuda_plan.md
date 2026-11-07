@@ -544,6 +544,27 @@ PyTorch bf16's 60-73 ms, interleaved (its weights converted once). Not yet:
 the modulation vectors (t embedder, AdaLN-LoRA), patch embedding, final layer,
 the rolling KV cache and the 28 blocks with the real weights.
 
+### The OmniDreams DiT network (2026-11-07)
+
+DitCudaRunner (include/faisca/omnidreams_cuda.h, src/cuda/omnidreams.cpp):
+CosmosDiTNetwork.forward (network.py 479-568) on the kernels above. Patch and
+HD map embedders as one GEMM over [patches | HD map | 0]; Timesteps sinusoid
+and t_embedding_norm on the host in double; TimestepEmbedding, every block's
+AdaLN-LoRA and the final layer's modulation as bf16 matvecs (dit_matvec);
+text projection (bias + GELU in the GEMM epilogue) and each block's text keys
+and values once per prompt (set_text); self attention keys and values written
+straight into each block's cache, whose bookkeeping is a port of FlashDreams'
+BlockKVCache (sink | window, roll left once full, same chunk index rewrites
+the same rows), the roll copied forward in pieces of `shift` rows so no piece
+overwrites rows not yet read. Not supported yet: a chunk written partly over
+the sink (refused with an error).
+tests/dit_network_reference.py runs the network in float64 and bf16 with the
+original BlockKVCache class (loaded from kvcache.py) over 5 chunks x 3
+timesteps (1000, 500, 128), 2 blocks, 2 x 16 x 24 tokens, window 3 chunks;
+tests/cuda_dit_network: every pass 1.68-1.71e-3 from float64 against PyTorch
+bf16's 6.38-6.50e-3, the passes after the window rolls (chunks 3, 4) included.
+Next: the checkpoint (torch_ckpt.h) into DitHostWeights, then fitting 8 GB.
+
 ## Phase 5 and exclusions
 
 MoE GPU work waits for a CPU MoE implementation validated against llama.cpp.

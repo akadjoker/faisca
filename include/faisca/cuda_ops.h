@@ -86,6 +86,7 @@ public:
         HalfGelu, // the same through the exact (erf) GELU
         Residual, // output: m x n floats, output += gate[column] * product
     };
+    // in the other modes gate, when given, is a bias added to the product first
     // sum_k input[m][k] * weight[n][k] on the f16 (or bf16) tensor cores with f32 accumulation,
     // stored as `how` says; input and weight hold halves, k a multiple of 32, n a multiple of 8.
     bool gemm_f16(const CudaBuffer& input, const CudaBuffer& weight, const CudaBuffer& output, uint32_t m,
@@ -98,6 +99,14 @@ public:
                            bool bf16, const CudaStream& stream, Error& error);
     // DiT: in place RMSNorm (gamma, 128 halves) of the heads of 128 at column first of rows
     // stride halves apart, then RoPE by angles (rows x 64 floats) unless angles is null
+    // DiT AdaLN / time MLPs: output[n] = add[n] + sum_k weight[n][k] * f(input[k]), f = SiLU when silu;
+    // bf16 weights, f32 vectors (buffers with byte offsets), k a multiple of 256
+    bool dit_matvec(const CudaBuffer& weight, const CudaBuffer& input, uint64_t input_offset, const CudaBuffer* add,
+                    uint64_t add_offset, const CudaBuffer& output, uint64_t output_offset, uint32_t n, uint32_t k,
+                    bool silu, const CudaStream& stream, Error& error);
+    // bytes (a multiple of 16) from src + src_offset to dst + dst_offset, the ranges apart
+    bool dit_copy(const CudaBuffer& src, uint64_t src_offset, const CudaBuffer& dst, uint64_t dst_offset,
+                  uint64_t bytes, const CudaStream& stream, Error& error);
     bool dit_qk_norm_rope(const CudaBuffer& data, uint32_t stride, uint32_t first, const CudaBuffer& gamma,
                           const CudaBuffer* angles, uint32_t rows, uint32_t heads, bool bf16,
                           const CudaStream& stream, Error& error);
@@ -149,6 +158,8 @@ private:
     CudaModule m_dit_module;
     CudaKernel m_dit_modulate_norm[2];
     CudaKernel m_dit_qk_norm_rope[2];
+    CudaKernel m_dit_matvec;
+    CudaKernel m_dit_copy;
     CudaModule m_attention_f16_module;
     CudaKernel m_attention_f16;
     CudaKernel m_attention_bf16;

@@ -88,6 +88,8 @@ bool CudaKernels::init(CudaDevice& device, Error& error)
         !device.find_kernel(m_dit_module, "dit_modulate_norm_bf16", m_dit_modulate_norm[1], error) ||
         !device.find_kernel(m_dit_module, "dit_qk_norm_rope_f16", m_dit_qk_norm_rope[0], error) ||
         !device.find_kernel(m_dit_module, "dit_qk_norm_rope_bf16", m_dit_qk_norm_rope[1], error) ||
+        !device.find_kernel(m_dit_module, "dit_matvec_bf16", m_dit_matvec, error) ||
+        !device.find_kernel(m_dit_module, "dit_copy", m_dit_copy, error) ||
         !device.load_module(ptx_attention_f16, m_attention_f16_module, error) ||
         !device.find_kernel(m_attention_f16_module, "attention_f16", m_attention_f16, error) ||
         !device.find_kernel(m_attention_f16_module, "attention_bf16", m_attention_bf16, error) ||
@@ -155,6 +157,8 @@ void CudaKernels::release()
     m_gemm_bf16 = CudaKernel();
     m_attention_f16_module = CudaModule();
     m_dit_module = CudaModule();
+    m_dit_matvec = CudaKernel();
+    m_dit_copy = CudaKernel();
     for (int t = 0; t < 2; ++t)
     {
         for (int o = 0; o < 3; ++o)
@@ -565,7 +569,8 @@ bool CudaKernels::gemm_f16(const CudaBuffer& input, const CudaBuffer& weight, co
     if (m_device == nullptr || m == 0 || n == 0 || n % 8 != 0 || k == 0 || k % 32 != 0 ||
         input.bytes < static_cast<size_t>(m) * k * 2 || weight.bytes < static_cast<size_t>(n) * k * 2 ||
         output.bytes < static_cast<size_t>(m) * n * out_size ||
-        (how == GemmOutput::Residual && (gate == nullptr || gate->bytes < gate_offset + n * 4ull)))
+        (how == GemmOutput::Residual && gate == nullptr) ||
+        (gate != nullptr && gate->bytes < gate_offset + n * 4ull))
     {
         error.set("invalid CUDA f16 GEMM dimensions or buffer size");
         return false;
@@ -603,6 +608,50 @@ bool CudaKernels::dit_modulate_norm(const CudaBuffer& x, const CudaBuffer& modul
     launch.grid_x = rows;
     launch.block_x = 256;
     return m_device->launch(m_dit_modulate_norm[bf16 ? 1 : 0], stream, launch, arguments, error);
+}
+
+bool CudaKernels::dit_matvec(const CudaBuffer& weight, const CudaBuffer& input, uint64_t input_offset,
+                             const CudaBuffer* add, uint64_t add_offset, const CudaBuffer& output,
+                             uint64_t output_offset, uint32_t n, uint32_t k, bool silu, const CudaStream& stream,
+                             Error& error)
+{
+    if (m_device == nullptr || n == 0 || k == 0 || k % 256 != 0 || weight.bytes < static_cast<size_t>(n) * k * 2 ||
+        input.bytes < input_offset + k * 4ull || output.bytes < output_offset + n * 4ull ||
+        (add != nullptr && add->bytes < add_offset + n * 4ull))
+    {
+        error.set("invalid CUDA DiT matvec dimensions or buffer size");
+        return false;
+    }
+    uint64_t addresses[] = {weight.address, input.address + input_offset, add != nullptr ? add->address + add_offset : 0,
+                            output.address + output_offset};
+    uint32_t apply = silu ? 1u : 0u;
+    void* arguments[] = {&addresses[0], &addresses[1], &addresses[2], &addresses[3], &n, &k, &apply};
+    CudaLaunch launch;
+    launch.grid_x = (n + 7) / 8;
+    launch.block_x = 256;
+    return m_device->launch(m_dit_matvec, stream, launch, arguments, error);
+}
+
+bool CudaKernels::dit_copy(const CudaBuffer& src, uint64_t src_offset, const CudaBuffer& dst, uint64_t dst_offset,
+                           uint64_t bytes, const CudaStream& stream, Error& error)
+{
+    if (m_device == nullptr || bytes % 16 != 0 || (src_offset | dst_offset) % 16 != 0 ||
+        src.bytes < src_offset + bytes || dst.bytes < dst_offset + bytes)
+    {
+        error.set("invalid CUDA DiT copy range");
+        return false;
+    }
+    if (bytes == 0)
+    {
+        return true;
+    }
+    uint64_t addresses[] = {src.address + src_offset, dst.address + dst_offset};
+    unsigned long long count = bytes / 16;
+    void* arguments[] = {&addresses[0], &addresses[1], &count};
+    CudaLaunch launch;
+    launch.grid_x = static_cast<uint32_t>((count + 255) / 256 < 4096 ? (count + 255) / 256 : 4096);
+    launch.block_x = 256;
+    return m_device->launch(m_dit_copy, stream, launch, arguments, error);
 }
 
 bool CudaKernels::dit_qk_norm_rope(const CudaBuffer& data, uint32_t stride, uint32_t first, const CudaBuffer& gamma,

@@ -64,6 +64,7 @@ enum Output
     HALF,     // out: halves of the input type
     HALF_GELU, // out: halves of gelu(acc), the exact (erf) form of nn.GELU()
     RESIDUAL, // out: floats, out += gate[column] * acc
+    // gate, when not null in the other modes, is a bias added to acc first
 };
 
 template <bool bf16>
@@ -188,8 +189,13 @@ __device__ __forceinline__ void gemm_tiles(const unsigned short* x, const unsign
                     continue;
                 }
                 const unsigned long long index = static_cast<unsigned long long>(row) * n + col;
-                const float v0 = acc[mt][nt][2 * half];
-                const float v1 = acc[mt][nt][2 * half + 1];
+                float v0 = acc[mt][nt][2 * half];
+                float v1 = acc[mt][nt][2 * half + 1];
+                if (output != RESIDUAL && gate != nullptr)
+                {
+                    v0 += gate[col];
+                    v1 += gate[col + 1];
+                }
                 if (output == FLOAT)
                 {
                     *reinterpret_cast<float2*>(static_cast<float*>(out) + index) = make_float2(v0, v1);
