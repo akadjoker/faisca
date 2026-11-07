@@ -266,10 +266,15 @@ bool TripoCudaRunner::gemm(uint64_t x, uint32_t x_stride, uint64_t w, uint32_t n
 {
     uint32_t out_stride = n_out;
     uint32_t acc = accumulate ? 1u : 0u;
+    if (n_in % 8 != 0 || x_stride % 4 != 0 || n_out % F32_PANEL != 0 || (x | w | bias | out) % 16 != 0)
+    {
+        error.set("tripo_gemm: n_in %u, x stride %u or n_out %u not aligned", n_in, x_stride, n_out);
+        return false;
+    }
     void* arguments[] = {&x, &x_stride, &w, &n_in, &n_out, &n_tokens, &bias, &out, &out_stride, &acc};
     CudaLaunch launch;
-    launch.grid_x = (n_out / static_cast<uint32_t>(F32_PANEL) + 3) / 4;
-    launch.grid_y = (n_tokens + 63) / 64;
+    launch.grid_x = (n_out / static_cast<uint32_t>(F32_PANEL) + 7) / 8;
+    launch.grid_y = (n_tokens + 127) / 128;
     launch.block_x = 256;
     return m_device->launch(m_gemm, m_stream, launch, arguments, error);
 }

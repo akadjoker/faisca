@@ -535,13 +535,23 @@ top. No third party dependencies. Owner: Luís (akadjoker). "faisca" is a workin
    cubes on the CPU pool. `triposr_dump ... --cuda`. chair.png against the
    reference: tokens 3.6e-6, scene codes 2.5e-6, density 5.8e-6, 256^3 same
    84160 faces, 42158 vertices against 42170, positions within 6e-6.
-   Speed on the RTX 4060 Laptop (synchronized, warm): ours image encoder
-   0.08 s, triplane 0.95 s, mesh 256^3 0.6-1.4 s; PyTorch 2.11 CUDA
-   (ref/triposr/bench_torch_cuda.py, TF32 matmul off): 0.045 s, 0.60 s,
-   1.5-1.75 s. STILL SLOWER in the encoder and the triplane: next task is
-   to find why (profile per kernel: tripo_gemm reaches about 1.4 TMAC/s,
-   attention is one query per thread) and beat PyTorch; then wire --cuda
-   into `faisca mesh`; then CPU cache tuning.
+   Speed on the RTX 4060 Laptop, first version: image encoder 0.08 s,
+   triplane 0.95 s against PyTorch 2.11 CUDA (ref/triposr/bench_torch_cuda.py,
+   TF32 matmul off) 0.045 s and 0.60 s. Found with nsys per kernel, both
+   runs: tripo_gemm took 0.81 s of the triplane (64 x 64 tiles, 4 x 4 per
+   thread, 8 shared loads per 16 fma: shared memory bound, 0.9-1.3 TMAC/s)
+   against cuBLAS ampere_sgemm_128x64 0.33 s (3.3 TMAC/s); our one query
+   per thread attention was already faster (0.19 s against cutlass
+   mem-efficient f32 0.28 s). tripo_gemm now 128 x 128 tiles, 8 x 8 per
+   thread, float4 shared loads, k steps of 8 double buffered (CUTLASS SIMT
+   sgemm tiling), 128 registers, 2 blocks per SM; same fma order, so all 38
+   traces of chair (tokens to mesh) are bit identical to the first version.
+   Interleaved with PyTorch: image encoder 0.037 s (0.044), triplane
+   0.48-0.49 s (0.61-0.62), mesh 256^3 0.54-0.58 s (0.96). Per kernel still
+   behind: tripo_layer_norm 574 us per 3072 rows against PyTorch's 54 us
+   (25 ms per triplane), GEMM 3072 x 1024 x 1024 1.14 ms against cuBLAS's
+   1.0 ms (split-K 64 x 64). Next: those two, then --cuda in `faisca mesh`,
+   then CPU cache tuning.
 
 OmniDreams (NVIDIA video world model) is an exploration, not a plan step:
 read docs/omnidreams_handoff.md first, then docs/omnidreams.md.

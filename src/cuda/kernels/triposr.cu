@@ -5,93 +5,127 @@
 
 // out[t][o] for t < n_tokens, o < n_out: acc = fmaf chain over k from 0 in k order (as
 // gemm_f32_packed), then acc + bias[o] if bias, then out[t][o] + that if accumulate.
-// panels: rows packed as pack_f32_panels does ([panel][k][16]). 256 threads, a tile of
-// 64 tokens x 64 outputs, 4 x 4 outputs per thread.
-extern "C" __global__ void tripo_gemm(const float* x, unsigned int x_stride, const float* panels, unsigned int n_in,
-                                      unsigned int n_out, unsigned int n_tokens, const float* bias, float* out,
-                                      unsigned int out_stride, unsigned int accumulate)
+// panels: rows packed as pack_f32_panels does ([panel][k][16]). n_in, x_stride and
+// out_stride multiples of 4 (n_in of 8), 16 byte aligned rows. 256 threads, a tile of
+// 128 tokens x 128 outputs (8 panels), 8 x 8 outputs per thread, k in steps of 8 through
+// two shared buffers (the SIMT tiling of CUTLASS's sgemm and cuBLAS's ampere_sgemm_128x128).
+extern "C" __global__ void __launch_bounds__(256, 2)
+    tripo_gemm(const float* x, unsigned int x_stride, const float* panels, unsigned int n_in, unsigned int n_out,
+               unsigned int n_tokens, const float* bias, float* out, unsigned int out_stride, unsigned int accumulate)
 {
-    __shared__ float as[16][64];
-    __shared__ float bs[16][64];
+    __shared__ __align__(16) float as[2][8][132];
+    __shared__ __align__(16) float bs[2][8][128];
     const unsigned int tid = threadIdx.x;
     const unsigned int tx = tid % 16;
     const unsigned int ty = tid / 16;
-    const unsigned int t0 = blockIdx.y * 64;
-    const unsigned int panel0 = blockIdx.x * 4;
+    const unsigned int t0 = blockIdx.y * 128;
+    const unsigned int panel0 = blockIdx.x * 8;
     const unsigned int n_panels = n_out / PANEL;
-    float acc[4][4];
+
+    const unsigned int a_t = tid / 2;
+    const unsigned int a_k = (tid % 2) * 4;
+    const unsigned int b_p = tid / 32;
+    const unsigned int b_k = (tid % 32) / 4;
+    const unsigned int b_c = (tid % 4) * 4;
+    const bool a_ok = t0 + a_t < n_tokens;
+    const bool b_ok = panel0 + b_p < n_panels;
+    const float* a_src = x + (size_t)(a_ok ? t0 + a_t : 0) * x_stride + a_k;
+    const float* b_src = panels + ((size_t)(b_ok ? panel0 + b_p : 0) * n_in + b_k) * PANEL + b_c;
+    const float4 zero = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    float4 a_next = a_ok ? *(const float4*)a_src : zero;
+    float4 b_next = b_ok ? *(const float4*)b_src : zero;
+    as[0][a_k + 0][a_t] = a_next.x;
+    as[0][a_k + 1][a_t] = a_next.y;
+    as[0][a_k + 2][a_t] = a_next.z;
+    as[0][a_k + 3][a_t] = a_next.w;
+    *(float4*)&bs[0][b_k][b_p * 16 + b_c] = b_next;
+    __syncthreads();
+
+    float acc[8][8];
 #pragma unroll
-    for (int i = 0; i < 4; ++i)
+    for (int i = 0; i < 8; ++i)
     {
 #pragma unroll
-        for (int j = 0; j < 4; ++j)
+        for (int j = 0; j < 8; ++j)
         {
             acc[i][j] = 0.0f;
         }
     }
-    for (unsigned int k0 = 0; k0 < n_in; k0 += 16)
+    unsigned int cur = 0;
+    for (unsigned int k0 = 0; k0 < n_in; k0 += 8)
     {
-#pragma unroll
-        for (int r = 0; r < 4; ++r)
+        const bool more = k0 + 8 < n_in;
+        if (more)
         {
-            const unsigned int e = tid + 256 * r;
-            const unsigned int tl = e / 16;
-            const unsigned int kl = e % 16;
-            const unsigned int t = t0 + tl;
-            const unsigned int k = k0 + kl;
-            as[kl][tl] = t < n_tokens && k < n_in ? x[(size_t)t * x_stride + k] : 0.0f;
-            const unsigned int p = panel0 + r;
-            const unsigned int kw = k0 + tid / 16;
-            bs[tid / 16][r * 16 + tid % 16] =
-                p < n_panels && kw < n_in ? panels[((size_t)p * n_in + kw) * PANEL + tid % 16] : 0.0f;
+            a_next = a_ok ? *(const float4*)(a_src + k0 + 8) : zero;
+            b_next = b_ok ? *(const float4*)(b_src + (size_t)(k0 + 8) * PANEL) : zero;
         }
-        __syncthreads();
-        const unsigned int steps = n_in - k0 < 16 ? n_in - k0 : 16;
-        for (unsigned int kk = 0; kk < steps; ++kk)
+#pragma unroll
+        for (int kk = 0; kk < 8; ++kk)
         {
-            float a[4];
-            float b[4];
+            const float4 a0 = *(const float4*)&as[cur][kk][ty * 4];
+            const float4 a1 = *(const float4*)&as[cur][kk][64 + ty * 4];
+            const float4 b0 = *(const float4*)&bs[cur][kk][tx * 4];
+            const float4 b1 = *(const float4*)&bs[cur][kk][64 + tx * 4];
+            const float a[8] = {a0.x, a0.y, a0.z, a0.w, a1.x, a1.y, a1.z, a1.w};
+            const float b[8] = {b0.x, b0.y, b0.z, b0.w, b1.x, b1.y, b1.z, b1.w};
 #pragma unroll
-            for (int i = 0; i < 4; ++i)
-            {
-                a[i] = as[kk][ty + 16 * i];
-                b[i] = bs[kk][tx + 16 * i];
-            }
-#pragma unroll
-            for (int i = 0; i < 4; ++i)
+            for (int i = 0; i < 8; ++i)
             {
 #pragma unroll
-                for (int j = 0; j < 4; ++j)
+                for (int j = 0; j < 8; ++j)
                 {
                     acc[i][j] = fmaf(a[i], b[j], acc[i][j]);
                 }
             }
         }
+        if (more)
+        {
+            const unsigned int next = cur ^ 1u;
+            as[next][a_k + 0][a_t] = a_next.x;
+            as[next][a_k + 1][a_t] = a_next.y;
+            as[next][a_k + 2][a_t] = a_next.z;
+            as[next][a_k + 3][a_t] = a_next.w;
+            *(float4*)&bs[next][b_k][b_p * 16 + b_c] = b_next;
+        }
         __syncthreads();
+        cur ^= 1u;
     }
 #pragma unroll
-    for (int i = 0; i < 4; ++i)
+    for (int i = 0; i < 8; ++i)
     {
-        const unsigned int t = t0 + ty + 16 * i;
+        const unsigned int t = t0 + (i / 4) * 64 + ty * 4 + i % 4;
         if (t >= n_tokens)
         {
             continue;
         }
 #pragma unroll
-        for (int j = 0; j < 4; ++j)
+        for (int h = 0; h < 2; ++h)
         {
-            const unsigned int o = panel0 * PANEL + tx + 16 * j;
+            const unsigned int o = panel0 * PANEL + h * 64 + tx * 4;
             if (o >= n_out)
             {
                 continue;
             }
-            float v = acc[i][j];
+            float4 v = make_float4(acc[i][h * 4], acc[i][h * 4 + 1], acc[i][h * 4 + 2], acc[i][h * 4 + 3]);
             if (bias != 0)
             {
-                v = v + bias[o];
+                const float4 bv = *(const float4*)(bias + o);
+                v.x = v.x + bv.x;
+                v.y = v.y + bv.y;
+                v.z = v.z + bv.z;
+                v.w = v.w + bv.w;
             }
-            float* dst = out + (size_t)t * out_stride + o;
-            *dst = accumulate ? *dst + v : v;
+            float4* dst = (float4*)(out + (size_t)t * out_stride + o);
+            if (accumulate)
+            {
+                const float4 d = *dst;
+                v.x = d.x + v.x;
+                v.y = d.y + v.y;
+                v.z = d.z + v.z;
+                v.w = d.w + v.w;
+            }
+            *dst = v;
         }
     }
 }
