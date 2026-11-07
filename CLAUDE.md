@@ -574,8 +574,11 @@ top. No third party dependencies. Owner: Luís (akadjoker). "faisca" is a workin
    the CPU pool): chair.png 256^3 load 3.4 s, image to triplane 0.49 s,
    mesh 0.70 s, 84160 faces, render (ref/triposr/out/chair_cuda_compare.png)
    same shape and colours as the reference; the CPU path takes 2.0 + 11.4 +
-   10.5 s. Next: the load time (packing plus 1.68 GB upload), then CPU
-   cache tuning.
+   10.5 s. Load, timed by part: checkpoint mmap 0.005 s, packing 1.4-2.3 s
+   (one thread), CUDA init 0.3 s (2.2 s when the GPU was idle), upload
+   0.24-0.32 s. TripoModel::open now takes the pool and packs panels in
+   parallel: open 0.24-0.99 s (background load), outputs identical.
+   Next: CPU cache tuning.
 
 OmniDreams (NVIDIA video world model) is an exploration, not a plan step:
 read docs/omnidreams_handoff.md first, then docs/omnidreams.md.

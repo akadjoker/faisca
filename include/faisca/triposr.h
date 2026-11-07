@@ -103,7 +103,8 @@ public:
     TripoModel(const TripoModel&) = delete;
     TripoModel& operator=(const TripoModel&) = delete;
 
-    bool open(const char* path, Error& error);
+    // pool packs the linear layers into panels
+    bool open(const char* path, ThreadPool& pool, Error& error);
 
     const TripoVitLayer& vit_layer(uint32_t index) const
     {
@@ -219,7 +220,7 @@ private:
     const float* f32(const char* name, uint64_t d0, uint64_t d1, uint64_t d2, uint64_t d3, Error& error);
     bool linear(const char* name, uint64_t n_out, uint64_t n_in, TripoLinear& w, const float** bias, Error& error);
     void add_linear(const float* rows, size_t n_out, size_t n_in, TripoLinear& w);
-    bool pack_linears(Error& error);
+    bool pack_linears(ThreadPool& pool, Error& error);
 
     static constexpr size_t MAX_LINEARS = 256;
     struct Pending

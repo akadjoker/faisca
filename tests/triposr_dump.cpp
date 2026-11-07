@@ -160,26 +160,26 @@ int main(int argc, char** argv)
     }
 
     faisca::Error error;
+    faisca::ThreadPool pool;
+    if (!pool.start(threads, error))
+    {
+        std::fprintf(stderr, "error: %s\n", error.c_str());
+        return 1;
+    }
     auto start = std::chrono::steady_clock::now();
     faisca::TripoModel model;
-    if (!model.open(argv[1], error))
+    if (!model.open(argv[1], pool, error))
     {
         std::fprintf(stderr, "error: %s\n", error.c_str());
         return 1;
     }
     std::fprintf(stderr, "open %.3f s\n", seconds_since(start));
 
-    faisca::ThreadPool pool;
     faisca::TripoRunner cpu;
 #if defined(FAISCA_CUDA)
     faisca::CudaDevice device;
     faisca::TripoCudaRunner gpu;
 #endif
-    if (!pool.start(threads, error))
-    {
-        std::fprintf(stderr, "error: %s\n", error.c_str());
-        return 1;
-    }
     if (use_cuda)
     {
 #if defined(FAISCA_CUDA)

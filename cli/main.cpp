@@ -1460,7 +1460,7 @@ int command_mesh(int argc, char** argv)
     faisca::Array<float> rgb;
     faisca::TripoMesh mesh;
     const auto t0 = std::chrono::steady_clock::now();
-    bool ok = model.open(positional[0], error) && pool.start(threads, error);
+    bool ok = pool.start(threads, error) && model.open(positional[0], pool, error);
 #if defined(FAISCA_CUDA)
     ok = ok && (cuda ? device.init(error) && gpu.init(model, device, pool, error) : runner.init(model, pool, error));
 #else

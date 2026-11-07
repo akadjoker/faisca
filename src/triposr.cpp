@@ -122,7 +122,7 @@ void TripoModel::add_linear(const float* rows, size_t n_out, size_t n_in, TripoL
     m_n_pending += 1;
 }
 
-bool TripoModel::pack_linears(Error& error)
+bool TripoModel::pack_linears(ThreadPool& pool, Error& error)
 {
     if (m_n_pending > MAX_LINEARS)
     {
@@ -149,8 +149,16 @@ bool TripoModel::pack_linears(Error& error)
     for (size_t i = 0; i < m_n_pending; ++i)
     {
         TripoLinear& w = *m_pending[i].linear;
-        pack_f32_panels(m_pending[i].rows, w.n_in, w.n_out, m_panels.data() + offset);
-        w.panels = m_panels.data() + offset;
+        const float* rows = m_pending[i].rows;
+        float* out = m_panels.data() + offset;
+        const size_t n_in = w.n_in;
+        parallel_dynamic(pool, w.n_out / F32_PANEL, 4,
+                         [&](size_t first, size_t last, int)
+                         {
+                             pack_f32_panels(rows + first * F32_PANEL * n_in, n_in, (last - first) * F32_PANEL,
+                                             out + first * F32_PANEL * n_in);
+                         });
+        w.panels = out;
         offset += w.n_in * w.n_out;
     }
     m_n_pending = 0;
@@ -176,7 +184,7 @@ bool TripoModel::linear(const char* name, uint64_t n_out, uint64_t n_in, TripoLi
     return true;
 }
 
-bool TripoModel::open(const char* path, Error& error)
+bool TripoModel::open(const char* path, ThreadPool& pool, Error& error)
 {
     if (!m_file.open(path, error))
     {
@@ -325,7 +333,7 @@ bool TripoModel::open(const char* path, Error& error)
     add_linear(m_mlp_last.data(), F32_PANEL, MLP_WIDTH, m_mlp[MLP_LAYERS - 1]);
     m_mlp_b[MLP_LAYERS - 1] = m_mlp_last.data() + F32_PANEL * MLP_WIDTH;
 
-    if (!pack_linears(error))
+    if (!pack_linears(pool, error))
     {
         return false;
     }
