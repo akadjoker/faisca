@@ -5,8 +5,11 @@ CosmosDiTNetwork.forward (FlashDreams integrations_v2/omnidreams/impl/transforme
 dit_block_reference.py, the self attention caches with FlashDreams' own BlockKVCache
 (flashdreams/core/attention/kvcache.py, loaded from its file) and 3 passes per chunk on the same
 chunk index (timesteps 1000, 500, 128 as the distilled sampler, docs/omnidreams.md).
-Runs in float64 (the reference) and bfloat16; writes the weights, inputs and outputs.
-Usage: dit_network_reference.py <flashdreams dir> <out dir> [T H W blocks window_chunks chunks]"""
+Runs in float64 (the reference) and bfloat16; writes the weights, inputs and outputs. With
+--checkpoint <.pt> the weights are the real ones (all 28 blocks, float64 on the CPU, the two
+update_parameters_after_loading_checkpoint changes applied) and are not written out.
+Usage: dit_network_reference.py <flashdreams dir> <out dir> [T H W blocks window_chunks chunks]
+       [--checkpoint <.pt>]"""
 import importlib.util
 import math
 import os
@@ -16,8 +19,15 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+checkpoint = None
+if "--checkpoint" in sys.argv:
+    at = sys.argv.index("--checkpoint")
+    checkpoint = sys.argv[at + 1]
+    del sys.argv[at:at + 2]
 flashdreams, folder = sys.argv[1], sys.argv[2]
 T, H, W, BLOCKS, WINDOW, CHUNKS = (int(v) for v in sys.argv[3:9]) if len(sys.argv) >= 9 else (2, 16, 24, 2, 3, 5)
+if checkpoint is not None:
+    BLOCKS = 28
 spec = importlib.util.spec_from_file_location(
     "kvcache", f"{flashdreams}/flashdreams/flashdreams/core/attention/kvcache.py")
 kvcache = importlib.util.module_from_spec(spec)
@@ -53,7 +63,7 @@ weights = {
     "final_mod_down": linear(LORA, D), "final_mod_up": linear(2 * D, LORA), "final_linear": linear(64, D),
     "text_proj": linear(TEXT_W, TEXT_IN), "text_proj_bias": normal(TEXT_W, std=0.02),
 }
-for b in range(BLOCKS):
+for b in range(BLOCKS if checkpoint is None else 0):
     weights.update({
         f"b{b}_self_q": linear(D, D), f"b{b}_self_k": linear(D, D), f"b{b}_self_v": linear(D, D),
         f"b{b}_self_out": linear(D, D),
@@ -66,6 +76,33 @@ for b in range(BLOCKS):
     for branch in range(3):
         weights[f"b{b}_mod_down{branch}"] = linear(LORA, D)
         weights[f"b{b}_mod_up{branch}"] = linear(3 * D, LORA)
+if checkpoint is not None:
+    sd = torch.load(checkpoint, map_location="cpu", weights_only=True, mmap=True)
+    g = lambda name: sd[name].to(torch.float64)
+    final = g("final_layer.linear.weight")
+    weights = {
+        "x_embedder": g("x_embedder.proj.1.weight")[:, :68],
+        "hdmap_embedder": g("additional_patch_embedding.proj.1.weight"),
+        "t_linear1": g("t_embedder.1.linear_1.weight"), "t_linear2": g("t_embedder.1.linear_2.weight"),
+        "t_norm": g("t_embedding_norm.weight"),
+        "final_mod_down": g("final_layer.adaln_modulation.1.weight"),
+        "final_mod_up": g("final_layer.adaln_modulation.2.weight"),
+        # network.py _fuse_shuffle_op_into_last_layer: (kt kh kw c) -> (c kt kh kw)
+        "final_linear": final.view(4, 16, D).transpose(0, 1).reshape(64, D),
+        "text_proj": g("crossattn_proj.0.weight"), "text_proj_bias": g("crossattn_proj.0.bias"),
+    }
+    names = {"self_q": "self_attn.q_proj", "self_k": "self_attn.k_proj", "self_v": "self_attn.v_proj",
+             "self_out": "self_attn.output_proj", "self_q_norm": "self_attn.q_norm", "self_k_norm": "self_attn.k_norm",
+             "cross_q": "cross_attn.q_proj", "cross_k": "cross_attn.k_proj", "cross_v": "cross_attn.v_proj",
+             "cross_out": "cross_attn.output_proj", "cross_q_norm": "cross_attn.q_norm",
+             "cross_k_norm": "cross_attn.k_norm", "mlp_up": "mlp.layer1", "mlp_down": "mlp.layer2"}
+    for b in range(BLOCKS):
+        for ours, theirs in names.items():
+            weights[f"b{b}_{ours}"] = g(f"blocks.{b}.{theirs}.weight")
+        for i, branch in enumerate(("self_attn", "cross_attn", "mlp")):
+            weights[f"b{b}_mod_down{i}"] = g(f"blocks.{b}.adaln_modulation_{branch}.1.weight")
+            weights[f"b{b}_mod_up{i}"] = g(f"blocks.{b}.adaln_modulation_{branch}.2.weight")
+    del sd
 text = normal(TEXT, TEXT_IN)
 passes = []
 for chunk in range(CHUNKS):
@@ -118,9 +155,10 @@ def attention(q, k, v):
 
 
 def run(dtype):
-    w = {name: value.cuda().to(dtype) for name, value in weights.items()}
+    device = "cpu" if checkpoint is not None and dtype == torch.float64 else "cuda"
+    w = {name: value.to(device).to(dtype) for name, value in weights.items()}
     rms = lambda t, g: F.rms_norm(t, (t.shape[-1],), g, eps=1e-6)
-    context = F.gelu(text.cuda().to(dtype) @ w["text_proj"].T + w["text_proj_bias"])
+    context = F.gelu(text.to(device).to(dtype) @ w["text_proj"].T + w["text_proj_bias"])
     text_kv = []
     caches = []
     for b in range(BLOCKS):
@@ -128,16 +166,16 @@ def run(dtype):
         text_kv.append((k, (context @ w[f"b{b}_cross_v"].T).view(TEXT, HEADS, HEAD)))
         caches.append(kvcache.BlockKVCache(k_shape=(WINDOW * L, HEADS, HEAD), v_shape=(WINDOW * L, HEADS, HEAD),
                                            seq_dim=0, chunk_size=L, window_size=WINDOW * L, sink_size=0,
-                                           device="cuda", dtype=dtype))
+                                           device=device, dtype=dtype))
     outputs = []
     for chunk, timestep, tokens, hdmap in passes:
         angles = angles_for(chunk)
         ts = torch.tensor(timestep * 0.001, dtype=torch.float64)
-        arg = (ts * timestep_freqs.double()).cuda().to(dtype)
+        arg = (ts * timestep_freqs.double()).to(device).to(dtype)
         sinusoid = torch.cat([torch.cos(arg), torch.sin(arg)])
         lora = F.silu(sinusoid @ w["t_linear1"].T) @ w["t_linear2"].T
         t_emb = rms(sinusoid, w["t_norm"])
-        x = tokens.cuda().to(dtype) @ w["x_embedder"].T + hdmap.cuda().to(dtype) @ w["hdmap_embedder"].T
+        x = tokens.to(device).to(dtype) @ w["x_embedder"].T + hdmap.to(device).to(dtype) @ w["hdmap_embedder"].T
         for cache in caches:
             cache.before_update(chunk)
         for b in range(BLOCKS):
@@ -175,7 +213,7 @@ for i, ((chunk, timestep, _, _), r, o) in enumerate(zip(passes, reference, low))
     r.numpy().tofile(f"{folder}/reference_{i}.f64")
     o.float().numpy().tofile(f"{folder}/torch_bf16_{i}.f32")
 
-for name, value in weights.items():
+for name, value in (weights.items() if checkpoint is None else ()):
     value.to(torch.bfloat16).view(torch.int16).numpy().tofile(f"{folder}/{name}.bf16")
 text.to(torch.bfloat16).view(torch.int16).numpy().tofile(f"{folder}/text.bf16")
 with open(f"{folder}/passes.txt", "w") as f:

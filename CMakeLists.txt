@@ -73,6 +73,7 @@ add_library(faisca_lib STATIC
     src/pocket_runner.cpp
     src/torch_ckpt.cpp
     src/triposr.cpp
+    src/omnidreams.cpp
 )
 find_package(Threads REQUIRED)
 target_link_libraries(faisca_lib PUBLIC Threads::Threads)

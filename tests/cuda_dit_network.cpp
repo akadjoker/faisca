@@ -1,6 +1,7 @@
 // DitCudaRunner over tests/dit_network_reference.py's passes (several chunks, 3 timesteps each,
 // the self attention window rolling), against its float64 run, next to PyTorch's bf16 run.
-// Usage: cuda_dit_network <reference dir>
+// Usage: cuda_dit_network <reference dir> [--checkpoint <.pt>]
+#include "faisca/omnidreams.h"
 #include "faisca/omnidreams_cuda.h"
 
 #include <chrono>
@@ -52,9 +53,15 @@ int main(int argc, char** argv)
     const size_t D = faisca::DIT_WIDTH;
 
     std::vector<std::vector<uint16_t>> storage;
+    const bool from_checkpoint = argc >= 4 && std::string(argv[2]) == "--checkpoint";
     storage.reserve(64 + 24 * blocks);
     const auto load = [&](const std::string& name, size_t count) -> const uint16_t* {
         storage.emplace_back();
+        if (from_checkpoint)
+        {
+            storage.back().resize(1);
+            return storage.back().data();
+        }
         return read_file(dir + name + ".bf16", storage.back(), count) ? storage.back().data() : nullptr;
     };
     faisca::DitHostWeights weights = {};
@@ -97,6 +104,19 @@ int main(int argc, char** argv)
     for (const auto& s : storage)
     {
         ok = ok && !s.empty();
+    }
+    faisca::DitCheckpoint checkpoint;
+    if (argc >= 4 && std::string(argv[2]) == "--checkpoint")
+    {
+        faisca::Error load_error;
+        if (!checkpoint.open(argv[3], load_error))
+        {
+            std::printf("cuda_dit_network: %s\n", load_error.message);
+            return 1;
+        }
+        weights = checkpoint.weights();
+        weights.block_count = blocks;
+        ok = true;
     }
     std::vector<uint16_t> text;
     ok = ok && read_file(dir + "text.bf16", text, size_t(512) * 100352);

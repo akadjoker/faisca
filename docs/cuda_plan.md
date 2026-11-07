@@ -563,7 +563,20 @@ original BlockKVCache class (loaded from kvcache.py) over 5 chunks x 3
 timesteps (1000, 500, 128), 2 blocks, 2 x 16 x 24 tokens, window 3 chunks;
 tests/cuda_dit_network: every pass 1.68-1.71e-3 from float64 against PyTorch
 bf16's 6.38-6.50e-3, the passes after the window rolls (chunks 3, 4) included.
-Next: the checkpoint (torch_ckpt.h) into DitHostWeights, then fitting 8 GB.
+DitCheckpoint (include/faisca/omnidreams.h, src/omnidreams.cpp) maps the real
+checkpoint (huggingface.co/nvidia/omni-dreams-models single_view/
+2b_res720p_30fps_i2v_hdmap_distilled.pt, sha256 c7cb6f0c...dd62f, 570 bf16
+tensors) through torch_ckpt.h, x_embedder trimmed to 68 columns and
+final_layer.linear's rows reordered as update_parameters_after_loading_checkpoint
+does. With it, all 28 blocks, 2 x 16 x 24 tokens, window 3 chunks, 4 chunks x 3
+timesteps against the float64 run of the same weights on the CPU
+(dit_network_reference.py --checkpoint): ours 2.6-5.2e-3 per pass, PyTorch bf16
+1.1-2.2e-2; 113-143 ms per pass at 768 tokens.
+Memory at the real size (7040 tokens, window 21120): block weights 3.64 GB,
+caches 4.84 GB, text projection 0.2 GB, activations ~0.4 GB: ~9.1 GB, over the
+~7.6 GB free. Next: stream the block weights from pinned host memory on a
+second stream, two block buffers (130 MB, ~11 ms at PCIe speed against 56-90 ms
+of compute per block), lossless.
 
 ## Phase 5 and exclusions
 
