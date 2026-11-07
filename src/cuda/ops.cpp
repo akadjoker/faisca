@@ -74,6 +74,9 @@ bool CudaKernels::init(CudaDevice& device, Error& error)
         !device.load_module(ptx_gemm_q8_0, m_gemm_module, error) ||
         !device.find_kernel(m_gemm_module, "quantize_q8_0", m_quantize_q8_0, error) ||
         !device.find_kernel(m_gemm_module, "gemm_q8_0", m_gemm_q8_0, error) ||
+        !device.load_module(ptx_gemm_f16, m_gemm_f16_module, error) ||
+        !device.find_kernel(m_gemm_f16_module, "gemm_f16", m_gemm_f16, error) ||
+        !device.find_kernel(m_gemm_f16_module, "gemm_bf16", m_gemm_bf16, error) ||
         !device.load_module(ptx_add, m_add_module, error) ||
         !device.find_kernel(m_add_module, "add", m_add, error))
     {
@@ -98,6 +101,7 @@ void CudaKernels::release()
         m_device->destroy_module(m_swiglu_module, ignored);
         m_device->destroy_module(m_add_module, ignored);
         m_device->destroy_module(m_gemm_module, ignored);
+        m_device->destroy_module(m_gemm_f16_module, ignored);
     }
     m_matvec_f32_module = CudaModule();
     m_matvec_f32 = CudaKernel();
@@ -130,6 +134,9 @@ void CudaKernels::release()
     m_gemm_module = CudaModule();
     m_quantize_q8_0 = CudaKernel();
     m_gemm_q8_0 = CudaKernel();
+    m_gemm_f16_module = CudaModule();
+    m_gemm_f16 = CudaKernel();
+    m_gemm_bf16 = CudaKernel();
     m_add = CudaKernel();
     m_device = nullptr;
 }
@@ -519,6 +526,25 @@ bool CudaKernels::gemm_q8_0(const CudaBuffer& weight, const CudaBuffer& quants, 
     launch.grid_x = (n_out + 63) / 64;
     launch.grid_y = (n_tokens + 63) / 64;
     return m_device->launch(m_gemm_q8_0, stream, launch, arguments, error);
+}
+
+bool CudaKernels::gemm_f16(const CudaBuffer& input, const CudaBuffer& weight, const CudaBuffer& output, uint32_t m,
+                           uint32_t n, uint32_t k, bool bf16, const CudaStream& stream, Error& error)
+{
+    if (m_device == nullptr || m == 0 || n == 0 || n % 8 != 0 || k == 0 || k % 32 != 0 ||
+        input.bytes < static_cast<size_t>(m) * k * 2 || weight.bytes < static_cast<size_t>(n) * k * 2 ||
+        output.bytes < static_cast<size_t>(m) * n * 4)
+    {
+        error.set("invalid CUDA f16 GEMM dimensions or buffer size");
+        return false;
+    }
+    uint64_t addresses[] = {input.address, weight.address, output.address};
+    void* arguments[] = {&addresses[0], &addresses[1], &addresses[2], &m, &n, &k};
+    CudaLaunch launch;
+    launch.grid_x = (n + 127) / 128;
+    launch.grid_y = (m + 127) / 128;
+    launch.block_x = 128;
+    return m_device->launch(bf16 ? m_gemm_bf16 : m_gemm_f16, stream, launch, arguments, error);
 }
 
 }

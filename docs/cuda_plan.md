@@ -494,6 +494,22 @@ crosses Gemma's sliding-window boundary. Record peak memory and speed.
 Gate: reference checks pass and measured prompt performance is recorded.
 Retain the validated generation kernels and a path for unsupported hardware.
 
+### f16 / bf16 tensor-core GEMM (2026-11-07, for the OmniDreams DiT)
+
+gemm_f16 / gemm_bf16 (src/cuda/kernels/gemm_f16.cu): mma.sync m16n8k16 with
+f32 accumulation (instruction strings from CUTLASS arch/mma_sm80.h:385, 452),
+CUTLASS's Sm80 tensor op tiling (default_gemm_configuration.h:461, 128x256x64,
+3 stages) cut to 128x128x32 so 3 stages fit 48 KB of static shared memory,
+ldmatrix.x4 on flash-attention's Swizzle<2, 3, 3> (kernel_traits.h,
+kBlockKSmem == 32). tests/cuda_gemm_f16: against a double reference over the
+same halves, worst |error| / sum |products| 6.4e-7 at k = 2048 (bound
+k * 2^-24). On the DiT shapes (7040 tokens, 2048 x 2048, 6144, 8192 and
+8192 -> 2048), interleaved with PyTorch 2.11 (cuBLAS, f32 out): 22-31 TFLOPS
+against 24-27, both at the tensor core peak of this card (512 f16 FLOP per
+clock per SM with f32 accumulation, 24 SMs at 2.0-2.5 GHz: 24.6-30.7), so
+the spread is the clock. Faster than this only with FP8 (twice the rate on
+Ada), which FlashDreams uses for the DiT.
+
 ## Phase 5 and exclusions
 
 MoE GPU work waits for a CPU MoE implementation validated against llama.cpp.

@@ -79,6 +79,10 @@ public:
     bool gemm_q8_0(const CudaBuffer& weight, const CudaBuffer& quants, const CudaBuffer& scales,
                    uint32_t token_stride, const CudaBuffer& output, uint32_t n_in, uint32_t n_out,
                    uint32_t n_tokens, const CudaStream& stream, Error& error, bool accumulate = false);
+    // output[m][n] = sum_k input[m][k] * weight[n][k] on the f16 (or bf16) tensor cores with f32
+    // accumulation; input and weight hold halves, k a multiple of 32, n a multiple of 8.
+    bool gemm_f16(const CudaBuffer& input, const CudaBuffer& weight, const CudaBuffer& output, uint32_t m,
+                  uint32_t n, uint32_t k, bool bf16, const CudaStream& stream, Error& error);
 
 private:
     CudaDevice* m_device = nullptr;
@@ -114,6 +118,9 @@ private:
     CudaModule m_gemm_module;
     CudaKernel m_quantize_q8_0;
     CudaKernel m_gemm_q8_0;
+    CudaModule m_gemm_f16_module;
+    CudaKernel m_gemm_f16;
+    CudaKernel m_gemm_bf16;
 };
 
 }
