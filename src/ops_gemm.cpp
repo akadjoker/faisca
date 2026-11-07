@@ -52,10 +52,11 @@ namespace
 
 constexpr size_t ROWS = 6;
 
-// rows tokens of a, packed [k][ROWS], times one panel of 16 outputs; named accumulators,
-// an array of them makes GCC store all twelve to the stack on every k
-template <int rows>
-void gemm_panel(const float* panel, size_t n_in, const float* a, float* out, size_t out_stride)
+// rows tokens of a times one panel of 16 outputs: a packed [k][ROWS], or with direct the
+// token rows themselves, a_stride apart; named accumulators, an array of them makes GCC
+// store all twelve to the stack on every k
+template <int rows, bool direct>
+void gemm_panel(const float* panel, size_t n_in, const float* a, size_t a_stride, float* out, size_t out_stride)
 {
     __m256 c00 = _mm256_setzero_ps(), c01 = _mm256_setzero_ps();
     __m256 c10 = _mm256_setzero_ps(), c11 = _mm256_setzero_ps();
@@ -67,37 +68,38 @@ void gemm_panel(const float* panel, size_t n_in, const float* a, float* out, siz
     {
         const __m256 w0 = _mm256_loadu_ps(panel + k * F32_PANEL);
         const __m256 w1 = _mm256_loadu_ps(panel + k * F32_PANEL + 8);
-        const float* ak = a + k * ROWS;
+        const float* ak = direct ? a + k : a + k * ROWS;
+        const size_t step = direct ? a_stride : 1;
         __m256 x = _mm256_broadcast_ss(ak + 0);
         c00 = _mm256_fmadd_ps(x, w0, c00);
         c01 = _mm256_fmadd_ps(x, w1, c01);
         if constexpr (rows > 1)
         {
-            x = _mm256_broadcast_ss(ak + 1);
+            x = _mm256_broadcast_ss(ak + 1 * step);
             c10 = _mm256_fmadd_ps(x, w0, c10);
             c11 = _mm256_fmadd_ps(x, w1, c11);
         }
         if constexpr (rows > 2)
         {
-            x = _mm256_broadcast_ss(ak + 2);
+            x = _mm256_broadcast_ss(ak + 2 * step);
             c20 = _mm256_fmadd_ps(x, w0, c20);
             c21 = _mm256_fmadd_ps(x, w1, c21);
         }
         if constexpr (rows > 3)
         {
-            x = _mm256_broadcast_ss(ak + 3);
+            x = _mm256_broadcast_ss(ak + 3 * step);
             c30 = _mm256_fmadd_ps(x, w0, c30);
             c31 = _mm256_fmadd_ps(x, w1, c31);
         }
         if constexpr (rows > 4)
         {
-            x = _mm256_broadcast_ss(ak + 4);
+            x = _mm256_broadcast_ss(ak + 4 * step);
             c40 = _mm256_fmadd_ps(x, w0, c40);
             c41 = _mm256_fmadd_ps(x, w1, c41);
         }
         if constexpr (rows > 5)
         {
-            x = _mm256_broadcast_ss(ak + 5);
+            x = _mm256_broadcast_ss(ak + 5 * step);
             c50 = _mm256_fmadd_ps(x, w0, c50);
             c51 = _mm256_fmadd_ps(x, w1, c51);
         }
@@ -110,15 +112,56 @@ void gemm_panel(const float* panel, size_t n_in, const float* a, float* out, siz
     }
 }
 
+template <bool direct>
+void gemm_rows(const float* panels, size_t n_in, const float* a, size_t a_stride, size_t rows, size_t first,
+               size_t last, float* out, size_t out_stride)
+{
+    for (size_t o = first; o < last; o += F32_PANEL)
+    {
+        const float* panel = panels + (o / F32_PANEL) * n_in * F32_PANEL;
+        switch (rows)
+        {
+        case 6:
+            gemm_panel<6, direct>(panel, n_in, a, a_stride, out + o, out_stride);
+            break;
+        case 5:
+            gemm_panel<5, direct>(panel, n_in, a, a_stride, out + o, out_stride);
+            break;
+        case 4:
+            gemm_panel<4, direct>(panel, n_in, a, a_stride, out + o, out_stride);
+            break;
+        case 3:
+            gemm_panel<3, direct>(panel, n_in, a, a_stride, out + o, out_stride);
+            break;
+        case 2:
+            gemm_panel<2, direct>(panel, n_in, a, a_stride, out + o, out_stride);
+            break;
+        default:
+            gemm_panel<1, direct>(panel, n_in, a, a_stride, out + o, out_stride);
+            break;
+        }
+    }
 }
 
+}
+
+// up to 8 panels the packed copy of x costs more than the strided broadcasts it saves
+// (perf stat cycles on one P core: 13.5-14.2 MAC/cycle against 12.4-13.0 at 64 outputs,
+// even at 128, packed ahead from 256)
 void gemm_f32_packed(const float* panels, size_t n_in, const float* x, size_t x_stride, size_t n_tokens, size_t first,
                      size_t last, float* out, size_t out_stride, float* scratch)
 {
+    const bool direct = last - first <= 8 * F32_PANEL;
     for (size_t t = 0; t < n_tokens; t += ROWS)
     {
         const size_t rows = n_tokens - t < ROWS ? n_tokens - t : ROWS;
         const float* xt = x + t * x_stride;
+        float* ot = out + t * out_stride;
+        if (direct)
+        {
+            gemm_rows<true>(panels, n_in, xt, x_stride, rows, first, last, ot, out_stride);
+            continue;
+        }
         for (size_t k = 0; k < n_in; ++k)
         {
             for (size_t r = 0; r < rows; ++r)
@@ -126,32 +169,7 @@ void gemm_f32_packed(const float* panels, size_t n_in, const float* x, size_t x_
                 scratch[k * ROWS + r] = xt[r * x_stride + k];
             }
         }
-        float* ot = out + t * out_stride;
-        for (size_t o = first; o < last; o += F32_PANEL)
-        {
-            const float* panel = panels + (o / F32_PANEL) * n_in * F32_PANEL;
-            switch (rows)
-            {
-            case 6:
-                gemm_panel<6>(panel, n_in, scratch, ot + o, out_stride);
-                break;
-            case 5:
-                gemm_panel<5>(panel, n_in, scratch, ot + o, out_stride);
-                break;
-            case 4:
-                gemm_panel<4>(panel, n_in, scratch, ot + o, out_stride);
-                break;
-            case 3:
-                gemm_panel<3>(panel, n_in, scratch, ot + o, out_stride);
-                break;
-            case 2:
-                gemm_panel<2>(panel, n_in, scratch, ot + o, out_stride);
-                break;
-            default:
-                gemm_panel<1>(panel, n_in, scratch, ot + o, out_stride);
-                break;
-            }
-        }
+        gemm_rows<false>(panels, n_in, scratch, ROWS, rows, first, last, ot, out_stride);
     }
 }
 

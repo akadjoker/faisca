@@ -594,8 +594,12 @@ top. No third party dependencies. Owner: Luís (akadjoker). "faisca" is a workin
    session: Xorg, editors, Defender). Bias and SiLU fused in one pass
    (bias_silu_rows, same operations): the 38 CPU outputs bit identical,
    mesh 256^3 6.26 -> 5.95 s interleaved (4 of 4 pairs, load average
-   10-24). Next: the triplane scaling on a quiet machine, then the x
-   transpose ahead of the GEMM.
+   10-24). gemm_f32_packed broadcasts straight from the x rows when the
+   slice has at most 8 panels (same FMA order, outputs bit identical):
+   perf stat cycles at 1020 x 64 x 64, P core 12.4 -> 13.5 MAC/cycle,
+   E core 6.35 -> 6.87; packed stays ahead from 256 outputs; mesh 5.95 ->
+   5.80 s in 3 of 4 interleaved pairs (load average 26). Next: the
+   triplane scaling on a quiet machine.
 
 OmniDreams (NVIDIA video world model) is an exploration, not a plan step:
 read docs/omnidreams_handoff.md first, then docs/omnidreams.md.
