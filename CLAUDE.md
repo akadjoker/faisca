@@ -585,8 +585,14 @@ top. No third party dependencies. Owner: Luís (akadjoker). "faisca" is a workin
    per value against 0.33). exp_avx2 now feeds 0 to the lanes its keep mask
    zeroes: same bits (38 CPU traces identical), mesh 256^3 5.3-5.9 s ->
    3.9-4.7 s interleaved. exp_avx512 (scalef, no mask) not checked: no
-   AVX-512 on this CPU. Next: the MLP GEMM (64 x 64 layers) and CPU cache
-   tuning of the big GEMMs.
+   AVX-512 on this CPU. gemm_f32_packed alone on one P core (perf stat
+   cycles): 12.4 MAC/cycle at 1024 x 64 x 64 (the MLP), 12.8 at 120 x 64,
+   13.2 at 192 x 1024 x 1024 (peak 16), so the kernel is not the limit;
+   after the exp fix the mesh profile is GEMM 66%, exp 11%, the SiLU and
+   bias passes ~9%, the x transpose 4.5%. Thread scaling of the triplane
+   still to measure on a quiet machine (load average 8-14 during this
+   session: Xorg, editors, Defender). Next: SiLU fused with the bias in
+   one pass (same operations), then the triplane scaling.
 
 OmniDreams (NVIDIA video world model) is an exploration, not a plan step:
 read docs/omnidreams_handoff.md first, then docs/omnidreams.md.
