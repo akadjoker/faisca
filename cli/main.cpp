@@ -7,6 +7,9 @@
 #if defined(FAISCA_VULKAN)
 #include "faisca/vulkan_runner.h"
 #endif
+#if defined(FAISCA_CUDA)
+#include "faisca/cuda_runner.h"
+#endif
 #include "faisca/tokenizer.h"
 #include "faisca/audio.h"
 #include "faisca/whisper_model.h"
@@ -40,7 +43,7 @@ void print_usage()
         "  faisca info <model.gguf> [--meta] [--tensors]\n"
         "  faisca chat <model.gguf> [-n <tokens>] [-c <context>] [-t <threads>] [--session <file>] [--kv-f32]\n"
         "  faisca generate <model.gguf> -p <prompt> [-n <tokens>] [-c <context>] [-t <threads>] [--raw] [--f32] [--kv-f32]\n"
-        "                                [--draft <draft.gguf>] [--draft-n <tokens>] [--vulkan]\n"
+        "                                [--draft <draft.gguf>] [--draft-n <tokens>] [--vulkan | --cuda]\n"
         "  faisca transcribe <model.bin> <audio.wav> [--language <code>] [-t <threads>] [--f32]\n"
         "  faisca describe <model.gguf> <mmproj.gguf> <image> [-p <prompt>] [-n <tokens>] [-c <context>] [-t <threads>]\n"
         "                                [--f32] [--kv-f32]\n"
@@ -61,6 +64,7 @@ void print_usage()
         "  --draft     a smaller model of the same vocabulary that proposes tokens (speculative decoding)\n"
         "  --draft-n   tokens proposed per round, default 3\n"
         "  --vulkan    run on the Vulkan device instead of the CPU (float32 activations, no draft)\n"
+        "  --cuda      run on NVIDIA CUDA (Llama, F32/F16/Q8_0 weights, float32 cache, no draft)\n"
         "\n"
         "chat reads one user message per line from standard input and keeps the conversation in the\n"
         "KV cache between turns; --session loads the conversation from the file if it exists and\n"
@@ -511,6 +515,7 @@ int command_generate(int argc, char** argv)
     const char* draft_path = nullptr;
     int draft_n = 3;
     bool vulkan = false;
+    bool cuda = false;
 
     for (int i = 2; i < argc; ++i)
     {
@@ -554,6 +559,10 @@ int command_generate(int argc, char** argv)
         {
             vulkan = true;
         }
+        else if (std::strcmp(argv[i], "--cuda") == 0)
+        {
+            cuda = true;
+        }
         else if (argv[i][0] == '-' && argv[i][1] != '\0')
         {
             std::fprintf(stderr, "faisca: unknown option '%s'\n", argv[i]);
@@ -581,15 +590,28 @@ int command_generate(int argc, char** argv)
         return 2;
     }
 
-    if (vulkan && draft_path != nullptr)
+    if (vulkan && cuda)
     {
-        std::fprintf(stderr, "faisca: --draft is not available with --vulkan\n");
+        std::fprintf(stderr, "faisca: choose --vulkan or --cuda, not both\n");
+        return 2;
+    }
+    if ((vulkan || cuda) && draft_path != nullptr)
+    {
+        std::fprintf(stderr, "faisca: --draft is not available with a GPU backend\n");
         return 2;
     }
 #if !defined(FAISCA_VULKAN)
     if (vulkan)
     {
         std::fprintf(stderr, "faisca: built without the Vulkan backend\n");
+        return 1;
+    }
+#endif
+
+#if !defined(FAISCA_CUDA)
+    if (cuda)
+    {
+        std::fprintf(stderr, "faisca: built without the CUDA backend\n");
         return 1;
     }
 #endif
@@ -603,6 +625,10 @@ int command_generate(int argc, char** argv)
 #if defined(FAISCA_VULKAN)
     VulkanDevice device;
     VulkanRunner vulkan_runner;
+#endif
+#if defined(FAISCA_CUDA)
+    CudaDevice cuda_device;
+    CudaRunner cuda_runner;
 #endif
 
     const auto load_start = std::chrono::steady_clock::now();
@@ -618,7 +644,15 @@ int command_generate(int argc, char** argv)
         return 1;
     }
 #endif
-    if (!vulkan && (!pool.start(threads, error) || !model.load(file, error, dequantize, &pool) ||
+#if defined(FAISCA_CUDA)
+    if (cuda && (!cuda_device.init(error) ||
+                 !cuda_runner.init(cuda_device, file, static_cast<uint32_t>(context), error, dequantize, kv_f16)))
+    {
+        std::fprintf(stderr, "faisca: %s\n", error.c_str());
+        return 1;
+    }
+#endif
+    if (!vulkan && !cuda && (!pool.start(threads, error) || !model.load(file, error, dequantize, &pool) ||
                     !runner.init(model, static_cast<uint32_t>(context), pool, error, kv_f16)))
     {
         std::fprintf(stderr, "faisca: %s\n", error.c_str());
@@ -626,6 +660,12 @@ int command_generate(int argc, char** argv)
     }
     const auto run_forward = [&](const int32_t* ids, size_t n, Array<float>& out) -> bool
     {
+#if defined(FAISCA_CUDA)
+        if (cuda)
+        {
+            return cuda_runner.forward(ids, n, out, error);
+        }
+#endif
 #if defined(FAISCA_VULKAN)
         if (vulkan)
         {
@@ -738,13 +778,21 @@ int command_generate(int argc, char** argv)
     std::printf("\n");
 
     const char* backend = simd_name();
-    int backend_threads = vulkan ? 0 : runner.threads();
-    size_t weight_mib = vulkan ? 0 : model.weight_bytes() >> 20;
+    int backend_threads = vulkan || cuda ? 0 : runner.threads();
+    size_t weight_mib = vulkan || cuda ? 0 : model.weight_bytes() >> 20;
 #if defined(FAISCA_VULKAN)
     if (vulkan)
     {
         backend = device.device_name();
         weight_mib = vulkan_runner.weight_bytes() >> 20;
+    }
+#endif
+#if defined(FAISCA_CUDA)
+    if (cuda)
+    {
+        backend = cuda_device.device_name();
+        weight_mib = cuda_runner.weight_bytes() >> 20;
+        std::fprintf(stderr, "CUDA, float32 activations, %s KV cache\n", kv_f16 ? "f16" : "float32");
     }
 #endif
     std::fprintf(stderr,

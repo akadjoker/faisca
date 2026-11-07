@@ -343,10 +343,28 @@ top. No third party dependencies. Owner: Luís (akadjoker). "faisca" is a workin
    27B vision (same mmproj layout, files beyond this machine), Whisper's
    encoder through attention_block (same shape of problem), the Vulkan
    runner.
-11. CUDA runner: planned, not started. Context: this VM has no GPU, no
-   nvcc and no NVIDIA driver, so everything here compiles only; every
-   measurement needs the owner's machine. The Vulkan runner was never
-   measured on a real GPU. On generation (memory bound) a well made
+11. CUDA runner: initial Llama backend implemented, --cuda in generate,
+  runner_dump and bench_runner. CudaDevice loads the driver at runtime;
+  CudaKernels has F32/Q8_0 matvec, embed, RMS norm, RoPE, KV store,
+  causal GQA attention, SwiGLU and add, with embedded PTX. CudaRunner
+  uploads F32/F16/Q8_0 weights, keeps activations and KV in float32,
+  uses one stream and batches of 32. Q8_0 is uploaded in the GGUF layout,
+  without CPU repacking; four inputs reuse each matrix weight load.
+  Linux/RTX 4060: 387 tensors against CPU float32 at worst 5.44e-6 on
+  16 repeated token-42 inputs and 5.47e-6 on 65, 16 greedy tokens
+  identical; CUDA Q8_0 and --f32 dumps exactly identical. IDs 1..65
+  give 5.76e-5 (Vulkan 8.71e-5) with identical tokens, documented as
+  a remaining strict-tolerance limitation, not silently waived.
+  Compute Sanitizer and ASan/UBSan/LSan clean on generate (ASan needs
+  protect_shadow_gap=0). SmolLM2 Q8_0, 512 prompt then 32 tokens:
+  mean runs 2..4 about 1027 / 144 tok/s, load 0.23 s, 366 MiB weights.
+  Windows untested; Q4/Q5/K-quants, Qwen/Gemma, f16 KV, tensor cores,
+  CUDA Graphs, speculative decoding and GPU sessions remain pending.
+  Detailed phases and validation gates: [docs/cuda_plan.md](docs/cuda_plan.md).
+  The previous VM had no GPU/toolkit; the current machine has CUDA 12.8.
+  Phase 0 measured SmolLM2 Q8_0 on RTX 4060: Vulkan 82 / 60 tok/s prompt /
+  generation, llama.cpp CUDA 5839 / 348 (different prompts and f32 / f16
+  cache, so indicative only). On generation (memory bound) a well made
    Vulkan and a well made CUDA kernel land close to each other; CUDA
    earns its place with int8 tensor cores for the prompt (mma.sync /
    WMMA, the GPU version of our VNNI GEMM), the tooling, and the async

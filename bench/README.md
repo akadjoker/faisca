@@ -174,6 +174,22 @@ SmolLM2-360M-Instruct.
 | Q4_0 prompt (tok/s) | 1 | 249 | 165 |
 | Q4_0 prompt (tok/s) | 4 | 147 | 480 |
 
+Laptop, 2026-11-07: Intel Core Ultra 7 165H (6 P cores, AVX2 and VNNI, no
+AVX-512 or AMX), SmolLM2-360M-Instruct Q8_0, f16 KV on both. llama.cpp
+(unsloth build, CPU backend libggml-cpu-alderlake) with `-dev none -ngl 0
+-nopo 1`, so nothing goes to the GPU: pp512 and tg64 at depth 512, mean of 3.
+faisca: `bench_runner --threads N --runs 3 --generate 64` on 512 tokens, then
+64 greedy tokens, best of 3. Two alternated rounds per thread count, ranges:
+
+| | threads | llama.cpp | faisca |
+| --- | --- | --- | --- |
+| Q8_0 generation at depth 512 (tok/s) | 1 | 36.0-36.8 | 48.9-49.1 |
+| Q8_0 generation at depth 512 (tok/s) | 4 | 63.3-63.9 | 118.6-118.8 |
+| Q8_0 generation at depth 512 (tok/s) | 6 | 66.6-68.9 | 137.0-138.1 |
+| Q8_0 prompt 512 (tok/s) | 1 | 136-141 | 245-252 |
+| Q8_0 prompt 512 (tok/s) | 4 | 412-459 | 831-844 |
+| Q8_0 prompt 512 (tok/s) | 6 | 525-561 | 1025-1112 |
+
 Q4_K_M (Q5_0 for the 960 wide matrices, Q4_K and Q6_K for `ffn_down`, Q8_0
 for the embeddings and half of `attn_v`), Q4_0 and Q8_0 measured with a
 harness over `Runner`: the first 512 tokens of the 1045 token prompt, then

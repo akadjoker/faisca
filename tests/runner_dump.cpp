@@ -4,6 +4,9 @@
 #if defined(FAISCA_VULKAN)
 #include "faisca/vulkan_runner.h"
 #endif
+#if defined(FAISCA_CUDA)
+#include "faisca/cuda_runner.h"
+#endif
 
 #include <cinttypes>
 #include <cstdio>
@@ -13,7 +16,7 @@
 #include <string>
 #include <vector>
 
-// usage: runner_dump [--dequantize] [--kv-f32] [--vulkan] [--threads N] <model.gguf> <out.bin> <generate N> <token ids...>
+// usage: runner_dump [--dequantize] [--kv-f32] [--vulkan | --cuda] [--threads N] <model.gguf> <out.bin> <generate N> <token ids...>
 //
 // Same output as tests/reference/llama_layer_dump.cpp: every traced vector of
 // every prompt token, assembled per name into [values, tokens], then N greedy
@@ -59,12 +62,20 @@ int main(int argc, char** argv)
     bool dequantize = false;
     bool kv_f16 = true;
     bool vulkan = false;
+    bool cuda = false;
     int threads = 1;
     while (argc > 1 && argv[1][0] == '-')
     {
         if (std::strcmp(argv[1], "--vulkan") == 0)
         {
             vulkan = true;
+            ++argv;
+            --argc;
+            continue;
+        }
+        if (std::strcmp(argv[1], "--cuda") == 0)
+        {
+            cuda = true;
             ++argv;
             --argc;
             continue;
@@ -93,11 +104,16 @@ int main(int argc, char** argv)
     }
     if (argc < 5)
     {
-        std::fprintf(stderr, "usage: runner_dump [--dequantize] [--kv-f32] [--vulkan] [--threads N] <model.gguf> <out.bin> <generate N> <token ids...>\n");
+        std::fprintf(stderr, "usage: runner_dump [--dequantize] [--kv-f32] [--vulkan | --cuda] [--threads N] <model.gguf> <out.bin> <generate N> <token ids...>\n");
         return 2;
     }
 
     const int generate = std::atoi(argv[3]);
+    if (cuda && vulkan)
+    {
+        std::fprintf(stderr, "runner_dump: choose only one GPU backend\n");
+        return 2;
+    }
     std::vector<int32_t> prompt;
     for (int i = 4; i < argc; ++i)
     {
@@ -133,8 +149,23 @@ int main(int argc, char** argv)
         return 1;
     }
 #endif
+#if defined(FAISCA_CUDA)
+    faisca::CudaDevice cuda_device;
+    faisca::CudaRunner cuda_runner;
+    if (cuda && (!cuda_device.init(error) || !cuda_runner.init(cuda_device, file, n_ctx, error, dequantize, kv_f16)))
+    {
+        std::fprintf(stderr, "runner_dump: %s\n", error.c_str());
+        return 1;
+    }
+#else
+    if (cuda)
+    {
+        std::fprintf(stderr, "runner_dump: built without CUDA\n");
+        return 1;
+    }
+#endif
     faisca::ThreadPool pool;
-    if (!vulkan && (!pool.start(threads, error) || !model.load(file, error, dequantize, &pool) ||
+    if (!vulkan && !cuda && (!pool.start(threads, error) || !model.load(file, error, dequantize, &pool) ||
                     !runner.init(model, n_ctx, pool, error, kv_f16)))
     {
         std::fprintf(stderr, "runner_dump: %s\n", error.c_str());
@@ -144,6 +175,12 @@ int main(int argc, char** argv)
     // the same calls on either runner
     const auto run_forward = [&](const int32_t* tokens, size_t count, faisca::Array<float>& out) -> bool
     {
+#if defined(FAISCA_CUDA)
+        if (cuda)
+        {
+            return cuda_runner.forward(tokens, count, out, error);
+        }
+#endif
 #if defined(FAISCA_VULKAN)
         if (vulkan)
         {
@@ -154,6 +191,13 @@ int main(int argc, char** argv)
     };
     const auto set_trace = [&](faisca::RunnerTrace callback, void* user)
     {
+#if defined(FAISCA_CUDA)
+        if (cuda)
+        {
+            cuda_runner.set_trace(callback, user);
+            return;
+        }
+#endif
 #if defined(FAISCA_VULKAN)
         if (vulkan)
         {

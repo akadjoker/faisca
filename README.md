@@ -1,8 +1,8 @@
 # faisca
 
 A small LLM runner written from scratch in C++17. A library first, with a
-command line tool on top. No third party dependencies, plus the GPU driver once
-the Vulkan backend lands.
+command line tool on top. No third party dependencies; optional GPU backends
+load the system driver at runtime.
 
 The library does not use standard library containers, strings, smart pointers
 or exceptions. It has its own containers (`faisca::Array`, `faisca::StringMap`,
@@ -19,7 +19,8 @@ or exceptions. It has its own containers (`faisca::Array`, `faisca::StringMap`,
 | Tokenizer (byte level BPE with the gpt-2, smollm and llama-bpe pre-tokenizers, validated against llama.cpp) | done |
 | CPU runner, float32, validated layer by layer against llama.cpp | done |
 | CPU optimization: threads, VNNI kernels for Q8_0, Q4_0, Q5_0, Q4_K and Q6_K, batched prompt, f16 KV cache | done, AMX pending |
-| Vulkan compute backend | runs the whole model, validated layer by layer on llvmpipe; speed on a real GPU not measured yet |
+| Vulkan compute backend | runs Llama models; SmolLM2 Q8_0 validated against CPU float32 and measured on RTX 4060, see [CUDA plan](docs/cuda_plan.md) |
+| CUDA backend | Llama inference with F32/F16/Q8_0 weights, f16 or float32 KV, decode as one CUDA graph; SmolLM2 Q8_0 on RTX 4060 Laptop at depth 512: about 390 generation tok/s (llama.cpp 385), prompt about 26800 tok/s (llama.cpp 25000), Windows untested |
 | Own cache format and KV cache on disk | done: sessions with prefix reuse, snapshots and files with an offset table |
 | Whisper (speech to text) | done: tiny, base and small validated layer by layer against whisper.cpp, `transcribe` command, no timestamps yet |
 | Pocket TTS (text to speech) | done: validated against pockettts.cpp, `speak` command, 27 voices, no cloning from a recording yet |
@@ -35,6 +36,20 @@ cmake --build build -j
 
 This produces the `faisca` static library and the `faisca` tool.
 
+`FAISCA_CUDA=ON` (default) includes the 64-bit driver layer without requiring
+the CUDA toolkit or headers; `-DFAISCA_CUDA=OFF` excludes it. The device API
+is in [include/faisca/cuda.h](include/faisca/cuda.h); the inference interface
+is [include/faisca/cuda_runner.h](include/faisca/cuda_runner.h).
+`generate --cuda` runs the Llama architecture with F32/F16/Q8_0 weights,
+float32 activations and float32 KV cache; `--f32` decodes Q8_0 weights at load.
+Qwen, Gemma, sliding windows, linear RoPE scaling and other quantizations
+are not supported by CUDA yet and are rejected. Draft decoding and GPU
+session export are not implemented. CUDA is currently available in
+`generate`, `runner_dump` and `bench_runner`, not the other CLI workflows.
+`build/cuda_check --require-device --model model.gguf` checks the kernels
+on real matrices. Regenerating embedded PTX requires nvcc and
+[tools/embed_ptx.py](tools/embed_ptx.py); normal builds do not.
+
 | Platform | State |
 | --- | --- |
 | Linux, GCC 13 and Clang 18 | built and tested, including ASan and UBSan |
@@ -48,6 +63,7 @@ faisca info model.gguf              # summary
 faisca info model.gguf --meta       # every metadata key
 faisca info model.gguf --tensors    # every tensor
 faisca generate model.gguf -p "What is the capital of France?" -n 64 -t 4
+faisca generate model.gguf --cuda -p "What is the capital of France?" -n 64
 faisca chat model.gguf -t 4 --session talk.session
 faisca transcribe ggml-small.bin recording.wav --language pt -t 4
 faisca describe gemma-3-4b-it-Q8_0.gguf mmproj-F16.gguf photo.png -p "What is this?" -t 4
