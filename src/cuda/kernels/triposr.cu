@@ -294,8 +294,9 @@ __device__ void load_transposed(float (*dst)[64], const float* src, unsigned int
 // steps of 64, the online softmax rescaled once per step. Thread (tq, tk) holds S and O
 // for queries 4 tq.. and keys / dims 4 tk.. and 32 + 4 tk..
 extern "C" __global__ void __launch_bounds__(128)
-    tripo_flash_attention(const float* q, const float* k, const float* v, float* out, unsigned int n_q,
-                          unsigned int n_kv, unsigned int stride, float scale)
+    tripo_flash_attention(const float* q, unsigned int q_stride, const float* k, const float* v,
+                          unsigned int kv_stride, float* out, unsigned int out_stride, unsigned int n_q,
+                          unsigned int n_kv, float scale)
 {
     __shared__ __align__(16) float qt[64][64];
     __shared__ __align__(16) float kt[64][64];
@@ -306,7 +307,7 @@ extern "C" __global__ void __launch_bounds__(128)
     const unsigned int head = blockIdx.y;
     const unsigned int q0 = blockIdx.x * 64;
     const float minus_infinity = __int_as_float(0xff800000);
-    load_transposed(qt, q, q0, n_q, stride, head);
+    load_transposed(qt, q, q0, n_q, q_stride, head);
 
     float o[4][8];
     float m[4];
@@ -325,7 +326,7 @@ extern "C" __global__ void __launch_bounds__(128)
     for (unsigned int k0 = 0; k0 < n_kv; k0 += 64)
     {
         __syncthreads();
-        load_transposed(kt, k, k0, n_kv, stride, head);
+        load_transposed(kt, k, k0, n_kv, kv_stride, head);
         for (unsigned int e = tid; e < 1024; e += 128)
         {
             const unsigned int row = e / 16;
@@ -333,7 +334,7 @@ extern "C" __global__ void __launch_bounds__(128)
             float4 f = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
             if (k0 + row < n_kv)
             {
-                f = *(const float4*)(v + (size_t)(k0 + row) * stride + head * 64 + c);
+                f = *(const float4*)(v + (size_t)(k0 + row) * kv_stride + head * 64 + c);
             }
             *(float4*)&vs[row][c] = f;
         }
@@ -445,7 +446,7 @@ extern "C" __global__ void __launch_bounds__(128)
             r.y = o[i][h * 4 + 1] * inverse;
             r.z = o[i][h * 4 + 2] * inverse;
             r.w = o[i][h * 4 + 3] * inverse;
-            *(float4*)(out + (size_t)query * stride + head * 64 + h * 32 + tk * 4) = r;
+            *(float4*)(out + (size_t)query * out_stride + head * 64 + h * 32 + tk * 4) = r;
         }
     }
 }

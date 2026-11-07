@@ -183,6 +183,26 @@ bool TripoCudaRunner::init(const TripoModel& model, CudaDevice& device, ThreadPo
     put(m_upsample_b, model.upsample_b(), TripoModel::CODE_CHANNELS);
     m_upsample_w = panels(model.upsample());
 
+    // q, k and v run as one GEMM: their panels (and the ViT biases) must follow each other
+    auto follows = [](const TripoLinear& a, const TripoLinear& b)
+    { return a.panels + a.n_in * a.n_out == b.panels && a.n_in == b.n_in; };
+    bool fused = true;
+    for (uint32_t il = 0; il < TripoModel::VIT_LAYERS; ++il)
+    {
+        const TripoVitLayer& l = model.vit_layer(il);
+        fused = fused && follows(l.q, l.k) && follows(l.k, l.v);
+    }
+    for (uint32_t ib = 0; ib < TripoModel::BLOCKS; ++ib)
+    {
+        const TripoBlock& b = model.block(ib);
+        fused = fused && follows(b.self_q, b.self_k) && follows(b.self_k, b.self_v) && follows(b.cross_k, b.cross_v);
+    }
+    if (!fused)
+    {
+        error.set("TripoSR q, k and v panels are not contiguous");
+        return false;
+    }
+
     // tripo_query reads the MLP panels as one run in layer order
     const float* run = model.mlp(0).panels;
     for (uint32_t l = 0; l < TripoModel::MLP_LAYERS; ++l)
@@ -215,6 +235,14 @@ bool TripoCudaRunner::init(const TripoModel& model, CudaDevice& device, ThreadPo
     for (const Pending& p : pending)
     {
         *p.field = m_params.address + p.offset * sizeof(float);
+    }
+    for (const Vit& g : m_vit)
+    {
+        if (g.k_b != g.q_b + vit_dim * sizeof(float) || g.v_b != g.k_b + vit_dim * sizeof(float))
+        {
+            error.set("TripoSR ViT q, k and v biases are not contiguous");
+            return false;
+        }
     }
 
     const size_t wide = n_plane * dim;
@@ -294,12 +322,12 @@ bool TripoCudaRunner::layer_norm(uint64_t x, uint64_t w, uint64_t b, uint64_t ou
     return m_device->launch(m_layer_norm, m_stream, launch, arguments, error);
 }
 
-bool TripoCudaRunner::attention(uint64_t q, uint64_t k, uint64_t v, uint64_t out, uint32_t n_q, uint32_t n_kv,
-                                uint32_t heads, Error& error)
+bool TripoCudaRunner::attention(uint64_t q, uint32_t q_stride, uint64_t k, uint64_t v, uint32_t kv_stride, uint64_t out,
+                                uint32_t n_q, uint32_t n_kv, uint32_t heads, Error& error)
 {
-    uint32_t stride = heads * 64;
+    uint32_t out_stride = heads * 64;
     float scale = 1.0f / std::sqrt(64.0f);
-    void* arguments[] = {&q, &k, &v, &out, &n_q, &n_kv, &stride, &scale};
+    void* arguments[] = {&q, &q_stride, &k, &v, &kv_stride, &out, &out_stride, &n_q, &n_kv, &scale};
     CudaLaunch launch;
     launch.grid_y = heads;
     launch.block_x = 128;
@@ -354,10 +382,9 @@ bool TripoCudaRunner::encode_image(const float* rgb, Error& error)
         uint32_t ff_count = n * TripoModel::VIT_FF;
         void* gelu_args[] = {&m_up, &ff_count};
         if (!layer_norm(m_image, l.ln1_w, l.ln1_b, m_h, n, dim, TripoModel::VIT_EPS, error) ||
-            !gemm(m_h, dim, l.q, dim, dim, n, l.q_b, m_q, false, error) ||
-            !gemm(m_h, dim, l.k, dim, dim, n, l.k_b, m_k, false, error) ||
-            !gemm(m_h, dim, l.v, dim, dim, n, l.v_b, m_v, false, error) ||
-            !attention(m_q, m_k, m_v, m_attn, n, n, TripoModel::VIT_HEADS, error) ||
+            !gemm(m_h, dim, l.q, dim, 3 * dim, n, l.q_b, m_up, false, error) ||
+            !attention(m_up, 3 * dim, m_up + dim * sizeof(float), m_up + 2 * dim * sizeof(float), 3 * dim, m_attn, n,
+                       n, TripoModel::VIT_HEADS, error) ||
             !gemm(m_attn, dim, l.out, dim, dim, n, l.out_b, m_image, true, error) ||
             !layer_norm(m_image, l.ln2_w, l.ln2_b, m_h, n, dim, TripoModel::VIT_EPS, error) ||
             !gemm(m_h, dim, l.up, dim, TripoModel::VIT_FF, n, l.up_b, m_up, false, error) ||
@@ -397,16 +424,16 @@ bool TripoCudaRunner::build_triplane(Error& error)
         uint32_t ff_arg = ff;
         void* geglu_args[] = {&m_up, &ff_arg, &geglu_count};
         if (!layer_norm(m_x, b.ln1_w, b.ln1_b, m_h, n, dim, TripoModel::LN_EPS, error) ||
-            !gemm(m_h, dim, b.self_q, dim, dim, n, 0, m_q, false, error) ||
-            !gemm(m_h, dim, b.self_k, dim, dim, n, 0, m_k, false, error) ||
-            !gemm(m_h, dim, b.self_v, dim, dim, n, 0, m_v, false, error) ||
-            !attention(m_q, m_k, m_v, m_attn, n, n, TripoModel::HEADS, error) ||
+            !gemm(m_h, dim, b.self_q, dim, 3 * dim, n, 0, m_up, false, error) ||
+            !attention(m_up, 3 * dim, m_up + dim * sizeof(float), m_up + 2 * dim * sizeof(float), 3 * dim, m_attn, n,
+                       n, TripoModel::HEADS, error) ||
             !gemm(m_attn, dim, b.self_out, dim, dim, n, b.self_out_b, m_x, true, error) ||
             !layer_norm(m_x, b.ln2_w, b.ln2_b, m_h, n, dim, TripoModel::LN_EPS, error) ||
             !gemm(m_h, dim, b.cross_q, dim, dim, n, 0, m_q, false, error) ||
-            !gemm(m_image, TripoModel::VIT_DIM, b.cross_k, TripoModel::VIT_DIM, dim, n_image, 0, m_k, false, error) ||
-            !gemm(m_image, TripoModel::VIT_DIM, b.cross_v, TripoModel::VIT_DIM, dim, n_image, 0, m_v, false, error) ||
-            !attention(m_q, m_k, m_v, m_attn, n, n_image, TripoModel::HEADS, error) ||
+            !gemm(m_image, TripoModel::VIT_DIM, b.cross_k, TripoModel::VIT_DIM, 2 * dim, n_image, 0, m_up, false,
+                  error) ||
+            !attention(m_q, dim, m_up, m_up + dim * sizeof(float), 2 * dim, m_attn, n, n_image, TripoModel::HEADS,
+                       error) ||
             !gemm(m_attn, dim, b.cross_out, dim, dim, n, b.cross_out_b, m_x, true, error) ||
             !layer_norm(m_x, b.ln3_w, b.ln3_b, m_h, n, dim, TripoModel::LN_EPS, error) ||
             !gemm(m_h, dim, b.ff_in, dim, 2 * ff, n, b.ff_in_b, m_up, false, error) ||

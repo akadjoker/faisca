@@ -564,8 +564,13 @@ top. No third party dependencies. Owner: Luís (akadjoker). "faisca" is a workin
    it runs at: __expf instead of expf saves 3%, skipping the K/V loads 20%,
    yet prefetching them into registers saved 1% (not kept). GPU performance
    counters (ncu) need admin rights here, so the remaining limit is not
-   identified yet. Image encoder 0.033 s, triplane 0.42-0.45 s. Next: that
-   GEMM shape, then --cuda in `faisca mesh`, then CPU cache tuning.
+   identified yet. The 3072 x 1024 x 1024 GEMM stays at 1.14 ms against
+   cuBLAS's 1.0 (cuBLAS splits k, which changes the sums; 128 x 64 tiles
+   were slower, 1.27 ms): q, k and v (and cross k, v) now run as one GEMM
+   on their contiguous panels, 2.48 ms instead of 3 x 1.14, bit identical.
+   Interleaved: image encoder 0.033 s (PyTorch 0.044), triplane 0.42-0.45 s
+   (0.61), mesh 256^3 0.6 s (1.4-1.5); the laptop GPU clock moves runs by
+   about 5%. Next: --cuda in `faisca mesh`, then CPU cache tuning.
 
 OmniDreams (NVIDIA video world model) is an exploration, not a plan step:
 read docs/omnidreams_handoff.md first, then docs/omnidreams.md.

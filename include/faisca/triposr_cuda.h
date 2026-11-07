@@ -54,8 +54,8 @@ private:
               uint64_t bias, uint64_t out, bool accumulate, Error& error);
     bool layer_norm(uint64_t x, uint64_t w, uint64_t b, uint64_t out, uint32_t rows, uint32_t width, float eps,
                     Error& error);
-    bool attention(uint64_t q, uint64_t k, uint64_t v, uint64_t out, uint32_t n_q, uint32_t n_kv, uint32_t heads,
-                   Error& error);
+    bool attention(uint64_t q, uint32_t q_stride, uint64_t k, uint64_t v, uint32_t kv_stride, uint64_t out,
+                   uint32_t n_q, uint32_t n_kv, uint32_t heads, Error& error);
     bool elementwise(const CudaKernel& kernel, void** arguments, uint32_t count, Error& error);
     bool query(uint64_t points, uint64_t lin, uint32_t grid_size, uint32_t n, uint64_t density, uint64_t color,
                Error& error);
