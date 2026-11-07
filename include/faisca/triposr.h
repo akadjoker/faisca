@@ -269,6 +269,9 @@ struct TripoMesh
     Array<uint32_t> faces;  // three vertex indices per triangle
 };
 
+// Wavefront OBJ with a colour per vertex ("v x y z r g b", as trimesh writes them)
+bool tripo_write_obj(const char* path, const TripoMesh& mesh, Error& error);
+
 class TripoRunner
 {
 public:

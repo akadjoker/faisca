@@ -1399,6 +1399,36 @@ bool tripo_marching_cubes(ThreadPool& pool, const float* vol, uint32_t resolutio
     return true;
 }
 
+bool tripo_write_obj(const char* path, const TripoMesh& mesh, Error& error)
+{
+    FILE* f = std::fopen(path, "wb");
+    if (f == nullptr)
+    {
+        error.set("cannot write %s", path);
+        return false;
+    }
+    bool ok = true;
+    const size_t n_vertices = mesh.positions.size() / 3;
+    for (size_t i = 0; ok && i < n_vertices; ++i)
+    {
+        const float* p = mesh.positions.data() + 3 * i;
+        const float* c = mesh.colors.data() + 3 * i;
+        ok = std::fprintf(f, "v %.8g %.8g %.8g %.8g %.8g %.8g\n", double(p[0]), double(p[1]), double(p[2]), double(c[0]),
+                          double(c[1]), double(c[2])) > 0;
+    }
+    for (size_t i = 0; ok && i < mesh.faces.size() / 3; ++i)
+    {
+        const uint32_t* t = mesh.faces.data() + 3 * i;
+        ok = std::fprintf(f, "f %u %u %u\n", t[0] + 1, t[1] + 1, t[2] + 1) > 0;
+    }
+    ok = std::fclose(f) == 0 && ok;
+    if (!ok)
+    {
+        error.set("error writing %s", path);
+    }
+    return ok;
+}
+
 bool TripoRunner::extract_mesh(uint32_t resolution, float threshold, TripoMesh& mesh, Error& error)
 {
     if (m_model == nullptr || resolution < 2)

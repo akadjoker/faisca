@@ -514,7 +514,17 @@ top. No third party dependencies. Owner: Luís (akadjoker). "faisca" is a workin
    multiply-add; with std::fma the 786432 values of chair.png's rgb_cond
    are bit identical (411223 differed by 1 ulp without it).
    tests/triposr_dump takes an image path or a reference dir.
-   Next: a CLI command writing a mesh file, CUDA, CPU cache tuning.
+   Done: `faisca mesh <model.ckpt> <image> -o <mesh.obj>` (--resolution,
+   --threshold, --ratio, -t; tripo_write_obj writes "v x y z r g b").
+   chair.png 256^3: load 0.9 s, image to triplane 11.9 s, mesh 10.4 s (22
+   threads, with the owner's background load). Visual check against the
+   reference mesh: ref/triposr/tools/render_mesh.py (numpy z-buffer, no
+   window) -> ref/triposr/out/chair_compare.png, same shape and colours.
+   Second image, robot.png 256^3: rgb_cond bit identical, tokens 3.1e-6,
+   scene codes 1.6e-6, density 5.1e-6 (one of 16.7 M grid points on the
+   other side of the threshold), 156032 faces as the reference, 78161
+   vertices against 78159, triposr_mc_check bit identical.
+   Next: CUDA, CPU cache tuning.
 
 OmniDreams (NVIDIA video world model) is an exploration, not a plan step:
 read docs/omnidreams_handoff.md first, then docs/omnidreams.md.
