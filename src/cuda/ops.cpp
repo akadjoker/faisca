@@ -77,6 +77,17 @@ bool CudaKernels::init(CudaDevice& device, Error& error)
         !device.load_module(ptx_gemm_f16, m_gemm_f16_module, error) ||
         !device.find_kernel(m_gemm_f16_module, "gemm_f16", m_gemm_f16, error) ||
         !device.find_kernel(m_gemm_f16_module, "gemm_bf16", m_gemm_bf16, error) ||
+        !device.find_kernel(m_gemm_f16_module, "gemm_f16_half", m_gemm_outputs[0][0], error) ||
+        !device.find_kernel(m_gemm_f16_module, "gemm_f16_gelu", m_gemm_outputs[0][1], error) ||
+        !device.find_kernel(m_gemm_f16_module, "gemm_f16_residual", m_gemm_outputs[0][2], error) ||
+        !device.find_kernel(m_gemm_f16_module, "gemm_bf16_half", m_gemm_outputs[1][0], error) ||
+        !device.find_kernel(m_gemm_f16_module, "gemm_bf16_gelu", m_gemm_outputs[1][1], error) ||
+        !device.find_kernel(m_gemm_f16_module, "gemm_bf16_residual", m_gemm_outputs[1][2], error) ||
+        !device.load_module(ptx_dit, m_dit_module, error) ||
+        !device.find_kernel(m_dit_module, "dit_modulate_norm_f16", m_dit_modulate_norm[0], error) ||
+        !device.find_kernel(m_dit_module, "dit_modulate_norm_bf16", m_dit_modulate_norm[1], error) ||
+        !device.find_kernel(m_dit_module, "dit_qk_norm_rope_f16", m_dit_qk_norm_rope[0], error) ||
+        !device.find_kernel(m_dit_module, "dit_qk_norm_rope_bf16", m_dit_qk_norm_rope[1], error) ||
         !device.load_module(ptx_attention_f16, m_attention_f16_module, error) ||
         !device.find_kernel(m_attention_f16_module, "attention_f16", m_attention_f16, error) ||
         !device.find_kernel(m_attention_f16_module, "attention_bf16", m_attention_bf16, error) ||
@@ -106,6 +117,7 @@ void CudaKernels::release()
         m_device->destroy_module(m_gemm_module, ignored);
         m_device->destroy_module(m_gemm_f16_module, ignored);
         m_device->destroy_module(m_attention_f16_module, ignored);
+        m_device->destroy_module(m_dit_module, ignored);
     }
     m_matvec_f32_module = CudaModule();
     m_matvec_f32 = CudaKernel();
@@ -142,6 +154,16 @@ void CudaKernels::release()
     m_gemm_f16 = CudaKernel();
     m_gemm_bf16 = CudaKernel();
     m_attention_f16_module = CudaModule();
+    m_dit_module = CudaModule();
+    for (int t = 0; t < 2; ++t)
+    {
+        for (int o = 0; o < 3; ++o)
+        {
+            m_gemm_outputs[t][o] = CudaKernel();
+        }
+        m_dit_modulate_norm[t] = CudaKernel();
+        m_dit_qk_norm_rope[t] = CudaKernel();
+    }
     m_attention_f16 = CudaKernel();
     m_attention_bf16 = CudaKernel();
     m_add = CudaKernel();
@@ -536,22 +558,70 @@ bool CudaKernels::gemm_q8_0(const CudaBuffer& weight, const CudaBuffer& quants, 
 }
 
 bool CudaKernels::gemm_f16(const CudaBuffer& input, const CudaBuffer& weight, const CudaBuffer& output, uint32_t m,
-                           uint32_t n, uint32_t k, bool bf16, const CudaStream& stream, Error& error)
+                           uint32_t n, uint32_t k, bool bf16, const CudaStream& stream, Error& error, GemmOutput how,
+                           const CudaBuffer* gate, uint64_t gate_offset)
 {
+    const size_t out_size = how == GemmOutput::Half || how == GemmOutput::HalfGelu ? 2 : 4;
     if (m_device == nullptr || m == 0 || n == 0 || n % 8 != 0 || k == 0 || k % 32 != 0 ||
         input.bytes < static_cast<size_t>(m) * k * 2 || weight.bytes < static_cast<size_t>(n) * k * 2 ||
-        output.bytes < static_cast<size_t>(m) * n * 4)
+        output.bytes < static_cast<size_t>(m) * n * out_size ||
+        (how == GemmOutput::Residual && (gate == nullptr || gate->bytes < gate_offset + n * 4ull)))
     {
         error.set("invalid CUDA f16 GEMM dimensions or buffer size");
         return false;
     }
-    uint64_t addresses[] = {input.address, weight.address, output.address};
-    void* arguments[] = {&addresses[0], &addresses[1], &addresses[2], &m, &n, &k};
+    uint64_t addresses[] = {input.address, weight.address, output.address,
+                            gate != nullptr ? gate->address + gate_offset : 0};
+    void* arguments[] = {&addresses[0], &addresses[1], &addresses[2], &addresses[3], &m, &n, &k};
     CudaLaunch launch;
     launch.grid_x = (n + 127) / 128;
     launch.grid_y = (m + 127) / 128;
     launch.block_x = 128;
-    return m_device->launch(bf16 ? m_gemm_bf16 : m_gemm_f16, stream, launch, arguments, error);
+    const int t = bf16 ? 1 : 0;
+    const CudaKernel& kernel = how == GemmOutput::Float      ? (bf16 ? m_gemm_bf16 : m_gemm_f16)
+                               : how == GemmOutput::Half     ? m_gemm_outputs[t][0]
+                               : how == GemmOutput::HalfGelu ? m_gemm_outputs[t][1]
+                                                             : m_gemm_outputs[t][2];
+    return m_device->launch(kernel, stream, launch, arguments, error);
+}
+
+bool CudaKernels::dit_modulate_norm(const CudaBuffer& x, const CudaBuffer& modulation, uint64_t shift_offset,
+                                    uint64_t scale_offset, const CudaBuffer& output, uint32_t rows, uint32_t width,
+                                    bool bf16, const CudaStream& stream, Error& error)
+{
+    if (m_device == nullptr || rows == 0 || width == 0 || width % 256 != 0 || width > 4096 ||
+        x.bytes < static_cast<size_t>(rows) * width * 4 || output.bytes < static_cast<size_t>(rows) * width * 2 ||
+        modulation.bytes < shift_offset + width * 4ull || modulation.bytes < scale_offset + width * 4ull)
+    {
+        error.set("invalid CUDA DiT modulate norm dimensions or buffer size");
+        return false;
+    }
+    uint64_t addresses[] = {x.address, modulation.address + shift_offset, modulation.address + scale_offset,
+                            output.address};
+    void* arguments[] = {&addresses[0], &addresses[1], &addresses[2], &addresses[3], &width};
+    CudaLaunch launch;
+    launch.grid_x = rows;
+    launch.block_x = 256;
+    return m_device->launch(m_dit_modulate_norm[bf16 ? 1 : 0], stream, launch, arguments, error);
+}
+
+bool CudaKernels::dit_qk_norm_rope(const CudaBuffer& data, uint32_t stride, uint32_t first, const CudaBuffer& gamma,
+                                   const CudaBuffer* angles, uint32_t rows, uint32_t heads, bool bf16,
+                                   const CudaStream& stream, Error& error)
+{
+    if (m_device == nullptr || rows == 0 || heads == 0 || first + heads * 128 > stride ||
+        data.bytes < static_cast<size_t>(rows) * stride * 2 || gamma.bytes < 256 ||
+        (angles != nullptr && angles->bytes < static_cast<size_t>(rows) * 64 * 4))
+    {
+        error.set("invalid CUDA DiT q / k norm dimensions or buffer size");
+        return false;
+    }
+    uint64_t addresses[] = {data.address, gamma.address, angles != nullptr ? angles->address : 0};
+    void* arguments[] = {&addresses[0], &stride, &first, &addresses[1], &addresses[2], &rows, &heads};
+    CudaLaunch launch;
+    launch.grid_x = (rows * heads + 7) / 8;
+    launch.block_x = 256;
+    return m_device->launch(m_dit_qk_norm_rope[bf16 ? 1 : 0], stream, launch, arguments, error);
 }
 
 bool CudaKernels::attention_f16(const CudaBuffer& query, uint32_t q_stride, const CudaBuffer& keys,

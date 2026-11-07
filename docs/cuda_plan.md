@@ -528,6 +528,22 @@ the difference, so its sm89 tiling likely differs (its source is not here).
 against 16.5-17.7, bf16 15.35 against 15.1-15.2; kv 21120 and kv 512 level
 (26 and 21-28 TFLOPS on both sides).
 
+### One OmniDreams DiT block (2026-11-07)
+
+tests/dit_block_reference.py writes one Cosmos-Predict2.5 DiT block (FlashDreams
+modules.py Block.forward without cross-view attention, first chunk, RoPE as
+rope_kernel.py over rope.py's frequencies) with random bf16 weights and runs it
+in float64, float32 and bfloat16 on PyTorch; tests/cuda_dit_block runs it on the
+CUDA kernels: dit.cu (layer norm x (1 + scale) + shift into bf16, per head
+RMSNorm and RoPE in place), the GEMM epilogues (bf16, bf16 through the exact
+GELU, f32 residual += gate * product), FlashAttention-2 on the fused QKV and on
+the text keys. Residual stream in f32, each matrix input rounded once to bf16.
+7040 tokens (2 x 44 x 80): rel L2 to float64 3.25e-4 (the block's update
+alone 2.2e-3) against PyTorch bf16's 2.88e-3 (2.0e-2); 56 ms per block against
+PyTorch bf16's 60-73 ms, interleaved (its weights converted once). Not yet:
+the modulation vectors (t embedder, AdaLN-LoRA), patch embedding, final layer,
+the rolling KV cache and the 28 blocks with the real weights.
+
 ## Phase 5 and exclusions
 
 MoE GPU work waits for a CPU MoE implementation validated against llama.cpp.

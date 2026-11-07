@@ -79,10 +79,28 @@ public:
     bool gemm_q8_0(const CudaBuffer& weight, const CudaBuffer& quants, const CudaBuffer& scales,
                    uint32_t token_stride, const CudaBuffer& output, uint32_t n_in, uint32_t n_out,
                    uint32_t n_tokens, const CudaStream& stream, Error& error, bool accumulate = false);
-    // output[m][n] = sum_k input[m][k] * weight[n][k] on the f16 (or bf16) tensor cores with f32
-    // accumulation; input and weight hold halves, k a multiple of 32, n a multiple of 8.
+    enum class GemmOutput
+    {
+        Float,    // output: m x n floats
+        Half,     // output: m x n halves of the input type
+        HalfGelu, // the same through the exact (erf) GELU
+        Residual, // output: m x n floats, output += gate[column] * product
+    };
+    // sum_k input[m][k] * weight[n][k] on the f16 (or bf16) tensor cores with f32 accumulation,
+    // stored as `how` says; input and weight hold halves, k a multiple of 32, n a multiple of 8.
     bool gemm_f16(const CudaBuffer& input, const CudaBuffer& weight, const CudaBuffer& output, uint32_t m,
-                  uint32_t n, uint32_t k, bool bf16, const CudaStream& stream, Error& error);
+                  uint32_t n, uint32_t k, bool bf16, const CudaStream& stream, Error& error,
+                  GemmOutput how = GemmOutput::Float, const CudaBuffer* gate = nullptr, uint64_t gate_offset = 0);
+    // DiT: output (rows x width halves) = layer_norm(x) * (1 + scale) + shift, x f32 rows, shift and
+    // scale width floats at their buffer offsets in bytes
+    bool dit_modulate_norm(const CudaBuffer& x, const CudaBuffer& modulation, uint64_t shift_offset,
+                           uint64_t scale_offset, const CudaBuffer& output, uint32_t rows, uint32_t width,
+                           bool bf16, const CudaStream& stream, Error& error);
+    // DiT: in place RMSNorm (gamma, 128 halves) of the heads of 128 at column first of rows
+    // stride halves apart, then RoPE by angles (rows x 64 floats) unless angles is null
+    bool dit_qk_norm_rope(const CudaBuffer& data, uint32_t stride, uint32_t first, const CudaBuffer& gamma,
+                          const CudaBuffer* angles, uint32_t rows, uint32_t heads, bool bf16,
+                          const CudaStream& stream, Error& error);
     // softmax(q k^T * scale) v per head of 128 over f16 (or bf16) rows, no mask, FlashAttention-2's
     // forward kernel; head h at column h * 128 of every row, strides in elements, output f16.
     bool attention_f16(const CudaBuffer& query, uint32_t q_stride, const CudaBuffer& keys, const CudaBuffer& values,
@@ -127,6 +145,10 @@ private:
     CudaModule m_gemm_f16_module;
     CudaKernel m_gemm_f16;
     CudaKernel m_gemm_bf16;
+    CudaKernel m_gemm_outputs[2][3];
+    CudaModule m_dit_module;
+    CudaKernel m_dit_modulate_norm[2];
+    CudaKernel m_dit_qk_norm_rope[2];
     CudaModule m_attention_f16_module;
     CudaKernel m_attention_f16;
     CudaKernel m_attention_bf16;

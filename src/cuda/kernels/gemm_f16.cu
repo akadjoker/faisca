@@ -58,11 +58,36 @@ __device__ __forceinline__ void mma(const unsigned int a[4], unsigned int b0, un
     }
 }
 
-// x: m rows of k halves, w: n rows of k halves, k a multiple of 32, n a multiple of 8, both
-// row strides k; out: m rows of n floats
+enum Output
+{
+    FLOAT,    // out: floats
+    HALF,     // out: halves of the input type
+    HALF_GELU, // out: halves of gelu(acc), the exact (erf) form of nn.GELU()
+    RESIDUAL, // out: floats, out += gate[column] * acc
+};
+
 template <bool bf16>
-__device__ __forceinline__ void gemm_tiles(const unsigned short* x, const unsigned short* w, float* out,
-                                           unsigned int m, unsigned int n, unsigned int k)
+__device__ __forceinline__ unsigned int pack(float low, float high)
+{
+    if (bf16)
+    {
+        const __nv_bfloat162 v = __floats2bfloat162_rn(low, high);
+        return *reinterpret_cast<const unsigned int*>(&v);
+    }
+    const __half2 v = __floats2half2_rn(low, high);
+    return *reinterpret_cast<const unsigned int*>(&v);
+}
+
+__device__ __forceinline__ float gelu(float v)
+{
+    return 0.5f * v * (1.0f + erff(v * 0.70710678118654752440f));
+}
+
+// x: m rows of k halves, w: n rows of k halves, k a multiple of 32, n a multiple of 8, both
+// row strides k; out: m rows of n values as output says
+template <bool bf16, Output output>
+__device__ __forceinline__ void gemm_tiles(const unsigned short* x, const unsigned short* w, void* out,
+                                           const float* gate, unsigned int m, unsigned int n, unsigned int k)
 {
     __shared__ __align__(128) unsigned short tile_a[STAGES][TILE_M * TILE_K];
     __shared__ __align__(128) unsigned short tile_b[STAGES][TILE_N * TILE_K];
@@ -158,10 +183,33 @@ __device__ __forceinline__ void gemm_tiles(const unsigned short* x, const unsign
             for (unsigned int half = 0; half < 2; ++half)
             {
                 const unsigned int row = block_m + warp_m + mt * 16 + g + half * 8;
-                if (row < m)
+                if (row >= m)
                 {
-                    *reinterpret_cast<float2*>(out + static_cast<unsigned long long>(row) * n + col) =
-                        make_float2(acc[mt][nt][2 * half], acc[mt][nt][2 * half + 1]);
+                    continue;
+                }
+                const unsigned long long index = static_cast<unsigned long long>(row) * n + col;
+                const float v0 = acc[mt][nt][2 * half];
+                const float v1 = acc[mt][nt][2 * half + 1];
+                if (output == FLOAT)
+                {
+                    *reinterpret_cast<float2*>(static_cast<float*>(out) + index) = make_float2(v0, v1);
+                }
+                else if (output == HALF)
+                {
+                    *reinterpret_cast<unsigned int*>(static_cast<unsigned short*>(out) + index) = pack<bf16>(v0, v1);
+                }
+                else if (output == HALF_GELU)
+                {
+                    *reinterpret_cast<unsigned int*>(static_cast<unsigned short*>(out) + index) =
+                        pack<bf16>(gelu(v0), gelu(v1));
+                }
+                else
+                {
+                    float2* destination = reinterpret_cast<float2*>(static_cast<float*>(out) + index);
+                    float2 r = *destination;
+                    r.x = fmaf(gate[col], v0, r.x);
+                    r.y = fmaf(gate[col + 1], v1, r.y);
+                    *destination = r;
                 }
             }
         }
@@ -170,14 +218,19 @@ __device__ __forceinline__ void gemm_tiles(const unsigned short* x, const unsign
 
 }
 
-extern "C" __global__ void __launch_bounds__(128) gemm_f16(const unsigned short* x, const unsigned short* w, float* out,
-                                                            unsigned int m, unsigned int n, unsigned int k)
-{
-    gemm_tiles<false>(x, w, out, m, n, k);
-}
+#define FAISCA_GEMM(name, bf16, output)                                                                     \
+    extern "C" __global__ void __launch_bounds__(128) name(const unsigned short* x, const unsigned short* w, void* out, \
+                                                           const float* gate, unsigned int m, unsigned int n,         \
+                                                           unsigned int k)                                            \
+    {                                                                                                                  \
+        gemm_tiles<bf16, output>(x, w, out, gate, m, n, k);                                                            \
+    }
 
-extern "C" __global__ void __launch_bounds__(128) gemm_bf16(const unsigned short* x, const unsigned short* w,
-                                                             float* out, unsigned int m, unsigned int n, unsigned int k)
-{
-    gemm_tiles<true>(x, w, out, m, n, k);
-}
+FAISCA_GEMM(gemm_f16, false, FLOAT)
+FAISCA_GEMM(gemm_bf16, true, FLOAT)
+FAISCA_GEMM(gemm_f16_half, false, HALF)
+FAISCA_GEMM(gemm_bf16_half, true, HALF)
+FAISCA_GEMM(gemm_f16_gelu, false, HALF_GELU)
+FAISCA_GEMM(gemm_bf16_gelu, true, HALF_GELU)
+FAISCA_GEMM(gemm_f16_residual, false, RESIDUAL)
+FAISCA_GEMM(gemm_bf16_residual, true, RESIDUAL)
