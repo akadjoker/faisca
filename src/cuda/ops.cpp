@@ -77,6 +77,9 @@ bool CudaKernels::init(CudaDevice& device, Error& error)
         !device.load_module(ptx_gemm_f16, m_gemm_f16_module, error) ||
         !device.find_kernel(m_gemm_f16_module, "gemm_f16", m_gemm_f16, error) ||
         !device.find_kernel(m_gemm_f16_module, "gemm_bf16", m_gemm_bf16, error) ||
+        !device.load_module(ptx_attention_f16, m_attention_f16_module, error) ||
+        !device.find_kernel(m_attention_f16_module, "attention_f16", m_attention_f16, error) ||
+        !device.find_kernel(m_attention_f16_module, "attention_bf16", m_attention_bf16, error) ||
         !device.load_module(ptx_add, m_add_module, error) ||
         !device.find_kernel(m_add_module, "add", m_add, error))
     {
@@ -102,6 +105,7 @@ void CudaKernels::release()
         m_device->destroy_module(m_add_module, ignored);
         m_device->destroy_module(m_gemm_module, ignored);
         m_device->destroy_module(m_gemm_f16_module, ignored);
+        m_device->destroy_module(m_attention_f16_module, ignored);
     }
     m_matvec_f32_module = CudaModule();
     m_matvec_f32 = CudaKernel();
@@ -137,6 +141,9 @@ void CudaKernels::release()
     m_gemm_f16_module = CudaModule();
     m_gemm_f16 = CudaKernel();
     m_gemm_bf16 = CudaKernel();
+    m_attention_f16_module = CudaModule();
+    m_attention_f16 = CudaKernel();
+    m_attention_bf16 = CudaKernel();
     m_add = CudaKernel();
     m_device = nullptr;
 }
@@ -545,6 +552,34 @@ bool CudaKernels::gemm_f16(const CudaBuffer& input, const CudaBuffer& weight, co
     launch.grid_y = (m + 127) / 128;
     launch.block_x = 128;
     return m_device->launch(bf16 ? m_gemm_bf16 : m_gemm_f16, stream, launch, arguments, error);
+}
+
+bool CudaKernels::attention_f16(const CudaBuffer& query, uint32_t q_stride, const CudaBuffer& keys,
+                                const CudaBuffer& values, uint32_t kv_stride, const CudaBuffer& output,
+                                uint32_t out_stride, uint32_t n_q, uint32_t n_kv, uint32_t heads, float scale,
+                                bool bf16, const CudaStream& stream, Error& error)
+{
+    const uint32_t width = heads * 128;
+    if (m_device == nullptr || n_q == 0 || n_kv == 0 || heads == 0 || q_stride < width || kv_stride < width ||
+        out_stride < width || q_stride % 8 != 0 || kv_stride % 8 != 0 || out_stride % 2 != 0 ||
+        query.bytes < (static_cast<size_t>(n_q - 1) * q_stride + width) * 2 ||
+        keys.bytes < (static_cast<size_t>(n_kv - 1) * kv_stride + width) * 2 ||
+        values.bytes < (static_cast<size_t>(n_kv - 1) * kv_stride + width) * 2 ||
+        output.bytes < (static_cast<size_t>(n_q - 1) * out_stride + width) * 2)
+    {
+        error.set("invalid CUDA f16 attention dimensions or buffer size");
+        return false;
+    }
+    // softmax_scale * M_LOG2E in float, as flash-attention's params.scale_softmax_log2
+    float scale_log2 = scale * static_cast<float>(1.4426950408889634);
+    uint64_t addresses[] = {query.address, keys.address, values.address, output.address};
+    void* arguments[] = {&addresses[0], &q_stride, &addresses[1], &addresses[2], &kv_stride,
+                         &addresses[3], &out_stride, &n_q, &n_kv, &scale_log2};
+    CudaLaunch launch;
+    launch.grid_x = (n_q + 127) / 128;
+    launch.grid_y = heads;
+    launch.block_x = 128;
+    return m_device->launch(bf16 ? m_attention_bf16 : m_attention_f16, stream, launch, arguments, error);
 }
 
 }

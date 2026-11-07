@@ -510,6 +510,24 @@ clock per SM with f32 accumulation, 24 SMs at 2.0-2.5 GHz: 24.6-30.7), so
 the spread is the clock. Faster than this only with FP8 (twice the rate on
 Ada), which FlashDreams uses for the DiT.
 
+### f16 / bf16 FlashAttention-2 (2026-11-07, for the OmniDreams DiT)
+
+attention_f16 / attention_bf16 (src/cuda/kernels/attention_f16.cu), heads of
+128, no mask: a port of flash-attention's forward kernel (commit 7c53542) with
+its sm86 / sm89 non-causal configuration Flash_fwd_kernel_traits<128, 128, 32, 4>
+(flash_fwd_launch_template.h:255-259; 48 KB, 2 blocks per SM, 245 registers,
+no spills), Swizzle<3, 3, 3>, the loop order of compute_attn_1rowblock and the
+softmax of softmax.h. tests/cuda_attention_f16 against a double softmax: rel
+L2 2.6e-4 (f16) and 2.1e-3 (bf16), partial blocks included. Against PyTorch
+2.11 on the same inputs (tests/compare_attention_f16.py, 1000 x 2000, 2
+heads): the same error to fp64 as its flash, cuDNN and efficient backends
+(2.80e-4 against 2.76-2.81e-4), 60% of the values bit identical to its flash
+backend; the f32 exp2 form (fused or __fmul_rn as PyTorch builds it) is not
+the difference, so its sm89 tiling likely differs (its source is not here).
+16 heads, warmed up, interleaved with torch flash: 7040 x 7040 f16 15.8 ms
+against 16.5-17.7, bf16 15.35 against 15.1-15.2; kv 21120 and kv 512 level
+(26 and 21-28 TFLOPS on both sides).
+
 ## Phase 5 and exclusions
 
 MoE GPU work waits for a CPU MoE implementation validated against llama.cpp.

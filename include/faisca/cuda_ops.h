@@ -83,6 +83,12 @@ public:
     // accumulation; input and weight hold halves, k a multiple of 32, n a multiple of 8.
     bool gemm_f16(const CudaBuffer& input, const CudaBuffer& weight, const CudaBuffer& output, uint32_t m,
                   uint32_t n, uint32_t k, bool bf16, const CudaStream& stream, Error& error);
+    // softmax(q k^T * scale) v per head of 128 over f16 (or bf16) rows, no mask, FlashAttention-2's
+    // forward kernel; head h at column h * 128 of every row, strides in elements, output f16.
+    bool attention_f16(const CudaBuffer& query, uint32_t q_stride, const CudaBuffer& keys, const CudaBuffer& values,
+                       uint32_t kv_stride, const CudaBuffer& output, uint32_t out_stride, uint32_t n_q,
+                       uint32_t n_kv, uint32_t heads, float scale, bool bf16, const CudaStream& stream,
+                       Error& error);
 
 private:
     CudaDevice* m_device = nullptr;
@@ -121,6 +127,9 @@ private:
     CudaModule m_gemm_f16_module;
     CudaKernel m_gemm_f16;
     CudaKernel m_gemm_bf16;
+    CudaModule m_attention_f16_module;
+    CudaKernel m_attention_f16;
+    CudaKernel m_attention_bf16;
 };
 
 }

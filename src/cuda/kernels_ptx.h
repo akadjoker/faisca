@@ -5,6 +5,7 @@ namespace faisca
 
 extern const char ptx_add[];
 extern const char ptx_attention[];
+extern const char ptx_attention_f16[];
 extern const char ptx_embed[];
 extern const char ptx_gemm_f16[];
 extern const char ptx_gemm_q8_0[];
