@@ -947,9 +947,108 @@ bool CkptFile::load(const uint8_t* data, size_t size, Error& error)
     {
         return false;
     }
+    // one tensor of the checkpoint, data pointing into the file
+    const auto add = [&](std::string_view name, uint32_t value_id) -> bool {
+        const int name_size = static_cast<int>(name.size());
+        const Value& t = unpickler.value(value_id);
+        if (t.kind != Kind::Tensor)
+        {
+            error.set("'%.*s' is not a tensor", name_size, name.data());
+            return false;
+        }
+        const Value& storage = unpickler.value(t.refs[0]);
+        const Value& shape = unpickler.value(t.refs[1]);
+        const Value& stride = unpickler.value(t.refs[2]);
+
+        CkptTensor tensor = {};
+        tensor.name = name;
+        uint64_t element_size = 0;
+        if (!storage_dtype(storage.text2, tensor.dtype, element_size))
+        {
+            error.set("'%.*s': unsupported storage %.*s", name_size, name.data(),
+                      static_cast<int>(storage.text2.size()), storage.text2.data());
+            return false;
+        }
+        if (shape.count > CkptTensor::MAX_DIMS || stride.count != shape.count)
+        {
+            error.set("'%.*s': %u dims with %u strides", name_size, name.data(), shape.count, stride.count);
+            return false;
+        }
+        tensor.n_dims = shape.count;
+        tensor.n_elements = 1;
+        for (uint32_t d = 0; d < shape.count; ++d)
+        {
+            const Value& dim = unpickler.value(unpickler.child(t.refs[1], d));
+            if (dim.kind != Kind::Int || dim.number < 0)
+            {
+                error.set("'%.*s': bad dimension %u", name_size, name.data(), d);
+                return false;
+            }
+            tensor.shape[d] = static_cast<uint64_t>(dim.number);
+            if (tensor.shape[d] != 0 && tensor.n_elements > (uint64_t(1) << 48) / tensor.shape[d])
+            {
+                error.set("'%.*s': too many elements", name_size, name.data());
+                return false;
+            }
+            tensor.n_elements *= tensor.shape[d];
+        }
+        uint64_t expected = 1;
+        for (uint32_t d = shape.count; d-- > 0;)
+        {
+            const Value& s = unpickler.value(unpickler.child(t.refs[2], d));
+            if (s.kind != Kind::Int)
+            {
+                error.set("'%.*s': bad stride %u", name_size, name.data(), d);
+                return false;
+            }
+            if (tensor.shape[d] != 1 && static_cast<uint64_t>(s.number) != expected)
+            {
+                error.set("'%.*s': not contiguous", name_size, name.data());
+                return false;
+            }
+            expected *= tensor.shape[d];
+        }
+
+        std::snprintf(path, sizeof(path), "%.*sdata/%.*s", static_cast<int>(prefix.size()), prefix.data(),
+                      static_cast<int>(storage.text.size()), storage.text.data());
+        const ZipEntry* entry = zip.find(path);
+        if (entry == nullptr || entry->method != 0)
+        {
+            error.set("'%.*s': storage %s missing or compressed", name_size, name.data(), path);
+            return false;
+        }
+        if (storage.number < 0 || t.number < 0 || static_cast<uint64_t>(storage.number) > entry->size / element_size ||
+            tensor.n_elements > static_cast<uint64_t>(storage.number) ||
+            static_cast<uint64_t>(t.number) > static_cast<uint64_t>(storage.number) - tensor.n_elements)
+        {
+            error.set("'%.*s': outside its storage", name_size, name.data());
+            return false;
+        }
+        tensor.data = data + entry->offset + static_cast<uint64_t>(t.number) * element_size;
+        tensor.n_bytes = tensor.n_elements * element_size;
+
+        if (m_index.insert(tensor.name, static_cast<uint32_t>(m_tensors.size())) != StringMap::Insert::Added)
+        {
+            error.set("'%.*s' duplicated", name_size, name.data());
+            return false;
+        }
+        m_tensors.push_back_unchecked(tensor);
+        return true;
+    };
+
+    // torch.save(tensor): one tensor at the root, found under the empty name
+    if (unpickler.value(root).kind == Kind::Tensor)
+    {
+        if (!m_tensors.reserve(1) || !m_index.reserve(1))
+        {
+            error.set("out of memory for 1 tensor");
+            return false;
+        }
+        return add(std::string_view(), root);
+    }
     if (unpickler.value(root).kind != Kind::Dict)
     {
-        error.set("checkpoint root is not a dict");
+        error.set("checkpoint root is neither a dict nor a tensor");
         return false;
     }
 
@@ -979,97 +1078,16 @@ bool CkptFile::load(const uint8_t* data, size_t size, Error& error)
         const uint32_t next = unpickler.item(item).next;
         const uint32_t value_id = unpickler.item(next).value;
         item = unpickler.item(next).next;
-
         const Value& key = unpickler.value(key_id);
-        const Value& t = unpickler.value(value_id);
         if (key.kind != Kind::String)
         {
             error.set("state dict key is not a string");
             return false;
         }
-        const int name_size = static_cast<int>(key.text.size());
-        if (t.kind != Kind::Tensor)
+        if (!add(key.text, value_id))
         {
-            error.set("'%.*s' is not a tensor", name_size, key.text.data());
             return false;
         }
-        const Value& storage = unpickler.value(t.refs[0]);
-        const Value& shape = unpickler.value(t.refs[1]);
-        const Value& stride = unpickler.value(t.refs[2]);
-
-        CkptTensor tensor = {};
-        tensor.name = key.text;
-        uint64_t element_size = 0;
-        if (!storage_dtype(storage.text2, tensor.dtype, element_size))
-        {
-            error.set("'%.*s': unsupported storage %.*s", name_size, key.text.data(),
-                      static_cast<int>(storage.text2.size()), storage.text2.data());
-            return false;
-        }
-        if (shape.count > CkptTensor::MAX_DIMS || stride.count != shape.count)
-        {
-            error.set("'%.*s': %u dims with %u strides", name_size, key.text.data(), shape.count, stride.count);
-            return false;
-        }
-        tensor.n_dims = shape.count;
-        tensor.n_elements = 1;
-        for (uint32_t d = 0; d < shape.count; ++d)
-        {
-            const Value& dim = unpickler.value(unpickler.child(t.refs[1], d));
-            if (dim.kind != Kind::Int || dim.number < 0)
-            {
-                error.set("'%.*s': bad dimension %u", name_size, key.text.data(), d);
-                return false;
-            }
-            tensor.shape[d] = static_cast<uint64_t>(dim.number);
-            if (tensor.shape[d] != 0 && tensor.n_elements > (uint64_t(1) << 48) / tensor.shape[d])
-            {
-                error.set("'%.*s': too many elements", name_size, key.text.data());
-                return false;
-            }
-            tensor.n_elements *= tensor.shape[d];
-        }
-        uint64_t expected = 1;
-        for (uint32_t d = shape.count; d-- > 0;)
-        {
-            const Value& s = unpickler.value(unpickler.child(t.refs[2], d));
-            if (s.kind != Kind::Int)
-            {
-                error.set("'%.*s': bad stride %u", name_size, key.text.data(), d);
-                return false;
-            }
-            if (tensor.shape[d] != 1 && static_cast<uint64_t>(s.number) != expected)
-            {
-                error.set("'%.*s': not contiguous", name_size, key.text.data());
-                return false;
-            }
-            expected *= tensor.shape[d];
-        }
-
-        std::snprintf(path, sizeof(path), "%.*sdata/%.*s", static_cast<int>(prefix.size()), prefix.data(),
-                      static_cast<int>(storage.text.size()), storage.text.data());
-        const ZipEntry* entry = zip.find(path);
-        if (entry == nullptr || entry->method != 0)
-        {
-            error.set("'%.*s': storage %s missing or compressed", name_size, key.text.data(), path);
-            return false;
-        }
-        if (storage.number < 0 || t.number < 0 || static_cast<uint64_t>(storage.number) > entry->size / element_size ||
-            tensor.n_elements > static_cast<uint64_t>(storage.number) ||
-            static_cast<uint64_t>(t.number) > static_cast<uint64_t>(storage.number) - tensor.n_elements)
-        {
-            error.set("'%.*s': outside its storage", name_size, key.text.data());
-            return false;
-        }
-        tensor.data = data + entry->offset + static_cast<uint64_t>(t.number) * element_size;
-        tensor.n_bytes = tensor.n_elements * element_size;
-
-        if (m_index.insert(tensor.name, static_cast<uint32_t>(m_tensors.size())) != StringMap::Insert::Added)
-        {
-            error.set("'%.*s' duplicated", name_size, key.text.data());
-            return false;
-        }
-        m_tensors.push_back_unchecked(tensor);
     }
     return true;
 }

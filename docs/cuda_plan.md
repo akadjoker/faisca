@@ -621,6 +621,25 @@ device memory (the rings in f32 are 2.0 GB): too much next to the DiT's 6.43 GB.
 Next: bf16 storage (the encoder runs in bf16 in FlashDreams), two ring slots per
 convolution plus one shared, buffers shared with the decoder and the DiT.
 
+### First local OmniDreams video (2026-11-07)
+
+cli/dreams.cpp (faisca_dreams): the whole rollout of OMNIDREAMS_PIPELINE_CONFIG on
+this RTX 4060, offline: the lightvae encoder alone first (the first frame, then
+the HD map as 5 + 8 + 8 frames, 2 latent frames each), released; then the DiT
+(block weights streamed), the text embeddings (text_embeddings.pt from the
+Kaggle step2 run, now readable: CkptFile takes a bare tensor at the root, under
+the empty name) and the lighttae decoder. Per chunk: our own normal noise (not
+PyTorch's Philox stream), 2 flow matching steps (sigma 1 at t 1000, sigma 0.8333
+at t 832 = bf16(833.3) as the scheduler hands the network the timestep in bf16),
+x0 = x - sigma v, renoise; the first frame's tokens pinned to the image latent
+and the condition mask 1 there on chunk 0 (_maybe_inject_image); finalize at
+context noise 128 (sigma 0.1299, the nearest table entry) to write the cache.
+The Kaggle scene (prompt1, 21 frames): 29.1 s in all, encoder 5.1 s, DiT 4.8,
+6.2, 7.6 s per chunk, decoder 1.0-1.3 s; 0.66 GB of device memory left. The
+video matches the Kaggle run's in content and quality (side by side in
+projects/ref/omnidreams-models/kaggle_scene/out_faisca), details differ with
+the noise; the left car smears away in both (the HD map box, not the model).
+
 ## Phase 5 and exclusions
 
 MoE GPU work waits for a CPU MoE implementation validated against llama.cpp.
