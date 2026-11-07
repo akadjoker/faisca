@@ -421,6 +421,25 @@ top. No third party dependencies. Owner: Luís (akadjoker). "faisca" is a workin
    RAM, so the development model must be a small MoE in Q8_0 (OLMoE-
    1B-7B or Qwen1.5-MoE-A2.7B class), to be confirmed with llama.cpp
    running on it here before the loader is designed.
+12. TripoSR (single image to 3D mesh, stabilityai/TripoSR): in progress.
+   Reference: /media/ctw04578/data/projects/ref/triposr (code/ is
+   VAST-AI-Research/TripoSR, hf/ holds config.yaml and model.ckpt;
+   dump_ref.py <rgba.png> <out> [mc_res] writes every stage as .f32 plus
+   shapes.txt and the torchmcubes mesh; dumps/chair and dumps/chair256 done).
+   Python only produces references, with /media/ctw04578/data/pytorch.
+   Inputs are cut-out RGBA images, rembg is not ported.
+   Done: `CkptFile` (torch_ckpt.h), the owner's choice over a GGUF
+   conversion: torch zip checkpoints (zip64, stored entries, pickle protocol
+   2 to 5 subset, F32/F16/BF16 contiguous tensors pointing into the mapped
+   file, nested "state_dict"). tests/ckpt_dump + tests/compare_ckpt.py: the
+   549 TripoSR tensors match torch.load in names, order, dtype, shape and
+   bytes; open 20 ms. Small F16/BF16/Parameter/view/scalar/nested
+   checkpoints match too, a non contiguous tensor is rejected; 3000 random
+   mutations under ASan/UBSan: no crash. MinGW not checked (no toolchain on
+   this machine).
+   Next: DINO ViT-B/16 (CLS token, bicubic position embedding interpolation
+   of transformers 4.35.0, layer norm eps 1e-12) against vit_tokens, then the
+   triplane transformer, upsample, NeRF MLP density grid and marching cubes.
 
 OmniDreams (NVIDIA video world model) is an exploration, not a plan step:
 read docs/omnidreams_handoff.md first, then docs/omnidreams.md.

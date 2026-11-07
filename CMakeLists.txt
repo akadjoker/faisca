@@ -70,6 +70,7 @@ add_library(faisca_lib STATIC
     src/pocket_text.cpp
     src/pocket_model.cpp
     src/pocket_runner.cpp
+    src/torch_ckpt.cpp
 )
 find_package(Threads REQUIRED)
 target_link_libraries(faisca_lib PUBLIC Threads::Threads)
@@ -139,6 +140,9 @@ if(FAISCA_BUILD_TESTS)
     target_link_libraries(image_check PRIVATE faisca_lib)
     add_executable(vision_dump tests/vision_dump.cpp)
     target_link_libraries(vision_dump PRIVATE faisca_lib)
+    add_executable(ckpt_dump tests/ckpt_dump.cpp)
+    target_link_libraries(ckpt_dump PRIVATE faisca_lib)
+    target_compile_options(ckpt_dump PRIVATE ${FAISCA_WARNINGS})
     add_executable(describe_dump tests/describe_dump.cpp)
     target_link_libraries(describe_dump PRIVATE faisca_lib)
     target_link_libraries(runner_dump PRIVATE faisca_lib)
