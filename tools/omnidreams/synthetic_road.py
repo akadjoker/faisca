@@ -31,6 +31,8 @@ parser.add_argument("--first-car", type=float, default=6.0)
 parser.add_argument("--car-every", type=float, default=7.0)
 parser.add_argument("--car-speed", type=float, default=80.0, help="km/h")
 parser.add_argument("--straight", type=float, default=150.0, help="metres before the first bend")
+parser.add_argument("--pitch", type=float, default=0.0, help="rig pitch in degrees, + up (a camera mounted tilted)")
+parser.add_argument("--yaw", type=float, default=0.0, help="rig yaw in degrees off the direction of travel, + left")
 args = parser.parse_args()
 
 speed = args.speed / 3.6
@@ -66,6 +68,14 @@ def quat_yaw(h):
     return {"x": 0.0, "y": 0.0, "z": math.sin(h / 2), "w": math.cos(h / 2)}
 
 
+def quat_rig(h):
+    # yaw about z, then pitch about the rig's left axis (FLU: a positive turn about y tilts x down)
+    a = h + math.radians(args.yaw)
+    b = -math.radians(args.pitch)
+    cz, sz, cy, sy = math.cos(a / 2), math.sin(a / 2), math.cos(b / 2), math.sin(b / 2)
+    return {"x": -sz * sy, "y": cz * sy, "z": sz * cy, "w": cz * cy}
+
+
 clip = "synthetic_rural_road"
 clipgt = os.path.join(args.out, "clipgt")
 os.makedirs(clipgt, exist_ok=True)
@@ -87,7 +97,7 @@ for t in times:
     p, h = at(start_s + speed * t, ego_lateral)
     ego_keys.append({"clip_id": clip, "timestamp_micros": int(round(t * 1e6)), "label_class_id": "osi:host_vehicle"})
     ego_values.append({"name": "host_vehicle", "location": {"x": float(p[0]), "y": float(p[1]), "z": 0.0},
-                       "orientation": quat_yaw(h)})
+                       "orientation": quat_rig(h)})
 write("egomotion_estimate", ego_keys, ego_values)
 
 car_speed = args.car_speed / 3.6
