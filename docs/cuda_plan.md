@@ -584,6 +584,22 @@ size (tests/cuda_dit_bench, real checkpoint, 2 x 44 x 80 = 7040 tokens, window
 first chunk (28 x the 56 ms block: the copies are hidden), 2.05 s on the
 second, 2.55 s with the window full; 3 passes a chunk: 4.8, 6.2, 7.7 s.
 
+### TAEHV video decoder (2026-11-07)
+
+TaehvCudaDecoder (include/faisca/taehv_cuda.h, src/cuda/taehv.cpp,
+src/cuda/kernels/taehv.cu): the lighttaew2_1.pth decoder OmniDreams uses
+(FlashDreams recipes/taehv impl.py Decoder, TaehvVAEDecoder's lighttae latent
+scaling), f32. One frame at a time through the network (a MemBlock only looks
+one frame back, so this equals the whole chunk), the memories swapped in as
+cache_step saves them; TGrow (1x1) before the nearest upsample and the upsample
+read inside the next convolution (both exact). One tiled convolution kernel
+(64 output channels x 16 x 8 pixels a block) with two concatenated inputs,
+bias, residual, ReLU and [0, 1] clamp in the epilogue.
+tests/taehv_reference.py (float64, whole chunks, 2 chunks) against
+tests/cuda_taehv: rel L2 4e-7, worst pixel 2.3e-6 (0.0006 of 255), 5 then 8
+frames. At the real size (88 x 160 latents, 704 x 1280 frames): 520-543 ms a
+chunk of 2 latent frames, against 7.7 s of DiT.
+
 ## Phase 5 and exclusions
 
 MoE GPU work waits for a CPU MoE implementation validated against llama.cpp.
