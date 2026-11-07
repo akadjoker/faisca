@@ -40,7 +40,7 @@ int main(int argc, char** argv)
 {
     if (argc < 4)
     {
-        std::fprintf(stderr, "usage: triposr_dump <model.ckpt> <reference dir with rgb_cond.f32> <out dir, - for no traces> [threads]\n");
+        std::fprintf(stderr, "usage: triposr_dump <model.ckpt> <reference dir with rgb_cond.f32> <out dir, - for no traces> [threads] [mesh resolution, 64]\n");
         return 2;
     }
     const int threads = argc > 4 ? std::atoi(argv[4]) : static_cast<int>(std::thread::hardware_concurrency());
@@ -93,5 +93,28 @@ int main(int argc, char** argv)
         return 1;
     }
     std::fprintf(stderr, "triplane %.3f s\n", seconds_since(start));
+
+    const uint32_t resolution = argc > 5 ? static_cast<uint32_t>(std::atoi(argv[5])) : 64;
+    start = std::chrono::steady_clock::now();
+    faisca::TripoMesh mesh;
+    if (!runner.extract_mesh(resolution, 25.0f, mesh, error))
+    {
+        std::fprintf(stderr, "error: %s\n", error.c_str());
+        return 1;
+    }
+    std::fprintf(stderr, "mesh %u^3: %zu vertices, %zu faces, %.3f s\n", resolution, mesh.positions.size() / 3,
+                 mesh.faces.size() / 3, seconds_since(start));
+    if (dump.dir != "-")
+    {
+        write_trace(&dump, "mc_vertices", -1, mesh.positions.data(), mesh.positions.size());
+        write_trace(&dump, "mc_colors", -1, mesh.colors.data(), mesh.colors.size());
+        const std::string faces = dump.dir + "/mc_faces.u32";
+        FILE* out = std::fopen(faces.c_str(), "wb");
+        if (out != nullptr)
+        {
+            std::fwrite(mesh.faces.data(), sizeof(uint32_t), mesh.faces.size(), out);
+            std::fclose(out);
+        }
+    }
     return 0;
 }

@@ -297,6 +297,34 @@ bool TripoModel::open(const char* path, Error& error)
         }
     }
     add_linear(m_upsample_rows.data(), rows, DIM, m_upsample);
+
+    for (uint32_t i = 0; i + 1 < MLP_LAYERS; ++i)
+    {
+        std::snprintf(key, sizeof(key), "decoder.layers.%u", 2 * i);
+        if (!linear(key, MLP_WIDTH, i == 0 ? MLP_IN : MLP_WIDTH, m_mlp[i], &m_mlp_b[i], error))
+        {
+            return false;
+        }
+    }
+    std::snprintf(key, sizeof(key), "decoder.layers.%u.weight", 2 * (MLP_LAYERS - 1));
+    const float* last_w = f32(key, 4, MLP_WIDTH, 0, 0, error);
+    std::snprintf(key, sizeof(key), "decoder.layers.%u.bias", 2 * (MLP_LAYERS - 1));
+    const float* last_b = f32(key, 4, 0, 0, 0, error);
+    if (!last_w || !last_b)
+    {
+        return false;
+    }
+    if (!m_mlp_last.resize_uninitialized(F32_PANEL * MLP_WIDTH + F32_PANEL))
+    {
+        error.set("out of memory for the TripoSR decoder");
+        return false;
+    }
+    std::memset(m_mlp_last.data(), 0, m_mlp_last.size() * sizeof(float));
+    std::memcpy(m_mlp_last.data(), last_w, 4 * MLP_WIDTH * sizeof(float));
+    std::memcpy(m_mlp_last.data() + F32_PANEL * MLP_WIDTH, last_b, 4 * sizeof(float));
+    add_linear(m_mlp_last.data(), F32_PANEL, MLP_WIDTH, m_mlp[MLP_LAYERS - 1]);
+    m_mlp_b[MLP_LAYERS - 1] = m_mlp_last.data() + F32_PANEL * MLP_WIDTH;
+
     if (!pack_linears(error))
     {
         return false;
@@ -392,7 +420,10 @@ bool TripoRunner::init(const TripoModel& model, ThreadPool& pool, Error& error)
                     m_scores.resize_uninitialized(threads * ATTENTION_QUERIES * (rows + KEY_TILE)) &&
                     m_k_tiles.resize_uninitialized(TripoModel::HEADS * (rows + KEY_TILE) * (TripoModel::DIM / TripoModel::HEADS)) &&
                     m_v_heads.resize_uninitialized(wide) && m_code.resize_uninitialized(code) &&
-                    m_gemm_scratch.resize_uninitialized(threads * gemm_f32_scratch(TripoModel::FF > rows ? TripoModel::FF : rows));
+                    m_gemm_scratch.resize_uninitialized(threads * gemm_f32_scratch(TripoModel::FF > rows ? TripoModel::FF : rows)) &&
+                    m_planes_last.resize_uninitialized(code) &&
+                    m_query.resize_uninitialized(threads * QUERY_CHUNK *
+                                                 (TripoModel::MLP_IN + 2 * TripoModel::MLP_WIDTH + F32_PANEL));
     if (!ok)
     {
         error.set("out of memory for the TripoSR buffers");
@@ -773,7 +804,476 @@ bool TripoRunner::build_triplane(Error& error)
         }
     }
     trace("scene_codes", -1, m_code.data(), m_code.size());
+    for (size_t np = 0; np < 3; ++np)
+    {
+        for (size_t pixel = 0; pixel < code_side * code_side; ++pixel)
+        {
+            for (size_t c = 0; c < channels; ++c)
+            {
+                m_planes_last[(np * code_side * code_side + pixel) * channels + c] =
+                    m_code[(np * channels + c) * code_side * code_side + pixel];
+            }
+        }
+    }
     return true;
+}
+
+namespace
+{
+
+// F.grid_sample(mode="bilinear", padding_mode="zeros", align_corners=False) of one plane
+// at (gx, gy) in [-1, 1], as PyTorch v2.11.0 GridSamplerKernel.cpp ApplyGridSample computes
+// it; plane is [size][size][channels]
+void sample_plane(const float* plane, int size, size_t channels, float gx, float gy, float* out)
+{
+    const float half = static_cast<float>(size) / 2;
+    const float x = (gx + 1.0f) * half - 0.5f;
+    const float y = (gy + 1.0f) * half - 0.5f;
+    const float x_w = std::floor(x);
+    const float y_n = std::floor(y);
+    const float w = x - x_w;
+    const float e = 1.0f - w;
+    const float n = y - y_n;
+    const float s = 1.0f - n;
+    const float nw = s * e;
+    const float ne = s * w;
+    const float sw = n * e;
+    const float se = n * w;
+    const int ix = static_cast<int>(x_w);
+    const int iy = static_cast<int>(y_n);
+    const bool west = ix > -1 && ix < size;
+    const bool east = ix + 1 > -1 && ix + 1 < size;
+    const bool north = iy > -1 && iy < size;
+    const bool south = iy + 1 > -1 && iy + 1 < size;
+    const float* p_nw = plane + (size_t(iy) * size_t(size) + size_t(ix)) * channels;
+    const float* p_ne = p_nw + channels;
+    const float* p_sw = p_nw + size_t(size) * channels;
+    const float* p_se = p_sw + channels;
+    for (size_t c = 0; c < channels; ++c)
+    {
+        const float v_nw = west && north ? p_nw[c] : 0.0f;
+        const float v_ne = east && north ? p_ne[c] : 0.0f;
+        const float v_sw = west && south ? p_sw[c] : 0.0f;
+        const float v_se = east && south ? p_se[c] : 0.0f;
+        out[c] = v_nw * nw + v_ne * ne + v_sw * sw + v_se * se;
+    }
+}
+
+void add_bias_rows(float* x, const float* bias, size_t rows, size_t width)
+{
+    for (size_t r = 0; r < rows; ++r)
+    {
+        for (size_t i = 0; i < width; ++i)
+        {
+            x[r * width + i] += bias[i];
+        }
+    }
+}
+
+// x / (1 + exp(-x)), the form of PyTorch's vectorized silu; tmp holds n floats
+void silu_values(float* x, float* tmp, size_t n)
+{
+    for (size_t i = 0; i < n; ++i)
+    {
+        tmp[i] = -x[i];
+    }
+    exp_values(tmp, n);
+    for (size_t i = 0; i < n; ++i)
+    {
+        x[i] = x[i] / (1.0f + tmp[i]);
+    }
+}
+
+}
+
+bool TripoRunner::query_points(PointSource source, const void* user, size_t n, float* density, float* color,
+                               Error& error)
+{
+    if (m_model == nullptr)
+    {
+        error.set("TripoRunner used before init");
+        return false;
+    }
+    const TripoModel& m = *m_model;
+    const size_t in = TripoModel::MLP_IN;
+    const size_t width = TripoModel::MLP_WIDTH;
+    const size_t channels = TripoModel::CODE_CHANNELS;
+    const int side = static_cast<int>(TripoModel::CODE_SIZE);
+    const size_t plane = size_t(side) * size_t(side) * channels;
+    const size_t per_thread = m_query.size() / static_cast<size_t>(m_pool->size());
+    const size_t scratch_per_thread = m_gemm_scratch.size() / static_cast<size_t>(m_pool->size());
+    const size_t chunks = (n + QUERY_CHUNK - 1) / QUERY_CHUNK;
+    const float low = -TripoModel::RADIUS;
+    const float span = TripoModel::RADIUS - low;
+    parallel_dynamic(*m_pool, chunks, 1,
+                     [&](size_t first, size_t last, int thread)
+                     {
+                         float* features = m_query.data() + size_t(thread) * per_thread;
+                         float* a = features + QUERY_CHUNK * in;
+                         float* b = a + QUERY_CHUNK * width;
+                         float* out = b + QUERY_CHUNK * width;
+                         float* scratch = m_gemm_scratch.data() + size_t(thread) * scratch_per_thread;
+                         for (size_t u = first; u < last; ++u)
+                         {
+                             const size_t p0 = u * QUERY_CHUNK;
+                             const size_t count = n - p0 < QUERY_CHUNK ? n - p0 : QUERY_CHUNK;
+                             for (size_t i = 0; i < count; ++i)
+                             {
+                                 float p[3];
+                                 source(user, p0 + i, p);
+                                 float q[3];
+                                 for (int d = 0; d < 3; ++d)
+                                 {
+                                     q[d] = (p[d] - low) / span * 2.0f + -1.0f;
+                                 }
+                                 float* f = features + i * in;
+                                 sample_plane(m_planes_last.data(), side, channels, q[0], q[1], f);
+                                 sample_plane(m_planes_last.data() + plane, side, channels, q[0], q[2], f + channels);
+                                 sample_plane(m_planes_last.data() + 2 * plane, side, channels, q[1], q[2],
+                                              f + 2 * channels);
+                             }
+                             const float* x = features;
+                             size_t x_width = in;
+                             for (uint32_t l = 0; l + 1 < TripoModel::MLP_LAYERS; ++l)
+                             {
+                                 const TripoLinear& w = m.mlp(l);
+                                 gemm_f32_packed(w.panels, w.n_in, x, x_width, count, 0, width, a, width, scratch);
+                                 add_bias_rows(a, m.mlp_b(l), count, width);
+                                 silu_values(a, b, count * width);
+                                 float* t = a;
+                                 a = b;
+                                 b = t;
+                                 x = b;
+                                 x_width = width;
+                             }
+                             const TripoLinear& w = m.mlp(TripoModel::MLP_LAYERS - 1);
+                             gemm_f32_packed(w.panels, w.n_in, x, x_width, count, 0, F32_PANEL, out, F32_PANEL, scratch);
+                             add_bias_rows(out, m.mlp_b(TripoModel::MLP_LAYERS - 1), count, F32_PANEL);
+                             float* d = density + p0;
+                             for (size_t i = 0; i < count; ++i)
+                             {
+                                 d[i] = out[i * F32_PANEL] + TripoModel::DENSITY_BIAS;
+                             }
+                             exp_values(d, count);
+                             if (color != nullptr)
+                             {
+                                 float* c = color + 3 * p0;
+                                 for (size_t i = 0; i < count; ++i)
+                                 {
+                                     for (int k = 0; k < 3; ++k)
+                                     {
+                                         c[3 * i + size_t(k)] = -out[i * F32_PANEL + 1 + size_t(k)];
+                                     }
+                                 }
+                                 exp_values(c, 3 * count);
+                                 for (size_t i = 0; i < 3 * count; ++i)
+                                 {
+                                     c[i] = 1.0f / (1.0f + c[i]);
+                                 }
+                             }
+                         }
+                     });
+    return true;
+}
+
+bool TripoRunner::query(const float* points, size_t n, float* density, float* color, Error& error)
+{
+    return query_points([](const void* user, size_t index, float out[3])
+                        { std::memcpy(out, static_cast<const float*>(user) + 3 * index, 3 * sizeof(float)); },
+                        points, n, density, color, error);
+}
+
+namespace
+{
+
+#include "triposr_mc_tables.inc"
+
+struct McPoint
+{
+    float x;
+    float y;
+    float z;
+};
+
+// torchmcubes VertexInterp
+McPoint vertex_interp(float isolevel, McPoint p1, McPoint p2, float v1, float v2)
+{
+    if (std::fabs(isolevel - v1) < 1.0e-4f)
+    {
+        return p1;
+    }
+    if (std::fabs(isolevel - v2) < 1.0e-4f)
+    {
+        return p2;
+    }
+    if (std::fabs(v1 - v2) < 1.0e-4f)
+    {
+        return p1;
+    }
+    const float mu = (isolevel - v1) / (v2 - v1);
+    return McPoint{p1.x + mu * (p2.x - p1.x), p1.y + mu * (p2.y - p1.y), p1.z + mu * (p2.z - p1.z)};
+}
+
+// torchmcubes Polygonise and the cell setup of mcubes_method for the cell at (x, y, z),
+// vol[z][y][x] with vol of side size; returns the triangle count, writing 3 points each
+// when out is not null
+int polygonise(const float* vol, size_t size, int x, int y, int z, McPoint* out)
+{
+    static const int INDEX[8] = {0, 1, 4, 5, 3, 2, 7, 6};
+    McPoint p[8];
+    float val[8];
+    for (int i = 0; i < 8; ++i)
+    {
+        const int dx = i % 2;
+        const int dy = (i / 2) % 2;
+        const int dz = i / 4;
+        p[INDEX[i]] = McPoint{float(x + dx), float(y + dy), float(z + dz)};
+        val[INDEX[i]] = vol[(size_t(z + dz) * size + size_t(y + dy)) * size + size_t(x + dx)];
+    }
+    const float iso = 0.0f;
+    int cube = 0;
+    for (int i = 0; i < 8; ++i)
+    {
+        if (val[i] < iso)
+        {
+            cube |= 1 << i;
+        }
+    }
+    const int edges = MC_EDGES[cube];
+    if (edges == 0)
+    {
+        return 0;
+    }
+    if (out == nullptr)
+    {
+        int count = 0;
+        for (int i = 0; MC_TRIANGLES[cube][i] != -1; i += 3)
+        {
+            count += 1;
+        }
+        return count;
+    }
+    static const int FROM[12] = {0, 1, 2, 3, 4, 5, 6, 7, 0, 1, 2, 3};
+    static const int TO[12] = {1, 2, 3, 0, 5, 6, 7, 4, 4, 5, 6, 7};
+    McPoint list[12] = {};
+    for (int e = 0; e < 12; ++e)
+    {
+        if (edges & (1 << e))
+        {
+            list[e] = vertex_interp(iso, p[FROM[e]], p[TO[e]], val[FROM[e]], val[TO[e]]);
+        }
+    }
+    int count = 0;
+    for (int i = 0; MC_TRIANGLES[cube][i] != -1; i += 3)
+    {
+        out[3 * count + 0] = list[MC_TRIANGLES[cube][i]];
+        out[3 * count + 1] = list[MC_TRIANGLES[cube][i + 1]];
+        out[3 * count + 2] = list[MC_TRIANGLES[cube][i + 2]];
+        count += 1;
+    }
+    return count;
+}
+
+uint64_t point_hash(const McPoint& p)
+{
+    uint32_t bits[3];
+    std::memcpy(bits, &p, sizeof(bits));
+    uint64_t h = 0x9e3779b97f4a7c15ull;
+    for (uint32_t b : bits)
+    {
+        h = (h ^ b) * 0xff51afd7ed558ccdull;
+        h ^= h >> 32;
+    }
+    return h;
+}
+
+struct GridSource
+{
+    const float* lin;
+    size_t size;
+};
+
+}
+
+bool tripo_marching_cubes(ThreadPool& pool, const float* vol, uint32_t resolution, Array<float>& points,
+                          Array<uint32_t>& faces, Error& error)
+{
+    const size_t size = resolution;
+    const size_t cells = size - 1;
+    // triangles per z slab counted, then written at their offsets, so the order is the
+    // serial order of mcubes_method whatever the thread count
+    Array<size_t> offsets;
+    if (!offsets.resize_uninitialized(cells + 1))
+    {
+        error.set("out of memory for the marching cubes");
+        return false;
+    }
+    parallel_dynamic(pool, cells, 1,
+                     [&](size_t first, size_t last, int)
+                     {
+                         for (size_t z = first; z < last; ++z)
+                         {
+                             size_t count = 0;
+                             for (size_t y = 0; y < cells; ++y)
+                             {
+                                 for (size_t x = 0; x < cells; ++x)
+                                 {
+                                     count += size_t(polygonise(vol, size, int(x), int(y), int(z), nullptr));
+                                 }
+                             }
+                             offsets[z + 1] = count;
+                         }
+                     });
+    offsets[0] = 0;
+    for (size_t z = 0; z < cells; ++z)
+    {
+        offsets[z + 1] += offsets[z];
+    }
+    const size_t n_triangles = offsets[cells];
+    Array<McPoint> corners;
+    if (!corners.resize_uninitialized(3 * n_triangles + 15))
+    {
+        error.set("out of memory for %zu triangles", n_triangles);
+        return false;
+    }
+    parallel_dynamic(pool, cells, 1,
+                     [&](size_t first, size_t last, int)
+                     {
+                         for (size_t z = first; z < last; ++z)
+                         {
+                             McPoint* out = corners.data() + 3 * offsets[z];
+                             for (size_t y = 0; y < cells; ++y)
+                             {
+                                 for (size_t x = 0; x < cells; ++x)
+                                 {
+                                     out += 3 * polygonise(vol, size, int(x), int(y), int(z), out);
+                                 }
+                             }
+                         }
+                     });
+
+    // unique vertices in first seen order, by exact position as the unordered_map of XYZ
+    size_t slots = 16;
+    while (slots < 6 * n_triangles)
+    {
+        slots *= 2;
+    }
+    Array<uint32_t> table;
+    Array<McPoint> unique;
+    if (!table.resize_uninitialized(slots) || !unique.reserve(3 * n_triangles) ||
+        !faces.resize_uninitialized(3 * n_triangles))
+    {
+        error.set("out of memory for %zu triangles", n_triangles);
+        return false;
+    }
+    std::memset(table.data(), 0xff, slots * sizeof(uint32_t));
+    for (size_t i = 0; i < 3 * n_triangles; ++i)
+    {
+        const McPoint& p = corners[i];
+        size_t slot = static_cast<size_t>(point_hash(p)) & (slots - 1);
+        for (;;)
+        {
+            const uint32_t index = table[slot];
+            if (index == 0xffffffffu)
+            {
+                table[slot] = static_cast<uint32_t>(unique.size());
+                unique.push_back_unchecked(p);
+                faces[i] = table[slot];
+                break;
+            }
+            const McPoint& q = unique[index];
+            if (q.x == p.x && q.y == p.y && q.z == p.z)
+            {
+                faces[i] = index;
+                break;
+            }
+            slot = (slot + 1) & (slots - 1);
+        }
+    }
+
+    if (!points.resize_uninitialized(3 * unique.size()))
+    {
+        error.set("out of memory for %zu vertices", unique.size());
+        return false;
+    }
+    std::memcpy(points.data(), unique.data(), unique.size() * sizeof(McPoint));
+    return true;
+}
+
+bool TripoRunner::extract_mesh(uint32_t resolution, float threshold, TripoMesh& mesh, Error& error)
+{
+    if (m_model == nullptr || resolution < 2)
+    {
+        error.set("TripoRunner::extract_mesh: no model or resolution below 2");
+        return false;
+    }
+    const size_t size = resolution;
+    Array<float> lin;
+    Array<float> vol;
+    if (!lin.resize_uninitialized(size) || !vol.resize_uninitialized(size * size * size))
+    {
+        error.set("out of memory for a %u^3 density grid", resolution);
+        return false;
+    }
+    // torch.linspace(0, 1, size) (RangeFactoriesKernel.cpp linspace_kernel), then
+    // scale_tensor to (-RADIUS, RADIUS)
+    const float step = (1.0f - 0.0f) / static_cast<float>(size - 1);
+    for (size_t i = 0; i < size; ++i)
+    {
+        const float v = i < size / 2 ? 0.0f + step * static_cast<float>(i)
+                                     : 1.0f - step * static_cast<float>(size - i - 1);
+        lin[i] = v * (TripoModel::RADIUS - -TripoModel::RADIUS) + -TripoModel::RADIUS;
+    }
+    GridSource grid = {lin.data(), size};
+    if (!query_points(
+            [](const void* user, size_t index, float out[3])
+            {
+                const GridSource& g = *static_cast<const GridSource*>(user);
+                out[0] = g.lin[index / (g.size * g.size)];
+                out[1] = g.lin[(index / g.size) % g.size];
+                out[2] = g.lin[index % g.size];
+            },
+            &grid, size * size * size, vol.data(), nullptr, error))
+    {
+        return false;
+    }
+    trace("density_act", -1, vol.data(), vol.size());
+    for (size_t i = 0; i < vol.size(); ++i)
+    {
+        vol[i] = vol[i] - threshold;
+    }
+
+    Array<float> grid_points;
+    if (!tripo_marching_cubes(*m_pool, vol.data(), resolution, grid_points, mesh.faces, error))
+    {
+        return false;
+    }
+
+    // v_pos[..., [2, 1, 0]] / (resolution - 1), scale_tensor to (-RADIUS, RADIUS)
+    const size_t n_vertices = grid_points.size() / 3;
+    if (!mesh.positions.resize_uninitialized(3 * n_vertices) || !mesh.colors.resize_uninitialized(3 * n_vertices))
+    {
+        error.set("out of memory for %zu vertices", n_vertices);
+        return false;
+    }
+    const float scale = static_cast<float>(resolution) - 1.0f;
+    for (size_t i = 0; i < n_vertices; ++i)
+    {
+        const float* g = grid_points.data() + 3 * i;
+        const float v[3] = {g[2] / scale, g[1] / scale, g[0] / scale};
+        for (int d = 0; d < 3; ++d)
+        {
+            mesh.positions[3 * i + size_t(d)] =
+                v[d] * (TripoModel::RADIUS - -TripoModel::RADIUS) + -TripoModel::RADIUS;
+        }
+    }
+    Array<float> density;
+    if (!density.resize_uninitialized(n_vertices))
+    {
+        error.set("out of memory for %zu vertices", n_vertices);
+        return false;
+    }
+    return query(mesh.positions.data(), n_vertices, density.data(), mesh.colors.data(), error);
 }
 
 }

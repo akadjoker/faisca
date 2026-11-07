@@ -91,6 +91,12 @@ public:
     static constexpr uint32_t CODE_CHANNELS = 40;
     static constexpr uint32_t CODE_SIZE = 2 * PLANE_SIZE;
 
+    static constexpr uint32_t MLP_IN = 3 * CODE_CHANNELS;
+    static constexpr uint32_t MLP_WIDTH = 64;
+    static constexpr uint32_t MLP_LAYERS = 10;
+    static constexpr float RADIUS = 0.87f;
+    static constexpr float DENSITY_BIAS = -1.0f;
+
     TripoModel() = default;
 
     TripoModel(const TripoModel&) = delete;
@@ -185,6 +191,18 @@ public:
         return m_upsample_b;
     }
 
+    // NeRFMLP: MLP_LAYERS linear layers, SiLU between them; the last one padded from 4 to
+    // F32_PANEL outputs with zero rows (density, then the three color features)
+    const TripoLinear& mlp(uint32_t index) const
+    {
+        return m_mlp[index];
+    }
+
+    const float* mlp_b(uint32_t index) const
+    {
+        return m_mlp_b[index];
+    }
+
 private:
     const float* f32(const char* name, uint64_t d0, uint64_t d1, uint64_t d2, uint64_t d3, Error& error);
     bool linear(const char* name, uint64_t n_out, uint64_t n_in, TripoLinear& w, const float** bias, Error& error);
@@ -220,6 +238,9 @@ private:
     const float* m_proj_out_b = nullptr;
     Array<float> m_upsample_rows;
     TripoLinear m_upsample;
+    TripoLinear m_mlp[MLP_LAYERS] = {};
+    const float* m_mlp_b[MLP_LAYERS] = {};
+    Array<float> m_mlp_last;
     const float* m_upsample_b = nullptr;
 };
 
@@ -227,6 +248,19 @@ private:
 // torch.nn.functional.interpolate(mode="bicubic", align_corners=False, scale_factor=scale)
 // does on the CPU in float32
 void tripo_bicubic_rows(const float* pos, uint32_t side, uint32_t dim, double scale, uint32_t out_side, float* out);
+
+// torchmcubes mcubes_cpu (commit a9ac95a) of vol, resolution^3 values indexed
+// [z][y][x], at level 0: points gets x, y, z in grid units per unique vertex (first seen
+// order of the serial loop, merged by exact position), faces three indices per triangle
+bool tripo_marching_cubes(ThreadPool& pool, const float* vol, uint32_t resolution, Array<float>& points,
+                          Array<uint32_t>& faces, Error& error);
+
+struct TripoMesh
+{
+    Array<float> positions; // x, y, z per vertex, in (-RADIUS, RADIUS)
+    Array<float> colors;    // r, g, b per vertex in [0, 1]
+    Array<uint32_t> faces;  // three vertex indices per triangle
+};
 
 class TripoRunner
 {
@@ -268,8 +302,21 @@ public:
         return m_code.data();
     }
 
+    // TriplaneNeRFRenderer.query_triplane over scene_code(): density_act (exp of the
+    // density plus DENSITY_BIAS) and, if color is not null, the sigmoid colors (3 per
+    // point) at n points (3 floats each) in (-RADIUS, RADIUS)
+    bool query(const float* points, size_t n, float* density, float* color, Error& error);
+
+    // TSR.extract_mesh: density on a resolution^3 grid, torchmcubes marching cubes of
+    // density - threshold at 0, vertices back in (-RADIUS, RADIUS), colors at the vertices
+    bool extract_mesh(uint32_t resolution, float threshold, TripoMesh& mesh, Error& error);
+
 private:
     static constexpr size_t ATTENTION_QUERIES = 48;
+    static constexpr size_t QUERY_CHUNK = 1024;
+
+    typedef void (*PointSource)(const void* user, size_t index, float out[3]);
+    bool query_points(PointSource source, const void* user, size_t n, float* density, float* color, Error& error);
 
     void trace(const char* name, int layer, const float* data, size_t count) const;
     // x_stride 0 means w.n_in
@@ -299,6 +346,8 @@ private:
     Array<float> m_k_tiles;
     Array<float> m_v_heads;
     Array<float> m_gemm_scratch;
+    Array<float> m_planes_last; // scene_code() as [3][CODE_SIZE][CODE_SIZE][CODE_CHANNELS]
+    Array<float> m_query;       // per thread: QUERY_CHUNK x (MLP_IN + 2 MLP_WIDTH + F32_PANEL)
     Array<float> m_code;
 };
 

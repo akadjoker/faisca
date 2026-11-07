@@ -477,10 +477,32 @@ top. No third party dependencies. Owner: Luís (akadjoker). "faisca" is a workin
    pairs and by 4 E cores; attention keeps ~2.2 MB per thread). open takes
    1.9 s: single threaded packing of 1.68 GB read through the NTFS FUSE
    mount.
-   Next: NeRF MLP density grid (grid_sample bilinear, align_corners False,
-   on the three planes xy, xz, yz, concat to 120, 9 x 64 SiLU, density
-   exp(x - 1)), marching cubes against torchmcubes, then the preprocessing
-   (resize_foreground, antialiased bilinear to 512).
+   Done: mesh (`TripoRunner::query`, `extract_mesh`, `tripo_marching_cubes`).
+   query_triplane: grid_sample bilinear, zeros, align_corners False as
+   PyTorch v2.11.0 GridSamplerKernel.cpp computes it (x = (g + 1) * W/2 -
+   0.5; sources in /media/ctw04578/data/projects/ref/pytorch-v2.11.0-gridsample),
+   planes (x,y), (x,z), (y,z) concatenated to 120, NeRFMLP 10 layers with
+   SiLU as x / (1 + exp(-x)) through gemm_f32_packed (last layer padded to
+   16 rows), density exp(d - 1), color sigmoid. extract_mesh: linspace as
+   RangeFactoriesKernel.cpp, scale_tensor order, torchmcubes mcubes_cpu
+   (commit a9ac95a, tables in src/triposr_mc_tables.inc, clone in
+   ref/triposr/torchmcubes) with the slabs counted then written so the
+   order is the serial one, vertices merged by exact position.
+   dump_ref.py now dumps extract_mesh step by step without trimesh
+   (density_act, mc_vertices, mc_faces.i32, mc_colors). Checks:
+   tests/triposr_mc_check (the reference density through our marching
+   cubes): vertices and oriented triangles bit identical at 64^3 (2464 /
+   4896) and 256^3 (42170 / 84160); the reference joins its z slabs in
+   OpenMP order, so the check compares sets. Whole pipeline
+   (tests/compare_triposr_mesh.py): density rel L2 4.7e-6, no grid point
+   on the other side of the threshold, 256^3 same vertex and face counts,
+   vertices within 0.01 cell, colors within 1e-4; at 64^3 2469 vertices
+   against 2464, because torchmcubes computes a shared edge from both cells
+   in opposite directions and merges them only when the floats coincide.
+   Bit identical with 22 and 7 threads. extract_mesh 256^3: 8.0-9.4 s
+   against 26.5 s for PyTorch CPU extract_mesh.
+   Next: preprocessing (resize_foreground, antialiased bilinear to 512,
+   rembg), a CLI command writing a mesh file, CUDA, CPU cache tuning.
 
 OmniDreams (NVIDIA video world model) is an exploration, not a plan step:
 read docs/omnidreams_handoff.md first, then docs/omnidreams.md.
