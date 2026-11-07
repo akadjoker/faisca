@@ -52,6 +52,10 @@ struct DitConfig
     float h_extrapolation = 3.0f;
     float w_extrapolation = 3.0f;
     float t_extrapolation = 1.0f;
+    // the large block weights (qkv, out, cross q and out, MLP: 112 MB a block) stay in pinned
+    // host memory and are copied block by block into two device slots on a second stream,
+    // overlapped with the computation of the block before
+    bool stream_weights = false;
 };
 
 class DitCudaRunner
@@ -83,17 +87,27 @@ public:
 private:
     struct Block
     {
-        CudaBuffer qkv, q_norm, k_norm, out, cross_q, cross_kv, cross_q_norm, cross_k_norm, cross_out, mlp_up,
-            mlp_down, mod_down[3], mod_up[3], text_kv, cache;
+        // the streamed ones first, in their slot layout
+        CudaBuffer qkv, out, cross_q, cross_out, mlp_up, mlp_down;
+        CudaBuffer q_norm, k_norm, cross_kv, cross_q_norm, cross_k_norm, mod_down[3], mod_up[3], text_kv, cache;
         DitKvCache kv;
     };
 
     bool upload(CudaBuffer& buffer, const void* data, size_t bytes, Error& error);
     bool run_block(Block& block, uint32_t index, int64_t chunk_index, Error& error);
+    bool run_blocks(int64_t chunk_index, Error& error);
+    bool copy_block(uint32_t index, Error& error);
+    void point_at_slot(Block& block, uint32_t slot);
 
     CudaDevice* m_device = nullptr;
     CudaKernels m_kernels;
     CudaStream m_stream;
+    CudaStream m_copy_stream;
+    CudaEvent m_loaded[2];
+    CudaEvent m_free[2];
+    CudaHostBuffer m_host_blocks;
+    CudaBuffer m_slots[2];
+    bool m_streaming = false;
     DitConfig m_config;
     uint32_t m_chunk = 0;
     uint32_t m_block_count = 0;

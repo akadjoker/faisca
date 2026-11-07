@@ -574,9 +574,15 @@ timesteps against the float64 run of the same weights on the CPU
 1.1-2.2e-2; 113-143 ms per pass at 768 tokens.
 Memory at the real size (7040 tokens, window 21120): block weights 3.64 GB,
 caches 4.84 GB, text projection 0.2 GB, activations ~0.4 GB: ~9.1 GB, over the
-~7.6 GB free. Next: stream the block weights from pinned host memory on a
-second stream, two block buffers (130 MB, ~11 ms at PCIe speed against 56-90 ms
-of compute per block), lossless.
+~7.6 GB free. DitConfig::stream_weights keeps each block's large weights (qkv, out, cross q
+and out, MLP: 112 MB) in pinned host memory and copies them into two device
+slots on a second stream, events ordering copy b + 2 after block b and block b
+after its copy; the small ones (norms, AdaLN, text keys and values) stay
+resident. Same results as resident (cuda_dit_network --stream). At the real
+size (tests/cuda_dit_bench, real checkpoint, 2 x 44 x 80 = 7040 tokens, window
+3 chunks, random inputs): 6.43 GB of device memory, 1.59 s per pass on the
+first chunk (28 x the 56 ms block: the copies are hidden), 2.05 s on the
+second, 2.55 s with the window full; 3 passes a chunk: 4.8, 6.2, 7.7 s.
 
 ## Phase 5 and exclusions
 

@@ -1,6 +1,6 @@
 // DitCudaRunner over tests/dit_network_reference.py's passes (several chunks, 3 timesteps each,
 // the self attention window rolling), against its float64 run, next to PyTorch's bf16 run.
-// Usage: cuda_dit_network <reference dir> [--checkpoint <.pt>]
+// Usage: cuda_dit_network <reference dir> [--checkpoint <.pt>] [--stream]
 #include "faisca/omnidreams.h"
 #include "faisca/omnidreams_cuda.h"
 
@@ -137,6 +137,10 @@ int main(int argc, char** argv)
     config.height = h;
     config.width = w;
     config.window_chunks = window;
+    for (int i = 2; i < argc; ++i)
+    {
+        config.stream_weights = config.stream_weights || std::string(argv[i]) == "--stream";
+    }
     faisca::DitCudaRunner runner;
     if (!runner.init(device, weights, config, error) || !runner.set_text(text.data(), error))
     {

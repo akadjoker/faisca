@@ -17,6 +17,19 @@ constexpr uint64_t V_H1 = 2 * D;
 constexpr uint64_t V_LORA = 3 * D;
 constexpr uint64_t V_TMP = 6 * D;
 constexpr uint64_t V_COUNT = 6 * D + DIT_LORA;
+// streamed block weights in a slot: qkv, out, cross q, cross out, MLP up, MLP down
+constexpr uint64_t SQUARE = uint64_t(D) * D * 2;
+constexpr uint64_t SLOT_OFFSETS[6] = {0, 3 * SQUARE, 4 * SQUARE, 5 * SQUARE, 6 * SQUARE, 10 * SQUARE};
+constexpr uint64_t SLOT_SIZES[6] = {3 * SQUARE, SQUARE, SQUARE, SQUARE, 4 * SQUARE, 4 * SQUARE};
+constexpr uint64_t SLOT_BYTES = 14 * SQUARE;
+
+CudaBuffer range(const CudaBuffer& buffer, uint64_t offset, uint64_t bytes)
+{
+    CudaBuffer out = buffer;
+    out.address += offset;
+    out.bytes = bytes;
+    return out;
+}
 
 CudaBuffer view(const CudaBuffer& buffer, uint64_t offset)
 {
@@ -179,17 +192,26 @@ void DitCudaRunner::release()
     for (uint32_t b = 0; b < m_block_count; ++b)
     {
         Block& block = m_blocks[b];
-        CudaBuffer* buffers[] = {&block.qkv, &block.q_norm, &block.k_norm, &block.out, &block.cross_q,
-                                 &block.cross_kv, &block.cross_q_norm, &block.cross_k_norm, &block.cross_out,
-                                 &block.mlp_up, &block.mlp_down, &block.mod_down[0], &block.mod_down[1],
-                                 &block.mod_down[2], &block.mod_up[0], &block.mod_up[1], &block.mod_up[2],
-                                 &block.text_kv, &block.cache};
+        CudaBuffer* streamed[] = {&block.qkv, &block.out, &block.cross_q, &block.cross_out, &block.mlp_up,
+                                  &block.mlp_down};
+        CudaBuffer* buffers[] = {&block.q_norm, &block.k_norm, &block.cross_kv, &block.cross_q_norm,
+                                 &block.cross_k_norm, &block.mod_down[0], &block.mod_down[1], &block.mod_down[2],
+                                 &block.mod_up[0], &block.mod_up[1], &block.mod_up[2], &block.text_kv, &block.cache};
+        for (CudaBuffer* buffer : streamed)
+        {
+            if (!m_streaming && buffer->bytes != 0)
+            {
+                m_device->destroy_buffer(*buffer, ignored);
+            }
+            *buffer = CudaBuffer();
+        }
         for (CudaBuffer* buffer : buffers)
         {
             if (buffer->bytes != 0)
             {
                 m_device->destroy_buffer(*buffer, ignored);
             }
+            *buffer = CudaBuffer();
         }
     }
     CudaBuffer* buffers[] = {&m_embedder, &m_t_linear1, &m_t_linear2, &m_final_mod_down, &m_final_mod_up,
@@ -202,7 +224,30 @@ void DitCudaRunner::release()
         {
             m_device->destroy_buffer(*buffer, ignored);
         }
+        *buffer = CudaBuffer();
     }
+    for (int i = 0; i < 2; ++i)
+    {
+        if (m_slots[i].bytes != 0)
+        {
+            m_device->destroy_buffer(m_slots[i], ignored);
+        }
+        m_slots[i] = CudaBuffer();
+        if (m_streaming)
+        {
+            m_device->destroy_event(m_loaded[i], ignored);
+            m_device->destroy_event(m_free[i], ignored);
+        }
+    }
+    if (m_host_blocks.bytes != 0)
+    {
+        m_device->destroy_host_buffer(m_host_blocks, ignored);
+    }
+    if (m_streaming)
+    {
+        m_device->destroy_stream(m_copy_stream, ignored);
+    }
+    m_streaming = false;
     m_device->destroy_stream(m_stream, ignored);
     m_kernels.release();
     m_device = nullptr;
@@ -290,6 +335,15 @@ bool DitCudaRunner::init(CudaDevice& device, const DitHostWeights& weights, cons
         }
         ok = ok && upload(m_text_proj_bias, bias.data(), DIT_TEXT_WIDTH * 4, error);
     }
+    m_streaming = config.stream_weights;
+    if (ok && m_streaming)
+    {
+        ok = device.create_host_buffer(SLOT_BYTES * weights.block_count, m_host_blocks, error) &&
+             device.create_buffer(SLOT_BYTES, m_slots[0], error) && device.create_buffer(SLOT_BYTES, m_slots[1], error) &&
+             device.create_stream(m_copy_stream, error) && device.create_event(m_loaded[0], error) &&
+             device.create_event(m_loaded[1], error) && device.create_event(m_free[0], error) &&
+             device.create_event(m_free[1], error);
+    }
     for (uint32_t b = 0; ok && b < weights.block_count; ++b)
     {
         const DitHostBlock& w = weights.blocks[b];
@@ -297,19 +351,35 @@ bool DitCudaRunner::init(CudaDevice& device, const DitHostWeights& weights, cons
         m_block_count = b + 1;
         const size_t square = size_t(D) * D * 2;
         const size_t context = size_t(D) * DIT_TEXT_WIDTH * 2;
-        ok = device.create_buffer(3 * square, block.qkv, error) && device.upload(block.qkv, w.self_q, square, error) &&
-             device.upload(block.qkv, w.self_k, square, error, square) &&
-             device.upload(block.qkv, w.self_v, square, error, 2 * square) &&
-             upload(block.q_norm, w.self_q_norm, 256, error) && upload(block.k_norm, w.self_k_norm, 256, error) &&
-             upload(block.out, w.self_out, square, error) && upload(block.cross_q, w.cross_q, square, error) &&
+        if (m_streaming)
+        {
+            uint8_t* host = static_cast<uint8_t*>(m_host_blocks.data) + b * SLOT_BYTES;
+            std::memcpy(host, w.self_q, square);
+            std::memcpy(host + square, w.self_k, square);
+            std::memcpy(host + 2 * square, w.self_v, square);
+            std::memcpy(host + SLOT_OFFSETS[1], w.self_out, square);
+            std::memcpy(host + SLOT_OFFSETS[2], w.cross_q, square);
+            std::memcpy(host + SLOT_OFFSETS[3], w.cross_out, square);
+            std::memcpy(host + SLOT_OFFSETS[4], w.mlp_up, 4 * square);
+            std::memcpy(host + SLOT_OFFSETS[5], w.mlp_down, 4 * square);
+        }
+        else
+        {
+            ok = device.create_buffer(3 * square, block.qkv, error) &&
+                 device.upload(block.qkv, w.self_q, square, error) &&
+                 device.upload(block.qkv, w.self_k, square, error, square) &&
+                 device.upload(block.qkv, w.self_v, square, error, 2 * square) &&
+                 upload(block.out, w.self_out, square, error) && upload(block.cross_q, w.cross_q, square, error) &&
+                 upload(block.cross_out, w.cross_out, square, error) &&
+                 upload(block.mlp_up, w.mlp_up, size_t(DIT_MLP) * D * 2, error) &&
+                 upload(block.mlp_down, w.mlp_down, size_t(DIT_MLP) * D * 2, error);
+        }
+        ok = ok && upload(block.q_norm, w.self_q_norm, 256, error) && upload(block.k_norm, w.self_k_norm, 256, error) &&
              device.create_buffer(2 * context, block.cross_kv, error) &&
              device.upload(block.cross_kv, w.cross_k, context, error) &&
              device.upload(block.cross_kv, w.cross_v, context, error, context) &&
              upload(block.cross_q_norm, w.cross_q_norm, 256, error) &&
-             upload(block.cross_k_norm, w.cross_k_norm, 256, error) &&
-             upload(block.cross_out, w.cross_out, square, error) &&
-             upload(block.mlp_up, w.mlp_up, size_t(DIT_MLP) * D * 2, error) &&
-             upload(block.mlp_down, w.mlp_down, size_t(DIT_MLP) * D * 2, error);
+             upload(block.cross_k_norm, w.cross_k_norm, 256, error);
         for (int i = 0; ok && i < 3; ++i)
         {
             ok = upload(block.mod_down[i], w.mod_down[i], size_t(DIT_LORA) * D * 2, error) &&
@@ -434,6 +504,57 @@ bool DitCudaRunner::run_block(Block& block, uint32_t index, int64_t chunk_index,
     return ok;
 }
 
+void DitCudaRunner::point_at_slot(Block& block, uint32_t slot)
+{
+    CudaBuffer* streamed[] = {&block.qkv, &block.out, &block.cross_q, &block.cross_out, &block.mlp_up, &block.mlp_down};
+    for (int i = 0; i < 6; ++i)
+    {
+        *streamed[i] = range(m_slots[slot], SLOT_OFFSETS[i], SLOT_SIZES[i]);
+    }
+}
+
+bool DitCudaRunner::copy_block(uint32_t index, Error& error)
+{
+    const uint32_t slot = index % 2;
+    return (index < 2 || m_device->wait_event(m_copy_stream, m_free[slot], error)) &&
+           m_device->upload_async(m_slots[slot], m_host_blocks, SLOT_BYTES, m_copy_stream, error, 0,
+                                  index * SLOT_BYTES) &&
+           m_device->record_event(m_loaded[slot], m_copy_stream, error);
+}
+
+bool DitCudaRunner::run_blocks(int64_t chunk_index, Error& error)
+{
+    if (!m_streaming)
+    {
+        for (uint32_t b = 0; b < m_block_count; ++b)
+        {
+            if (!run_block(m_blocks[b], b, chunk_index, error))
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+    // block b computes from slot b % 2 once its copy is in; the copy of block b + 2 waits until
+    // block b has finished with that slot
+    if (!copy_block(0, error) || (m_block_count > 1 && !copy_block(1, error)))
+    {
+        return false;
+    }
+    for (uint32_t b = 0; b < m_block_count; ++b)
+    {
+        const uint32_t slot = b % 2;
+        point_at_slot(m_blocks[b], slot);
+        if (!m_device->wait_event(m_stream, m_loaded[slot], error) || !run_block(m_blocks[b], b, chunk_index, error) ||
+            !m_device->record_event(m_free[slot], m_stream, error) ||
+            (b + 2 < m_block_count && !copy_block(b + 2, error)))
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
 bool DitCudaRunner::forward(const uint16_t* tokens, const uint16_t* hdmap, float timestep, int64_t chunk_index,
                             float* out, Error& error)
 {
@@ -536,10 +657,7 @@ bool DitCudaRunner::forward(const uint16_t* tokens, const uint16_t* hdmap, float
          m_kernels.dit_matvec(m_final_mod_up, m_vectors, V_TMP * 4, &m_vectors, V_LORA * 4, m_modulation, final_mod,
                               2 * D, DIT_LORA, false, m_stream, error) &&
          m_kernels.gemm_f16(m_input, m_embedder, m_x, L, D, EMBED_IN, true, m_stream, error, Out::Float);
-    for (uint32_t b = 0; ok && b < m_block_count; ++b)
-    {
-        ok = run_block(m_blocks[b], b, chunk_index, error);
-    }
+    ok = ok && run_blocks(chunk_index, error);
     ok = ok &&
          m_kernels.dit_modulate_norm(m_x, m_modulation, final_mod, final_mod + uint64_t(D) * 4, m_h, L, D, true,
                                      m_stream, error) &&
