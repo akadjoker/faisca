@@ -13,6 +13,10 @@
 //   first; wait for K, issue V, S = Q K^T, mask the keys past n_kv on the first step only, wait
 //   for V, issue the next K, online softmax, P to f16 in registers, O += P V with V^T through
 //   ldmatrix.trans;
+// - with causal, query i sees keys 0..i (n_q == n_kv, no cache offset): only the key blocks up to
+//   the diagonal, the keys past each row masked to -inf, and softmax_rescale_o's Check_inf (a row
+//   max of -inf counts as 0 in the rescale, so a fully masked first block gives zeros, not NaN);
+// - GQA: query head h reads key / value head h / kv_group;
 // - softmax.h: exp2f(s * scale_log2 - max * scale_log2) with the fused multiply add, per thread
 //   sums reduced over the quad (shuffle 2 then 1) only at the end, 1 / sum, then O to f16.
 
@@ -87,7 +91,7 @@ template <bool bf16>
 __device__ __forceinline__ void attention_tiles(const unsigned short* q, unsigned int q_stride, const unsigned short* k,
                                                 const unsigned short* v, unsigned int kv_stride, unsigned short* out,
                                                 unsigned int out_stride, unsigned int n_q, unsigned int n_kv,
-                                                float scale_log2)
+                                                float scale_log2, unsigned int kv_group, unsigned int causal)
 {
     __shared__ __align__(128) unsigned short tile_q[BLOCK_M * HEAD];
     __shared__ __align__(128) unsigned short tile_k[BLOCK_N * HEAD];
@@ -98,6 +102,7 @@ __device__ __forceinline__ void attention_tiles(const unsigned short* q, unsigne
     const unsigned int t = lane % 4;
     const unsigned int m0 = blockIdx.x * BLOCK_M;
     const unsigned int column = blockIdx.y * HEAD;
+    const unsigned int kv_column = (blockIdx.y / kv_group) * HEAD;
 
     const auto load_kv = [&](const unsigned short* source, unsigned short* tile, unsigned int block) {
 #pragma unroll
@@ -109,7 +114,7 @@ __device__ __forceinline__ void attention_tiles(const unsigned short* q, unsigne
             const unsigned int key = block * BLOCK_N + row;
             const bool inside = key < n_kv;
             copy_async(tile + swizzled(row, chunk),
-                       inside ? source + static_cast<unsigned long long>(key) * kv_stride + column + chunk * 8 : source,
+                       inside ? source + static_cast<unsigned long long>(key) * kv_stride + kv_column + chunk * 8 : source,
                        inside);
         }
         asm volatile("cp.async.commit_group;");
@@ -125,7 +130,8 @@ __device__ __forceinline__ void attention_tiles(const unsigned short* q, unsigne
         copy_async(tile_q + swizzled(row, chunk),
                    inside ? q + static_cast<unsigned long long>(m0 + row) * q_stride + column + chunk * 8 : q, inside);
     }
-    const unsigned int blocks = (n_kv + BLOCK_N - 1) / BLOCK_N;
+    const unsigned int last_key = causal != 0 ? (m0 + BLOCK_M < n_kv ? m0 + BLOCK_M : n_kv) : n_kv;
+    const unsigned int blocks = (last_key + BLOCK_N - 1) / BLOCK_N;
     load_kv(k, tile_k, blocks - 1);
 
     float acc_o[2][16][4] = {};
@@ -163,6 +169,27 @@ __device__ __forceinline__ void attention_tiles(const unsigned short* q, unsigne
                 {
                     mma<bf16>(a[i], b[np][0], b[np][1], acc_s[i][2 * np]);
                     mma<bf16>(a[i], b[np][2], b[np][3], acc_s[i][2 * np + 1]);
+                }
+            }
+        }
+        if (causal != 0 && static_cast<unsigned int>(block) * BLOCK_N + BLOCK_N - 1 > m0)
+        {
+#pragma unroll
+            for (unsigned int i = 0; i < 2; ++i)
+            {
+#pragma unroll
+                for (unsigned int nt = 0; nt < 4; ++nt)
+                {
+#pragma unroll
+                    for (unsigned int e = 0; e < 4; ++e)
+                    {
+                        const unsigned int key = static_cast<unsigned int>(block) * BLOCK_N + nt * 8 + 2 * t + e % 2;
+                        const unsigned int query = m0 + i * 64 + warp * 16 + g + (e / 2) * 8;
+                        if (key > query)
+                        {
+                            acc_s[i][nt][e] = -INFINITY;
+                        }
+                    }
                 }
             }
         }
@@ -213,7 +240,8 @@ __device__ __forceinline__ void attention_tiles(const unsigned short* q, unsigne
                 row_max[i][h] = m;
                 if (!first)
                 {
-                    const float rescale = exp2f((previous - m) * scale_log2);
+                    const float current = causal != 0 && m == -INFINITY ? 0.0f : m;
+                    const float rescale = exp2f((previous - current) * scale_log2);
                     row_sum[i][h] *= rescale;
 #pragma unroll
                     for (unsigned int dt = 0; dt < 16; ++dt)
@@ -298,15 +326,15 @@ __device__ __forceinline__ void attention_tiles(const unsigned short* q, unsigne
 extern "C" __global__ void __launch_bounds__(128)
     attention_f16(const unsigned short* q, unsigned int q_stride, const unsigned short* k, const unsigned short* v,
                   unsigned int kv_stride, unsigned short* out, unsigned int out_stride, unsigned int n_q,
-                  unsigned int n_kv, float scale_log2)
+                  unsigned int n_kv, float scale_log2, unsigned int kv_group, unsigned int causal)
 {
-    attention_tiles<false>(q, q_stride, k, v, kv_stride, out, out_stride, n_q, n_kv, scale_log2);
+    attention_tiles<false>(q, q_stride, k, v, kv_stride, out, out_stride, n_q, n_kv, scale_log2, kv_group, causal);
 }
 
 extern "C" __global__ void __launch_bounds__(128)
     attention_bf16(const unsigned short* q, unsigned int q_stride, const unsigned short* k, const unsigned short* v,
                    unsigned int kv_stride, unsigned short* out, unsigned int out_stride, unsigned int n_q,
-                   unsigned int n_kv, float scale_log2)
+                   unsigned int n_kv, float scale_log2, unsigned int kv_group, unsigned int causal)
 {
-    attention_tiles<true>(q, q_stride, k, v, kv_stride, out, out_stride, n_q, n_kv, scale_log2);
+    attention_tiles<true>(q, q_stride, k, v, kv_stride, out, out_stride, n_q, n_kv, scale_log2, kv_group, causal);
 }

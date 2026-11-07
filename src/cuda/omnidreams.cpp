@@ -431,7 +431,7 @@ bool DitCudaRunner::set_text(const uint16_t* text, Error& error)
         Block& block = m_blocks[b];
         ok = m_kernels.gemm_f16(m_text, block.cross_kv, block.text_kv, DIT_TEXT_TOKENS, 2 * D, DIT_TEXT_WIDTH, true,
                                 m_stream, error, Out::Half) &&
-             m_kernels.dit_qk_norm_rope(block.text_kv, 2 * D, 0, block.cross_k_norm, nullptr, DIT_TEXT_TOKENS,
+             m_kernels.dit_qk_norm_rope(block.text_kv, 2 * D, 0, &block.cross_k_norm, nullptr, DIT_TEXT_TOKENS,
                                         DIT_HEADS, true, m_stream, error);
     }
     ok = ok && m_device->synchronize(m_stream, error);
@@ -480,8 +480,8 @@ bool DitCudaRunner::run_block(Block& block, uint32_t index, int64_t chunk_index,
         m_kernels.gemm_f16(m_h, block.qkv, m_q, L, D, D, true, m_stream, error, Out::Half) &&
         m_kernels.gemm_f16(m_h, view(block.qkv, uint64_t(D) * D * 2), chunk_kv, L, 2 * D, D, true, m_stream, error,
                            Out::Half) &&
-        m_kernels.dit_qk_norm_rope(m_q, D, 0, block.q_norm, &m_angles, L, DIT_HEADS, true, m_stream, error) &&
-        m_kernels.dit_qk_norm_rope(chunk_kv, 2 * D, 0, block.k_norm, &m_angles, L, DIT_HEADS, true, m_stream,
+        m_kernels.dit_qk_norm_rope(m_q, D, 0, &block.q_norm, &m_angles, L, DIT_HEADS, true, m_stream, error) &&
+        m_kernels.dit_qk_norm_rope(chunk_kv, 2 * D, 0, &block.k_norm, &m_angles, L, DIT_HEADS, true, m_stream,
                                    error) &&
         m_kernels.attention_f16(m_q, D, block.cache, view(block.cache, uint64_t(D) * 2), 2 * D, m_attn, D, L,
                                 block.kv.visible_end(), DIT_HEADS, scale, true, m_stream, error) &&
@@ -490,7 +490,7 @@ bool DitCudaRunner::run_block(Block& block, uint32_t index, int64_t chunk_index,
         m_kernels.dit_modulate_norm(m_x, m_modulation, base + 3 * f, base + 4 * f, m_h, L, D, true, m_stream,
                                     error) &&
         m_kernels.gemm_f16(m_h, block.cross_q, m_q, L, D, D, true, m_stream, error, Out::Half) &&
-        m_kernels.dit_qk_norm_rope(m_q, D, 0, block.cross_q_norm, nullptr, L, DIT_HEADS, true, m_stream, error) &&
+        m_kernels.dit_qk_norm_rope(m_q, D, 0, &block.cross_q_norm, nullptr, L, DIT_HEADS, true, m_stream, error) &&
         m_kernels.attention_f16(m_q, D, block.text_kv, view(block.text_kv, uint64_t(D) * 2), 2 * D, m_attn, D, L,
                                 DIT_TEXT_TOKENS, DIT_HEADS, scale, true, m_stream, error) &&
         m_kernels.gemm_f16(m_attn, block.cross_out, m_x, L, D, D, true, m_stream, error, Out::Residual,

@@ -46,13 +46,19 @@ bool write_file(const std::string& path, const std::vector<uint16_t>& data)
 }
 
 bool run(faisca::CudaDevice& device, faisca::CudaKernels& kernels, const faisca::CudaStream& stream, uint32_t n_q,
-         uint32_t n_kv, uint32_t heads, bool bf16, int reps, bool check, const char* dump, faisca::Error& error)
+         uint32_t n_kv, uint32_t heads, bool bf16, int reps, bool check, const char* dump, faisca::Error& error,
+         uint32_t kv_heads = 0, bool causal = false)
 {
     const uint32_t width = heads * 128;
+    if (kv_heads == 0)
+    {
+        kv_heads = heads;
+    }
+    const uint32_t kv_width = kv_heads * 128;
     std::mt19937 random(n_q * 131 + n_kv * 7 + heads + (bf16 ? 1 : 0));
     std::normal_distribution<float> normal(0.0f, 1.0f);
-    std::vector<uint16_t> q(static_cast<size_t>(n_q) * width), k(static_cast<size_t>(n_kv) * width),
-        v(static_cast<size_t>(n_kv) * width), out(static_cast<size_t>(n_q) * width);
+    std::vector<uint16_t> q(static_cast<size_t>(n_q) * width), k(static_cast<size_t>(n_kv) * kv_width),
+        v(static_cast<size_t>(n_kv) * kv_width), out(static_cast<size_t>(n_q) * width);
     std::vector<float> qf(q.size()), kf(k.size()), vf(v.size());
     const auto fill = [&](std::vector<uint16_t>& h, std::vector<float>& f) {
         for (size_t i = 0; i < h.size(); ++i)
@@ -70,7 +76,8 @@ bool run(faisca::CudaDevice& device, faisca::CudaKernels& kernels, const faisca:
         !device.create_buffer(v.size() * 2, dv, error) || !device.create_buffer(out.size() * 2, dout, error) ||
         !device.upload(dq, q.data(), q.size() * 2, error) || !device.upload(dk, k.data(), k.size() * 2, error) ||
         !device.upload(dv, v.data(), v.size() * 2, error) ||
-        !kernels.attention_f16(dq, width, dk, dv, width, dout, width, n_q, n_kv, heads, scale, bf16, stream, error) ||
+        !kernels.attention_f16(dq, width, dk, dv, kv_width, dout, width, n_q, n_kv, heads, scale, bf16, stream, error,
+                               kv_heads, causal) ||
         !device.synchronize(error) || !device.download(dout, out.data(), out.size() * 2, error))
     {
         return false;
@@ -84,22 +91,24 @@ bool run(faisca::CudaDevice& device, faisca::CudaKernels& kernels, const faisca:
         std::vector<double> p(n_kv);
         for (uint32_t h = 0; h < heads; ++h)
         {
+            const uint32_t kh = h / (heads / kv_heads);
             for (uint32_t r = 0; r < n_q; ++r)
             {
+                const uint32_t seen = causal ? r + 1 : n_kv;
                 double max = -INFINITY;
-                for (uint32_t j = 0; j < n_kv; ++j)
+                for (uint32_t j = 0; j < seen; ++j)
                 {
                     double s = 0;
                     for (uint32_t d = 0; d < 128; ++d)
                     {
                         s += static_cast<double>(qf[static_cast<size_t>(r) * width + h * 128 + d]) *
-                             kf[static_cast<size_t>(j) * width + h * 128 + d];
+                             kf[static_cast<size_t>(j) * kv_width + kh * 128 + d];
                     }
                     p[j] = s * scale;
                     max = p[j] > max ? p[j] : max;
                 }
                 double sum = 0;
-                for (uint32_t j = 0; j < n_kv; ++j)
+                for (uint32_t j = 0; j < seen; ++j)
                 {
                     p[j] = std::exp(p[j] - max);
                     sum += p[j];
@@ -107,9 +116,9 @@ bool run(faisca::CudaDevice& device, faisca::CudaKernels& kernels, const faisca:
                 for (uint32_t d = 0; d < 128; ++d)
                 {
                     double o = 0;
-                    for (uint32_t j = 0; j < n_kv; ++j)
+                    for (uint32_t j = 0; j < seen; ++j)
                     {
-                        o += p[j] * vf[static_cast<size_t>(j) * width + h * 128 + d];
+                        o += p[j] * vf[static_cast<size_t>(j) * kv_width + kh * 128 + d];
                     }
                     o /= sum;
                     const size_t index = static_cast<size_t>(r) * width + h * 128 + d;
@@ -123,8 +132,8 @@ bool run(faisca::CudaDevice& device, faisca::CudaKernels& kernels, const faisca:
         // P and O rounded to 11 (f16) or 8 (bf16) significant bits
         const double limit = bf16 ? 1.5e-2 : 2e-3;
         ok = std::isfinite(l2) && l2 <= limit;
-        std::printf("%s q %u kv %u heads %u: rel L2 %.2e (limit %.0e)%s\n", name, n_q, n_kv, heads, l2, limit,
-                    ok ? "" : "  FAIL");
+        std::printf("%s q %u kv %u heads %u/%u%s: rel L2 %.2e (limit %.0e)%s\n", name, n_q, n_kv, heads, kv_heads,
+                    causal ? " causal" : "", l2, limit, ok ? "" : "  FAIL");
     }
     if (dump != nullptr)
     {
@@ -141,8 +150,8 @@ bool run(faisca::CudaDevice& device, faisca::CudaKernels& kernels, const faisca:
         // warm up first: the clock of an idle laptop GPU takes a few launches to rise
         for (int i = 0; i < reps; ++i)
         {
-            if (!kernels.attention_f16(dq, width, dk, dv, width, dout, width, n_q, n_kv, heads, scale, bf16, stream,
-                                       error))
+            if (!kernels.attention_f16(dq, width, dk, dv, kv_width, dout, width, n_q, n_kv, heads, scale, bf16, stream,
+                                       error, kv_heads, causal))
             {
                 return false;
             }
@@ -154,8 +163,8 @@ bool run(faisca::CudaDevice& device, faisca::CudaKernels& kernels, const faisca:
         const auto start = std::chrono::steady_clock::now();
         for (int i = 0; i < reps; ++i)
         {
-            if (!kernels.attention_f16(dq, width, dk, dv, width, dout, width, n_q, n_kv, heads, scale, bf16, stream,
-                                       error))
+            if (!kernels.attention_f16(dq, width, dk, dv, kv_width, dout, width, n_q, n_kv, heads, scale, bf16, stream,
+                                       error, kv_heads, causal))
             {
                 return false;
             }
@@ -214,6 +223,19 @@ int main(int argc, char** argv)
             for (int bf16 = 0; bf16 < 2; ++bf16)
             {
                 ok = run(device, kernels, stream, shape[0], shape[1], shape[2], bf16 != 0, 0, true, nullptr, error) &&
+                     ok;
+            }
+        }
+        // causal with grouped keys and values (Qwen2.5: 28 query heads over 4), sizes across the
+        // 128-query and 32-key blocks
+        const uint32_t causal_shapes[][3] = {{1, 1, 1}, {33, 33, 1}, {200, 200, 4}, {512, 512, 28}};
+        for (const auto& shape : causal_shapes)
+        {
+            const uint32_t kv = shape[2] == 28 ? 4 : shape[2] == 4 ? 2 : 1;
+            for (int bf16 = 0; bf16 < 2; ++bf16)
+            {
+                ok = run(device, kernels, stream, shape[0], shape[1], shape[2], bf16 != 0, 0, true, nullptr, error, kv,
+                         true) &&
                      ok;
             }
         }

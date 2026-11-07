@@ -6,7 +6,8 @@ system prompt "You are a helpful assistant who will provide prompts to an image 
 chat template without a generation prompt, padded with the pad token to 512 tokens, all 28 hidden
 states (the embedding layer skipped) each normalized to mean 0 and std 1 per token and concatenated:
 [1, 1, 512, 100352] bf16, the shape the Kaggle driver saved.
-Needs transformers >= 4.49 (Qwen2.5-VL). Usage: text_embed.py "<prompt>" <out.pt>
+Needs transformers >= 4.49 (Qwen2.5-VL). Usage: text_embed.py "<prompt>" <out.pt> [threads] [--float32]
+--float32 runs the model in float32 and saves float32 (a reference for other implementations).
 """
 import sys
 import time
@@ -16,14 +17,17 @@ from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
 
 MODEL = "nvidia/Cosmos-Reason1-7B"
 REVISION = "3210bec0495fdc7a8d3dbb8d58da5711eab4b423"
-prompt, out = sys.argv[1], sys.argv[2]
-torch.set_num_threads(int(sys.argv[3]) if len(sys.argv) > 3 else 16)
+float32 = "--float32" in sys.argv
+args = [a for a in sys.argv[1:] if a != "--float32"]
+prompt, out = args[0], args[1]
+torch.set_num_threads(int(args[2]) if len(args) > 2 else 16)
+dtype = torch.float32 if float32 else torch.bfloat16
 
 started = time.time()
 processor = AutoProcessor.from_pretrained(MODEL, revision=REVISION, local_files_only=True)
 tokenizer = processor.tokenizer
 model = Qwen2_5_VLForConditionalGeneration.from_pretrained(MODEL, revision=REVISION, local_files_only=True,
-                                                           dtype=torch.bfloat16)
+                                                           dtype=dtype)
 model.eval().requires_grad_(False)
 print(f"loaded in {time.time() - started:.1f} s", flush=True)
 

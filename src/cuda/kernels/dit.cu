@@ -86,7 +86,7 @@ __device__ __forceinline__ void modulate_norm(const float* x, const float* shift
 }
 
 // In place on heads of 128 at column first + head * 128 of rows stride halves apart: RMSNorm
-// over the head with gamma (nn.RMSNorm(128, eps=1e-6), MultiHeadAttention q_norm / k_norm),
+// over the head with gamma (skipped when gamma is null) (nn.RMSNorm(128, eps=1e-6), MultiHeadAttention q_norm / k_norm),
 // then, with angles, the rotation of pairs (d, d + 64) by angles[row * 64 + d]
 // (rope_kernel.py, non-interleaved). One warp per (row, head); lane l holds d = l, l + 32,
 // l + 64, l + 96, so both pairs of a lane stay in the lane.
@@ -116,9 +116,12 @@ __device__ __forceinline__ void qk_norm_rope(unsigned short* data, unsigned int 
         squares += __shfl_xor_sync(0xffffffffu, squares, offset);
     }
     const float inverse = rsqrtf(squares / 128.0f + 1e-6f);
-    for (unsigned int i = 0; i < 4; ++i)
+    if (gamma != nullptr)
     {
-        v[i] = v[i] * inverse * load_half<bf16>(gamma + lane + 32 * i);
+        for (unsigned int i = 0; i < 4; ++i)
+        {
+            v[i] = v[i] * inverse * load_half<bf16>(gamma + lane + 32 * i);
+        }
     }
     if (angles != nullptr)
     {

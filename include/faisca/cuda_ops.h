@@ -97,8 +97,9 @@ public:
     bool dit_modulate_norm(const CudaBuffer& x, const CudaBuffer& modulation, uint64_t shift_offset,
                            uint64_t scale_offset, const CudaBuffer& output, uint32_t rows, uint32_t width,
                            bool bf16, const CudaStream& stream, Error& error);
-    // DiT: in place RMSNorm (gamma, 128 halves) of the heads of 128 at column first of rows
-    // stride halves apart, then RoPE by angles (rows x 64 floats) unless angles is null
+    // DiT: in place RMSNorm (gamma, 128 halves; none when gamma is null) of the heads of 128 at
+    // column first of rows stride halves apart, then RoPE by angles (rows x 64 floats) unless
+    // angles is null
     // DiT AdaLN / time MLPs: output[n] = add[n] + sum_k weight[n][k] * f(input[k]), f = SiLU when silu;
     // bf16 weights, f32 vectors (buffers with byte offsets), k a multiple of 256
     bool dit_matvec(const CudaBuffer& weight, const CudaBuffer& input, uint64_t input_offset, const CudaBuffer* add,
@@ -107,15 +108,17 @@ public:
     // bytes (a multiple of 16) from src + src_offset to dst + dst_offset, the ranges apart
     bool dit_copy(const CudaBuffer& src, uint64_t src_offset, const CudaBuffer& dst, uint64_t dst_offset,
                   uint64_t bytes, const CudaStream& stream, Error& error);
-    bool dit_qk_norm_rope(const CudaBuffer& data, uint32_t stride, uint32_t first, const CudaBuffer& gamma,
+    bool dit_qk_norm_rope(const CudaBuffer& data, uint32_t stride, uint32_t first, const CudaBuffer* gamma,
                           const CudaBuffer* angles, uint32_t rows, uint32_t heads, bool bf16,
                           const CudaStream& stream, Error& error);
     // softmax(q k^T * scale) v per head of 128 over f16 (or bf16) rows, no mask, FlashAttention-2's
     // forward kernel; head h at column h * 128 of every row, strides in elements, output f16.
+    // kv_heads (0: as many as heads) < heads: grouped query attention, query head h reading key /
+    // value head h / (heads / kv_heads). causal: query i sees keys 0..i (n_q == n_kv).
     bool attention_f16(const CudaBuffer& query, uint32_t q_stride, const CudaBuffer& keys, const CudaBuffer& values,
                        uint32_t kv_stride, const CudaBuffer& output, uint32_t out_stride, uint32_t n_q,
                        uint32_t n_kv, uint32_t heads, float scale, bool bf16, const CudaStream& stream,
-                       Error& error);
+                       Error& error, uint32_t kv_heads = 0, bool causal = false);
 
 private:
     CudaDevice* m_device = nullptr;

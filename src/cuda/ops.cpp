@@ -654,18 +654,18 @@ bool CudaKernels::dit_copy(const CudaBuffer& src, uint64_t src_offset, const Cud
     return m_device->launch(m_dit_copy, stream, launch, arguments, error);
 }
 
-bool CudaKernels::dit_qk_norm_rope(const CudaBuffer& data, uint32_t stride, uint32_t first, const CudaBuffer& gamma,
+bool CudaKernels::dit_qk_norm_rope(const CudaBuffer& data, uint32_t stride, uint32_t first, const CudaBuffer* gamma,
                                    const CudaBuffer* angles, uint32_t rows, uint32_t heads, bool bf16,
                                    const CudaStream& stream, Error& error)
 {
     if (m_device == nullptr || rows == 0 || heads == 0 || first + heads * 128 > stride ||
-        data.bytes < static_cast<size_t>(rows) * stride * 2 || gamma.bytes < 256 ||
+        data.bytes < static_cast<size_t>(rows) * stride * 2 || (gamma != nullptr && gamma->bytes < 256) ||
         (angles != nullptr && angles->bytes < static_cast<size_t>(rows) * 64 * 4))
     {
         error.set("invalid CUDA DiT q / k norm dimensions or buffer size");
         return false;
     }
-    uint64_t addresses[] = {data.address, gamma.address, angles != nullptr ? angles->address : 0};
+    uint64_t addresses[] = {data.address, gamma != nullptr ? gamma->address : 0, angles != nullptr ? angles->address : 0};
     void* arguments[] = {&addresses[0], &stride, &first, &addresses[1], &addresses[2], &rows, &heads};
     CudaLaunch launch;
     launch.grid_x = (rows * heads + 7) / 8;
@@ -676,14 +676,20 @@ bool CudaKernels::dit_qk_norm_rope(const CudaBuffer& data, uint32_t stride, uint
 bool CudaKernels::attention_f16(const CudaBuffer& query, uint32_t q_stride, const CudaBuffer& keys,
                                 const CudaBuffer& values, uint32_t kv_stride, const CudaBuffer& output,
                                 uint32_t out_stride, uint32_t n_q, uint32_t n_kv, uint32_t heads, float scale,
-                                bool bf16, const CudaStream& stream, Error& error)
+                                bool bf16, const CudaStream& stream, Error& error, uint32_t kv_heads, bool causal)
 {
     const uint32_t width = heads * 128;
-    if (m_device == nullptr || n_q == 0 || n_kv == 0 || heads == 0 || q_stride < width || kv_stride < width ||
-        out_stride < width || q_stride % 8 != 0 || kv_stride % 8 != 0 || out_stride % 2 != 0 ||
+    if (kv_heads == 0)
+    {
+        kv_heads = heads;
+    }
+    const uint32_t kv_width = kv_heads * 128;
+    if (m_device == nullptr || n_q == 0 || n_kv == 0 || heads == 0 || heads % kv_heads != 0 || q_stride < width ||
+        kv_stride < kv_width || out_stride < width || q_stride % 8 != 0 || kv_stride % 8 != 0 ||
+        out_stride % 2 != 0 || (causal && n_q != n_kv) ||
         query.bytes < (static_cast<size_t>(n_q - 1) * q_stride + width) * 2 ||
-        keys.bytes < (static_cast<size_t>(n_kv - 1) * kv_stride + width) * 2 ||
-        values.bytes < (static_cast<size_t>(n_kv - 1) * kv_stride + width) * 2 ||
+        keys.bytes < (static_cast<size_t>(n_kv - 1) * kv_stride + kv_width) * 2 ||
+        values.bytes < (static_cast<size_t>(n_kv - 1) * kv_stride + kv_width) * 2 ||
         output.bytes < (static_cast<size_t>(n_q - 1) * out_stride + width) * 2)
     {
         error.set("invalid CUDA f16 attention dimensions or buffer size");
@@ -691,9 +697,12 @@ bool CudaKernels::attention_f16(const CudaBuffer& query, uint32_t q_stride, cons
     }
     // softmax_scale * M_LOG2E in float, as flash-attention's params.scale_softmax_log2
     float scale_log2 = scale * static_cast<float>(1.4426950408889634);
+    uint32_t group = heads / kv_heads;
+    uint32_t mask = causal ? 1u : 0u;
     uint64_t addresses[] = {query.address, keys.address, values.address, output.address};
     void* arguments[] = {&addresses[0], &q_stride, &addresses[1], &addresses[2], &kv_stride,
-                         &addresses[3], &out_stride, &n_q, &n_kv, &scale_log2};
+                         &addresses[3], &out_stride, &n_q,          &n_kv,         &scale_log2,
+                         &group,        &mask};
     CudaLaunch launch;
     launch.grid_x = (n_q + 127) / 128;
     launch.grid_y = heads;

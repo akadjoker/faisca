@@ -159,19 +159,19 @@ int main(int argc, char** argv)
     // the text keys and values: computed once per scene (Block.initialize_cache)
     const auto context_kv = [&]() {
         return kernels.gemm_f16(d_context, d_ckv_w, d_ckv, CONTEXT, 2 * D, CONTEXT_DIM, true, stream, error, Out::Half) &&
-               kernels.dit_qk_norm_rope(d_ckv, 2 * D, 0, d_ckn, nullptr, CONTEXT, HEADS, true, stream, error);
+               kernels.dit_qk_norm_rope(d_ckv, 2 * D, 0, &d_ckn, nullptr, CONTEXT, HEADS, true, stream, error);
     };
     const auto block = [&]() {
         return kernels.dit_modulate_norm(d_x, d_mod, mod(0), mod(1), d_h, L, D, true, stream, error) &&
                kernels.gemm_f16(d_h, d_qkv_w, d_qkv, L, 3 * D, D, true, stream, error, Out::Half) &&
-               kernels.dit_qk_norm_rope(d_qkv, 3 * D, 0, d_qn, &d_angles, L, HEADS, true, stream, error) &&
-               kernels.dit_qk_norm_rope(d_qkv, 3 * D, D, d_kn, &d_angles, L, HEADS, true, stream, error) &&
+               kernels.dit_qk_norm_rope(d_qkv, 3 * D, 0, &d_qn, &d_angles, L, HEADS, true, stream, error) &&
+               kernels.dit_qk_norm_rope(d_qkv, 3 * D, D, &d_kn, &d_angles, L, HEADS, true, stream, error) &&
                kernels.attention_f16(d_qkv, 3 * D, view(d_qkv, D * 2), view(d_qkv, 2 * D * 2), 3 * D, d_attn, D, L, L,
                                      HEADS, scale, true, stream, error) &&
                kernels.gemm_f16(d_attn, d_o_w, d_x, L, D, D, true, stream, error, Out::Residual, &d_mod, mod(2)) &&
                kernels.dit_modulate_norm(d_x, d_mod, mod(3), mod(4), d_h, L, D, true, stream, error) &&
                kernels.gemm_f16(d_h, d_cq_w, d_qkv, L, D, D, true, stream, error, Out::Half) &&
-               kernels.dit_qk_norm_rope(d_qkv, D, 0, d_cqn, nullptr, L, HEADS, true, stream, error) &&
+               kernels.dit_qk_norm_rope(d_qkv, D, 0, &d_cqn, nullptr, L, HEADS, true, stream, error) &&
                kernels.attention_f16(d_qkv, D, d_ckv, view(d_ckv, D * 2), 2 * D, d_attn, D, L, CONTEXT, HEADS, scale,
                                      true, stream, error) &&
                kernels.gemm_f16(d_attn, d_co_w, d_x, L, D, D, true, stream, error, Out::Residual, &d_mod, mod(5)) &&
