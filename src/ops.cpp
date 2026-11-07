@@ -2409,6 +2409,9 @@ constexpr float EXP_C7 = 0.00019841270113829523325f;
 inline __m256 exp_avx2(__m256 x)
 {
     const __m256 keep = _mm256_cmp_ps(x, _mm256_set1_ps(EXP_ZERO_BELOW), _CMP_GE_OQ);
+    // lanes zeroed at the end compute e^0: their subnormal products cost a microcode
+    // assist each (4.8 ns per value instead of 0.33 on the Core Ultra 7 165H)
+    x = _mm256_and_ps(x, keep);
     x = _mm256_min_ps(_mm256_max_ps(x, _mm256_set1_ps(EXP_LO)), _mm256_set1_ps(EXP_HI));
     const __m256 n = _mm256_round_ps(_mm256_mul_ps(x, _mm256_set1_ps(EXP_LOG2E)), _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
     __m256 r = _mm256_fnmadd_ps(n, _mm256_set1_ps(EXP_LN2_HI), x);

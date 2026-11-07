@@ -578,7 +578,15 @@ top. No third party dependencies. Owner: Luís (akadjoker). "faisca" is a workin
    (one thread), CUDA init 0.3 s (2.2 s when the GPU was idle), upload
    0.24-0.32 s. TripoModel::open now takes the pool and packs panels in
    parallel: open 0.24-0.99 s (background load), outputs identical.
-   Next: CPU cache tuning.
+   CPU mesh: single thread 3.4 MAC/cycle in the query MLP, and perf of the
+   mesh phase alone (perf record -D past the triplane) put exp_values at 41%
+   against 37% for the GEMM. Cause: SiLU's exp(-x) for large x clamps to
+   -104 and the 2^n products go subnormal, a microcode assist each (4.8 ns
+   per value against 0.33). exp_avx2 now feeds 0 to the lanes its keep mask
+   zeroes: same bits (38 CPU traces identical), mesh 256^3 5.3-5.9 s ->
+   3.9-4.7 s interleaved. exp_avx512 (scalef, no mask) not checked: no
+   AVX-512 on this CPU. Next: the MLP GEMM (64 x 64 layers) and CPU cache
+   tuning of the big GEMMs.
 
 OmniDreams (NVIDIA video world model) is an exploration, not a plan step:
 read docs/omnidreams_handoff.md first, then docs/omnidreams.md.
