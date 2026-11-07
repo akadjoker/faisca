@@ -237,3 +237,32 @@ and drawn by ludus as the reference.
 3. Lucent conditioning mode, compared with those frames.
 4. Later, faisca: `.pt` to GGUF, LightTAE, DiT layer by layer against the
    step2 dumps, LightVAE, the text encoder through the Qwen2.5 path.
+
+## Running locally (faisca_dreams, 2026-11-07)
+
+The whole model runs in faisca on the owner's RTX 4060 Laptop (8 GB), no Python: text encoder
+(Cosmos-Reason1-7B), VAE encoder (lightvae), DiT, TAEHV decoder. Build: `cmake --build build
+--target faisca_dreams`.
+
+```sh
+MODELS=/media/ctw04578/data/projects/ref/omnidreams-models
+COSMOS=$HOME/.cache/huggingface/hub/models--nvidia--Cosmos-Reason1-7B/snapshots/3210bec0495fdc7a8d3dbb8d58da5711eab4b423
+build/faisca_dreams --dit $MODELS/single_view/2b_res720p_30fps_i2v_hdmap_distilled.pt \
+    --vae $MODELS/vae/lightvaew2_1.pth --tae $MODELS/vae/lighttaew2_1.pth \
+    --text-model $COSMOS --prompt "A wide-angle dash-cam video ..." \
+    --image first_frame.png --hdmap frames.rgb --frames 893 --out out_dir [--seed 42] [--ppm]
+```
+
+| Option | Meaning |
+|---|---|
+| `--dit` | OmniDreams checkpoint (single view, 720p, 30 fps, distilled) |
+| `--vae`, `--tae` | lightvae encoder and TAEHV decoder weights |
+| `--prompt` + `--text-model` | the sentence, encoded here (1.7 s); or `--text text_embeddings.pt` with saved embeddings |
+| `--image` | first frame, 1280x704 PNG, in the f-theta front camera |
+| `--hdmap` | conditioning frames, raw RGB8, frames x 704 x 1280 |
+| `--frames` | 5 + 8k, at most the frames in `--hdmap` |
+| `--out` | writes `video.rgb` (raw RGB8) and prints the ffmpeg line for an mp4 |
+
+About 1.4 s a frame (893 frames about 20 minutes, 1797 frames 41 minutes). The HD map and the first
+frame come from Lucent: `docs/OMNIDREAMS_HDMAP.md` in the Lucent repo (branch `omnidreams-hdmap`)
+has every command from an OpenDRIVE map and an ASTAS OSI run to the video.
