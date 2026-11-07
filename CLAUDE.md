@@ -437,9 +437,21 @@ top. No third party dependencies. Owner: Luís (akadjoker). "faisca" is a workin
    checkpoints match too, a non contiguous tensor is rejected; 3000 random
    mutations under ASan/UBSan: no crash. MinGW not checked (no toolchain on
    this machine).
-   Next: DINO ViT-B/16 (CLS token, bicubic position embedding interpolation
-   of transformers 4.35.0, layer norm eps 1e-12) against vit_tokens, then the
-   triplane transformer, upsample, NeRF MLP density grid and marching cubes.
+   Done: DINO ViT-B/16 image encoder (`TripoModel`, `TripoRunner::encode_image`
+   in triposr.h): CLS token, position embeddings resampled as
+   ViTEmbeddings.interpolate_pos_encoding of transformers 4.35.0 does
+   (scale_factor (32 + 0.1) / 14, so the source step is 14 / 32.1, through
+   PyTorch v2.11.0 UpSample.h bicubic, A = -0.75, kept in
+   /media/ctw04578/data/projects/ref/pytorch-v2.11.0-upsample), pre-norm
+   layers with eps 1e-12 and the erf GELU. tests/triposr_dump (reads the
+   reference rgb_cond.f32) + tests/compare_triposr.py on dumps/chair: rel L2
+   7.3e-7 after the embeddings, 8.4e-7 after layer 0, 1.9e-6 on the final
+   tokens; bit identical with 22 and 5 threads. 2.4 s with 22 threads, 2.0 s
+   with 5 (F32 Weight::matmul, one token at a time; not optimized yet).
+   Next: triplane transformer (Transformer1D: GroupNorm 32, proj_in, 16
+   BasicTransformerBlocks with self and cross attention and GEGLU,
+   proj_out), upsample, NeRF MLP density grid, marching cubes, then the
+   preprocessing (resize_foreground, antialiased bilinear to 512).
 
 OmniDreams (NVIDIA video world model) is an exploration, not a plan step:
 read docs/omnidreams_handoff.md first, then docs/omnidreams.md.
