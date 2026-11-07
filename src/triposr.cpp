@@ -899,20 +899,6 @@ void add_bias_rows(float* x, const float* bias, size_t rows, size_t width)
     }
 }
 
-// x / (1 + exp(-x)), the form of PyTorch's vectorized silu; tmp holds n floats
-void silu_values(float* x, float* tmp, size_t n)
-{
-    for (size_t i = 0; i < n; ++i)
-    {
-        tmp[i] = -x[i];
-    }
-    exp_values(tmp, n);
-    for (size_t i = 0; i < n; ++i)
-    {
-        x[i] = x[i] / (1.0f + tmp[i]);
-    }
-}
-
 }
 
 bool TripoRunner::query_points(PointSource source, const void* user, size_t n, float* density, float* color,
@@ -967,8 +953,7 @@ bool TripoRunner::query_points(PointSource source, const void* user, size_t n, f
                              {
                                  const TripoLinear& w = m.mlp(l);
                                  gemm_f32_packed(w.panels, w.n_in, x, x_width, count, 0, width, a, width, scratch);
-                                 add_bias_rows(a, m.mlp_b(l), count, width);
-                                 silu_values(a, b, count * width);
+                                 bias_silu_rows(a, m.mlp_b(l), count, width);
                                  float* t = a;
                                  a = b;
                                  b = t;

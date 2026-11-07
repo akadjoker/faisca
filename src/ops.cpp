@@ -2556,6 +2556,34 @@ void swiglu(const float* gate, const float* up, size_t n, float* out)
     }
 }
 
+void bias_silu_rows(float* x, const float* bias, size_t rows, size_t width)
+{
+    for (size_t r = 0; r < rows; ++r)
+    {
+        float* row = x + r * width;
+        size_t i = 0;
+#if defined(__AVX512F__)
+        for (; i + 16 <= width; i += 16)
+        {
+            const __m512 v = _mm512_add_ps(_mm512_loadu_ps(row + i), _mm512_loadu_ps(bias + i));
+            const __m512 e = exp_avx512(_mm512_sub_ps(_mm512_setzero_ps(), v));
+            _mm512_storeu_ps(row + i, _mm512_div_ps(v, _mm512_add_ps(_mm512_set1_ps(1.0f), e)));
+        }
+#endif
+        for (; i + 8 <= width; i += 8)
+        {
+            const __m256 v = _mm256_add_ps(_mm256_loadu_ps(row + i), _mm256_loadu_ps(bias + i));
+            const __m256 e = exp_avx2(_mm256_sub_ps(_mm256_setzero_ps(), v));
+            _mm256_storeu_ps(row + i, _mm256_div_ps(v, _mm256_add_ps(_mm256_set1_ps(1.0f), e)));
+        }
+        for (; i < width; ++i)
+        {
+            const float v = row[i] + bias[i];
+            row[i] = v / (1.0f + std::exp(-v));
+        }
+    }
+}
+
 // 0.5 x (1 + tanh(y)) = x / (1 + exp(-2y)), y = sqrt(2 / pi) (x + 0.044715 x^3), with exp_values' exp
 void gelu(float* x, size_t n)
 {
@@ -3155,6 +3183,21 @@ void exp_values(float* x, size_t n)
 void swiglu(const float* gate, const float* up, size_t n, float* out)
 {
     swiglu_scalar(gate, up, n, out);
+}
+
+void bias_silu_rows(float* x, const float* bias, size_t rows, size_t width)
+{
+    for (size_t r = 0; r < rows; ++r)
+    {
+        float* row = x + r * width;
+        for (size_t i = 0; i < width; ++i)
+        {
+            const float v = row[i] + bias[i];
+            float e = -v;
+            exp_values_scalar(&e, 1);
+            row[i] = v / (1.0f + e);
+        }
+    }
 }
 
 void gelu(float* x, size_t n)

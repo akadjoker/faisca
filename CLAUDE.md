@@ -591,8 +591,11 @@ top. No third party dependencies. Owner: Luís (akadjoker). "faisca" is a workin
    after the exp fix the mesh profile is GEMM 66%, exp 11%, the SiLU and
    bias passes ~9%, the x transpose 4.5%. Thread scaling of the triplane
    still to measure on a quiet machine (load average 8-14 during this
-   session: Xorg, editors, Defender). Next: SiLU fused with the bias in
-   one pass (same operations), then the triplane scaling.
+   session: Xorg, editors, Defender). Bias and SiLU fused in one pass
+   (bias_silu_rows, same operations): the 38 CPU outputs bit identical,
+   mesh 256^3 6.26 -> 5.95 s interleaved (4 of 4 pairs, load average
+   10-24). Next: the triplane scaling on a quiet machine, then the x
+   transpose ahead of the GEMM.
 
 OmniDreams (NVIDIA video world model) is an exploration, not a plan step:
 read docs/omnidreams_handoff.md first, then docs/omnidreams.md.

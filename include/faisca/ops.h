@@ -230,6 +230,9 @@ void attention_block(const float* q, size_t q_stride, size_t n_q, const float* k
 void swiglu(const float* gate, const float* up, size_t n, float* out);
 void swiglu_scalar(const float* gate, const float* up, size_t n, float* out);
 
+// x = silu(x + bias) per row of width, x / (1 + exp(-x)) with exp_values' exp
+void bias_silu_rows(float* x, const float* bias, size_t rows, size_t width);
+
 void add(float* x, const float* y, size_t n);
 
 // float32 weights for many tokens (src/ops_gemm.cpp): n_out rows of n_in, n_out a multiple
