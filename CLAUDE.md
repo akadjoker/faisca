@@ -555,8 +555,17 @@ top. No third party dependencies. Owner: Luís (akadjoker). "faisca" is a workin
    registers with float-float sums (TwoSum, squares made exact by fmaf):
    same outputs as the double kernel on 3.1 M random values and on all 38
    chair traces; 25 us with a warm L2, 131 us cold against PyTorch's 138 us
-   (DRAM bound). Image encoder 0.034 s, triplane 0.47 s. Next: that GEMM
-   shape and attention, then --cuda in `faisca mesh`, then CPU cache tuning.
+   (DRAM bound). Attention now in the FlashAttention-2 order
+   (tripo_flash_attention: 64 queries per block of 128 threads, 4 x 8 of S
+   and O per thread, keys in steps of 64, online softmax rescaled per
+   step): self 9.13 -> 8.16 ms, cross 3.21 -> 2.88 ms, ViT 0.74 -> 0.66 ms;
+   chair tokens 3.5e-6, scene codes 2.1e-6, density 4.5e-6, 0 points across
+   the threshold, 84160 faces. Still about 2.4 TMAC/s of ~6 at the 2.0 GHz
+   it runs at: __expf instead of expf saves 3%, skipping the K/V loads 20%,
+   yet prefetching them into registers saved 1% (not kept). GPU performance
+   counters (ncu) need admin rights here, so the remaining limit is not
+   identified yet. Image encoder 0.033 s, triplane 0.42-0.45 s. Next: that
+   GEMM shape, then --cuda in `faisca mesh`, then CPU cache tuning.
 
 OmniDreams (NVIDIA video world model) is an exploration, not a plan step:
 read docs/omnidreams_handoff.md first, then docs/omnidreams.md.

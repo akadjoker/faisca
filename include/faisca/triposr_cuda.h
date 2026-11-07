@@ -67,7 +67,7 @@ private:
     void* m_trace_user = nullptr;
     CudaStream m_stream;
     CudaModule m_module;
-    CudaKernel m_gemm, m_layer_norm, m_gelu, m_geglu, m_add, m_attention, m_upsample, m_query;
+    CudaKernel m_gemm, m_layer_norm, m_gelu, m_geglu, m_add, m_flash, m_upsample, m_query;
 
     CudaBuffer m_weights; // TripoModel::panel_data()
     CudaBuffer m_params;  // biases, norms, positions, plane inputs, MLP biases

@@ -267,75 +267,185 @@ extern "C" __global__ void tripo_add(float* x, const float* y, unsigned int coun
     }
 }
 
-// softmax(q k^T * scale) v for head_dim 64: one query per thread, 128 queries of head
-// blockIdx.y per block, keys and values in tiles of 64 through shared memory, online softmax
-extern "C" __global__ void tripo_attention(const float* q, const float* k, const float* v, float* out,
-                                           unsigned int n_q, unsigned int n_kv, unsigned int stride, float scale)
+// tile[64][64] of a head (rows r0.., columns head * 64..) transposed into dst[d][row],
+// rows from limit on as zeros; a warp covers 32 rows of one float4 column
+__device__ void load_transposed(float (*dst)[64], const float* src, unsigned int r0, unsigned int limit,
+                                unsigned int stride, unsigned int head)
 {
-    __shared__ float ks[64][64];
-    __shared__ float vs[64][64];
-    const unsigned int head = blockIdx.y;
-    const unsigned int query = blockIdx.x * 128 + threadIdx.x;
-    const bool active = query < n_q;
-    float qr[64];
-    float o[64];
-#pragma unroll
-    for (int d = 0; d < 64; ++d)
+    for (unsigned int e = threadIdx.x; e < 1024; e += 128)
     {
-        qr[d] = active ? q[(size_t)query * stride + head * 64 + d] : 0.0f;
-        o[d] = 0.0f;
+        const unsigned int w = e / 32;
+        const unsigned int row = (w % 2) * 32 + e % 32;
+        const unsigned int c = (w / 2) * 4;
+        float4 f = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        if (r0 + row < limit)
+        {
+            f = *(const float4*)(src + (size_t)(r0 + row) * stride + head * 64 + c);
+        }
+        dst[c][row] = f.x;
+        dst[c + 1][row] = f.y;
+        dst[c + 2][row] = f.z;
+        dst[c + 3][row] = f.w;
     }
-    float m = -3.402823466e38f;
-    float l = 0.0f;
+}
+
+// softmax(q k^T * scale) v for head_dim 64 in the FlashAttention-2 order (Dao 2023, as
+// PyTorch's mem-efficient cutlass kernel): 64 queries per block of 128 threads, keys in
+// steps of 64, the online softmax rescaled once per step. Thread (tq, tk) holds S and O
+// for queries 4 tq.. and keys / dims 4 tk.. and 32 + 4 tk..
+extern "C" __global__ void __launch_bounds__(128)
+    tripo_flash_attention(const float* q, const float* k, const float* v, float* out, unsigned int n_q,
+                          unsigned int n_kv, unsigned int stride, float scale)
+{
+    __shared__ __align__(16) float qt[64][64];
+    __shared__ __align__(16) float kt[64][64];
+    __shared__ __align__(16) float vs[64][64];
+    const unsigned int tid = threadIdx.x;
+    const unsigned int tq = tid / 8;
+    const unsigned int tk = tid % 8;
+    const unsigned int head = blockIdx.y;
+    const unsigned int q0 = blockIdx.x * 64;
+    const float minus_infinity = __int_as_float(0xff800000);
+    load_transposed(qt, q, q0, n_q, stride, head);
+
+    float o[4][8];
+    float m[4];
+    float l[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i)
+    {
+        m[i] = minus_infinity;
+        l[i] = 0.0f;
+#pragma unroll
+        for (int j = 0; j < 8; ++j)
+        {
+            o[i][j] = 0.0f;
+        }
+    }
     for (unsigned int k0 = 0; k0 < n_kv; k0 += 64)
     {
-        for (unsigned int e = threadIdx.x; e < 64 * 64; e += 128)
+        __syncthreads();
+        load_transposed(kt, k, k0, n_kv, stride, head);
+        for (unsigned int e = tid; e < 1024; e += 128)
         {
-            const unsigned int j = e / 64;
-            const unsigned int d = e % 64;
-            const bool in = k0 + j < n_kv;
-            ks[j][d] = in ? k[(size_t)(k0 + j) * stride + head * 64 + d] : 0.0f;
-            vs[j][d] = in ? v[(size_t)(k0 + j) * stride + head * 64 + d] : 0.0f;
+            const unsigned int row = e / 16;
+            const unsigned int c = (e % 16) * 4;
+            float4 f = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            if (k0 + row < n_kv)
+            {
+                f = *(const float4*)(v + (size_t)(k0 + row) * stride + head * 64 + c);
+            }
+            *(float4*)&vs[row][c] = f;
         }
         __syncthreads();
-        const unsigned int count = n_kv - k0 < 64 ? n_kv - k0 : 64;
-        for (unsigned int j = 0; j < count; ++j)
+
+        float s[4][8];
+#pragma unroll
+        for (int i = 0; i < 4; ++i)
         {
-            float s = 0.0f;
 #pragma unroll
-            for (int d = 0; d < 64; ++d)
+            for (int j = 0; j < 8; ++j)
             {
-                s = fmaf(qr[d], ks[j][d], s);
-            }
-            s = s * scale;
-            if (s > m)
-            {
-                const float alpha = expf(m - s);
-                l = l * alpha;
-#pragma unroll
-                for (int d = 0; d < 64; ++d)
-                {
-                    o[d] = o[d] * alpha;
-                }
-                m = s;
-            }
-            const float p = expf(s - m);
-            l = l + p;
-#pragma unroll
-            for (int d = 0; d < 64; ++d)
-            {
-                o[d] = fmaf(p, vs[j][d], o[d]);
+                s[i][j] = 0.0f;
             }
         }
-        __syncthreads();
-    }
-    if (active)
-    {
-        const float inverse = 1.0f / l;
-#pragma unroll
+#pragma unroll 8
         for (int d = 0; d < 64; ++d)
         {
-            out[(size_t)query * stride + head * 64 + d] = o[d] * inverse;
+            const float4 a = *(const float4*)&qt[d][tq * 4];
+            const float4 b0 = *(const float4*)&kt[d][tk * 4];
+            const float4 b1 = *(const float4*)&kt[d][32 + tk * 4];
+            const float av[4] = {a.x, a.y, a.z, a.w};
+            const float bv[8] = {b0.x, b0.y, b0.z, b0.w, b1.x, b1.y, b1.z, b1.w};
+#pragma unroll
+            for (int i = 0; i < 4; ++i)
+            {
+#pragma unroll
+                for (int j = 0; j < 8; ++j)
+                {
+                    s[i][j] = fmaf(av[i], bv[j], s[i][j]);
+                }
+            }
+        }
+#pragma unroll
+        for (int i = 0; i < 4; ++i)
+        {
+            float top = minus_infinity;
+#pragma unroll
+            for (int j = 0; j < 8; ++j)
+            {
+                const unsigned int key = k0 + (j / 4) * 32 + tk * 4 + j % 4;
+                s[i][j] = key < n_kv ? s[i][j] * scale : minus_infinity;
+                top = fmaxf(top, s[i][j]);
+            }
+            top = fmaxf(top, __shfl_xor_sync(0xffffffffu, top, 1));
+            top = fmaxf(top, __shfl_xor_sync(0xffffffffu, top, 2));
+            top = fmaxf(top, __shfl_xor_sync(0xffffffffu, top, 4));
+            const float m_new = fmaxf(m[i], top);
+            const float alpha = expf(m[i] - m_new);
+            float sum = 0.0f;
+#pragma unroll
+            for (int j = 0; j < 8; ++j)
+            {
+                s[i][j] = expf(s[i][j] - m_new);
+                sum = sum + s[i][j];
+            }
+            sum = sum + __shfl_xor_sync(0xffffffffu, sum, 1);
+            sum = sum + __shfl_xor_sync(0xffffffffu, sum, 2);
+            sum = sum + __shfl_xor_sync(0xffffffffu, sum, 4);
+            l[i] = l[i] * alpha + sum;
+            m[i] = m_new;
+#pragma unroll
+            for (int j = 0; j < 8; ++j)
+            {
+                o[i][j] = o[i][j] * alpha;
+            }
+        }
+        __syncthreads();
+#pragma unroll
+        for (int j = 0; j < 8; ++j)
+        {
+            const unsigned int key = (j / 4) * 32 + tk * 4 + j % 4;
+            *(float4*)&kt[key][tq * 4] = make_float4(s[0][j], s[1][j], s[2][j], s[3][j]);
+        }
+        __syncthreads();
+#pragma unroll 8
+        for (int key = 0; key < 64; ++key)
+        {
+            const float4 p = *(const float4*)&kt[key][tq * 4];
+            const float4 v0 = *(const float4*)&vs[key][tk * 4];
+            const float4 v1 = *(const float4*)&vs[key][32 + tk * 4];
+            const float pv[4] = {p.x, p.y, p.z, p.w};
+            const float vv[8] = {v0.x, v0.y, v0.z, v0.w, v1.x, v1.y, v1.z, v1.w};
+#pragma unroll
+            for (int i = 0; i < 4; ++i)
+            {
+#pragma unroll
+                for (int j = 0; j < 8; ++j)
+                {
+                    o[i][j] = fmaf(pv[i], vv[j], o[i][j]);
+                }
+            }
+        }
+    }
+#pragma unroll
+    for (int i = 0; i < 4; ++i)
+    {
+        const unsigned int query = q0 + tq * 4 + i;
+        if (query >= n_q)
+        {
+            continue;
+        }
+        const float inverse = 1.0f / l[i];
+#pragma unroll
+        for (int h = 0; h < 2; ++h)
+        {
+            float4 r;
+            r.x = o[i][h * 4] * inverse;
+            r.y = o[i][h * 4 + 1] * inverse;
+            r.z = o[i][h * 4 + 2] * inverse;
+            r.w = o[i][h * 4 + 3] * inverse;
+            *(float4*)(out + (size_t)query * stride + head * 64 + h * 32 + tk * 4) = r;
         }
     }
 }

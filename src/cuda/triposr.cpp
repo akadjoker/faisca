@@ -75,7 +75,7 @@ bool TripoCudaRunner::init(const TripoModel& model, CudaDevice& device, ThreadPo
         !device.find_kernel(m_module, "tripo_gelu", m_gelu, error) ||
         !device.find_kernel(m_module, "tripo_geglu", m_geglu, error) ||
         !device.find_kernel(m_module, "tripo_add", m_add, error) ||
-        !device.find_kernel(m_module, "tripo_attention", m_attention, error) ||
+        !device.find_kernel(m_module, "tripo_flash_attention", m_flash, error) ||
         !device.find_kernel(m_module, "tripo_upsample", m_upsample, error) ||
         !device.find_kernel(m_module, "tripo_query", m_query, error))
     {
@@ -301,10 +301,10 @@ bool TripoCudaRunner::attention(uint64_t q, uint64_t k, uint64_t v, uint64_t out
     float scale = 1.0f / std::sqrt(64.0f);
     void* arguments[] = {&q, &k, &v, &out, &n_q, &n_kv, &stride, &scale};
     CudaLaunch launch;
-    launch.grid_x = (n_q + 127) / 128;
     launch.grid_y = heads;
     launch.block_x = 128;
-    return m_device->launch(m_attention, m_stream, launch, arguments, error);
+    launch.grid_x = (n_q + 63) / 64;
+    return m_device->launch(m_flash, m_stream, launch, arguments, error);
 }
 
 bool TripoCudaRunner::elementwise(const CudaKernel& kernel, void** arguments, uint32_t count, Error& error)
