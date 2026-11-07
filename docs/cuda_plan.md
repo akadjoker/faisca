@@ -25,8 +25,8 @@ explicitly pending. Each implemented operation still passes its reference
 before integration; this does not declare all of phases 2 and 3 complete.
 
 Preserve the phase order in ../CLAUDE.md, step 11. Each phase advances only
-after its reference checks pass. Do not create commits without the owner's
-request; when requested, each kernel commit must include passing checks.
+after its reference checks pass. Commit and push each validated chunk right
+away; each kernel commit must include passing checks.
 
 ## Hardware and open decisions
 
