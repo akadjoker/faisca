@@ -600,6 +600,27 @@ tests/cuda_taehv: rel L2 4e-7, worst pixel 2.3e-6 (0.0006 of 255), 5 then 8
 frames. At the real size (88 x 160 latents, 704 x 1280 frames): 520-543 ms a
 chunk of 2 latent frames, against 7.7 s of DiT.
 
+### Wan 2.1 VAE encoder, lightvae (2026-11-07)
+
+OmniDreams encodes the first frame and the HD map with the same lightvae
+(integrations_v2/omnidreams/config.py OMNIDREAMS_PIPELINE_CONFIG: image_encoder
+and encoder both AVAILABLE_WAN_VAE_CHECKPOINT_PATHS["lightvae"]). WanVaeCudaEncoder
+(include/faisca/wanvae_cuda.h, src/cuda/wanvae.cpp, src/cuda/kernels/wanvae.cu):
+FlashDreams vae.py Encoder3d with pruning_rate 0.75 (24, 24, 48, 96, 96) and
+WanVAE.encode, f32, one frame at a time: each causal (3, 3, 3) convolution reads
+a ring of its last three inputs (zero at the start, as F.pad and
+normalize_state_for_body), the temporal downsamples pass the first frame and
+then time_conv every second one, as _downsample3d_step over seed + 4-frame
+chunks. One convolution kernel with three time taps and stride 1 or 2 (the
+Resample's ZeroPad2d((0, 1, 0, 1)) + stride 2); the middle attention (one head
+of 96 over the frame's pixels) on attention_f16, padded to 128, scale 1/sqrt(96).
+tests/wanvae_reference.py (float64, the same code paths, 1 + 4 then 4 frames)
+against tests/cuda_wanvae: 6.5e-6 and 4.4e-6, 2 then 1 latent frames. At
+704 x 1280: 117 ms for the first frame, 407-414 ms per 4 frames, 2.75 GB of
+device memory (the rings in f32 are 2.0 GB): too much next to the DiT's 6.43 GB.
+Next: bf16 storage (the encoder runs in bf16 in FlashDreams), two ring slots per
+convolution plus one shared, buffers shared with the decoder and the DiT.
+
 ## Phase 5 and exclusions
 
 MoE GPU work waits for a CPU MoE implementation validated against llama.cpp.

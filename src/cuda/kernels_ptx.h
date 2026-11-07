@@ -18,5 +18,6 @@ extern const char ptx_rope[];
 extern const char ptx_swiglu[];
 extern const char ptx_taehv[];
 extern const char ptx_triposr[];
+extern const char ptx_wanvae[];
 
 }
