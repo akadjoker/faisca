@@ -222,6 +222,171 @@ bool Tokenizer::load(const GgufFile& file, Error& error)
     return false;
 }
 
+// The Qwen2 pre-tokenizer as tokenizer.json writes it (llama.cpp's "qwen2" pre type)
+static const char QWEN2_SPLIT[] =
+    "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|"
+    "\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+";
+
+bool Tokenizer::load_hf(const char* path, Error& error)
+{
+    release();
+    m_hf_file.close();
+    if (!m_hf_file.open(path, error) ||
+        !m_hf_json.parse(reinterpret_cast<const char*>(m_hf_file.data()), m_hf_file.size(), error))
+    {
+        return false;
+    }
+    const JsonDocument& json = m_hf_json;
+    const uint32_t root = json.root();
+    const uint32_t model = json.find(root, "model");
+    const uint32_t type = json.find(model, "type");
+    const uint32_t vocab = json.find(model, "vocab");
+    const uint32_t merge_list = json.find(model, "merges");
+    if (type == JSON_NONE || json.value(type).text != "BPE" || vocab == JSON_NONE ||
+        json.value(vocab).kind != JsonKind::Object || merge_list == JSON_NONE ||
+        json.value(merge_list).kind != JsonKind::Array)
+    {
+        error.set("%s: not a BPE tokenizer.json with model.vocab and model.merges", path);
+        return false;
+    }
+    // the pre-tokenizer: a Split on the Qwen2 regex then ByteLevel without its own regex
+    bool qwen2 = false;
+    const uint32_t pre = json.find(root, "pre_tokenizer");
+    const uint32_t steps = json.find(pre, "pretokenizers");
+    if (steps != JSON_NONE && json.value(steps).kind == JsonKind::Array)
+    {
+        for (uint32_t step = json.value(steps).first; step != JSON_NONE; step = json.value(step).next)
+        {
+            const uint32_t pattern = json.find(json.find(step, "pattern"), "Regex");
+            if (pattern != JSON_NONE && json.value(pattern).text == std::string_view(QWEN2_SPLIT))
+            {
+                qwen2 = true;
+            }
+        }
+    }
+    if (!qwen2)
+    {
+        error.set("%s: only the Qwen2 pre-tokenizer is supported", path);
+        return false;
+    }
+    m_model = Model::Bpe;
+    m_pre = PreTokenizer::Qwen2;
+    m_clean_spaces = false;
+    m_ignore_merges = false;
+    m_add_bos = false;
+    m_add_eos = false;
+
+    // ids from the vocabulary and the added tokens; any gap stays empty
+    uint64_t count = 0;
+    for (uint32_t k = json.value(vocab).first; k != JSON_NONE; k = json.value(json.value(k).next).next)
+    {
+        const JsonValue& id = json.value(json.value(k).next);
+        if (!id.integral || id.integer < 0 || id.integer >= (int64_t(1) << 30))
+        {
+            error.set("%s: bad id in model.vocab", path);
+            return false;
+        }
+        count = static_cast<uint64_t>(id.integer) + 1 > count ? static_cast<uint64_t>(id.integer) + 1 : count;
+    }
+    const uint32_t added = json.find(root, "added_tokens");
+    if (added != JSON_NONE && json.value(added).kind == JsonKind::Array)
+    {
+        for (uint32_t a = json.value(added).first; a != JSON_NONE; a = json.value(a).next)
+        {
+            const uint32_t id = json.find(a, "id");
+            if (id == JSON_NONE || !json.value(id).integral || json.value(id).integer < 0 ||
+                json.value(id).integer >= (int64_t(1) << 30))
+            {
+                error.set("%s: bad id in added_tokens", path);
+                return false;
+            }
+            const uint64_t next = static_cast<uint64_t>(json.value(id).integer) + 1;
+            count = next > count ? next : count;
+        }
+    }
+    Array<std::string_view> texts;
+    Array<int32_t> types;
+    if (!texts.resize_uninitialized(count) || !types.resize_uninitialized(count))
+    {
+        error.set("out of memory while reading the vocabulary");
+        return false;
+    }
+    for (size_t i = 0; i < count; ++i)
+    {
+        texts[i] = std::string_view();
+        types[i] = static_cast<int32_t>(TokenType::Normal);
+    }
+    for (uint32_t k = json.value(vocab).first; k != JSON_NONE; k = json.value(json.value(k).next).next)
+    {
+        texts[static_cast<size_t>(json.value(json.value(k).next).integer)] = json.value(k).text;
+    }
+    if (added != JSON_NONE && json.value(added).kind == JsonKind::Array)
+    {
+        for (uint32_t a = json.value(added).first; a != JSON_NONE; a = json.value(a).next)
+        {
+            const size_t id = static_cast<size_t>(json.value(json.find(a, "id")).integer);
+            const uint32_t content = json.find(a, "content");
+            const uint32_t special = json.find(a, "special");
+            if (content == JSON_NONE || json.value(content).kind != JsonKind::String)
+            {
+                error.set("%s: added token %zu has no content", path, id);
+                return false;
+            }
+            texts[id] = json.value(content).text;
+            types[id] = static_cast<int32_t>(special != JSON_NONE && json.value(special).kind == JsonKind::True
+                                                 ? TokenType::Control
+                                                 : TokenType::UserDefined);
+        }
+    }
+    if (!set_vocabulary(texts, types, error) || !build_pieces(error))
+    {
+        release();
+        return false;
+    }
+
+    // merges as "left right" strings, or [left, right] pairs in newer files
+    Array<std::string_view> merges;
+    if (!merges.reserve(json.value(merge_list).count))
+    {
+        error.set("out of memory while reading the merges");
+        return false;
+    }
+    for (uint32_t m = json.value(merge_list).first; m != JSON_NONE; m = json.value(m).next)
+    {
+        const JsonValue& merge = json.value(m);
+        if (merge.kind == JsonKind::String)
+        {
+            merges.push_back_unchecked(merge.text);
+            continue;
+        }
+        if (merge.kind != JsonKind::Array || merge.count != 2)
+        {
+            error.set("%s: a merge is neither \"a b\" nor [a, b]", path);
+            return false;
+        }
+        const std::string_view left = json.value(merge.first).text;
+        const std::string_view right = json.value(json.value(merge.first).next).text;
+        char* joined = m_arena.allocate(left.size() + 1 + right.size());
+        if (joined == nullptr)
+        {
+            error.set("out of memory while reading the merges");
+            return false;
+        }
+        std::memcpy(joined, left.data(), left.size());
+        joined[left.size()] = ' ';
+        std::memcpy(joined + left.size() + 1, right.data(), right.size());
+        merges.push_back_unchecked(std::string_view(joined, left.size() + 1 + right.size()));
+    }
+    m_bos = TOKEN_NONE;
+    m_eos = TOKEN_NONE;
+    if (!set_merges(merges, error) || !collect_special_tokens(error))
+    {
+        release();
+        return false;
+    }
+    return true;
+}
+
 bool Tokenizer::intern(std::string_view text, bool copy, uint32_t& symbol)
 {
     if (m_symbol_index.find(text, symbol))
@@ -353,6 +518,93 @@ bool Tokenizer::load_tokens(const GgufFile& file, Error& error)
         }
     }
 
+    if (!set_vocabulary(texts, types, error))
+    {
+        return false;
+    }
+
+    if (m_model == Model::Spm)
+    {
+        const GgufArray* score_array = file.get_array("tokenizer.ggml.scores");
+        if (score_array == nullptr || score_array->elem_type != GgufType::Float32 || score_array->count < count ||
+            !score_array->copy_to(m_scores))
+        {
+            error.set("tokenizer.ggml.scores is missing or is not a float array with one entry per token");
+            return false;
+        }
+        for (uint32_t byte = 0; byte < 256; ++byte)
+        {
+            m_byte_token[byte] = TOKEN_NONE;
+        }
+        for (size_t i = 0; i < count; ++i)
+        {
+            const Token& token = m_tokens[i];
+            if (token.type == TokenType::Byte && token.text.size() >= 5)
+            {
+                m_byte_token[static_cast<uint8_t>(byte_token_value(token.text))] = static_cast<int32_t>(i);
+            }
+        }
+        uint64_t id = 0;
+        if (file.get_uint("tokenizer.ggml.unknown_token_id", id) && id < count)
+        {
+            m_unk = static_cast<int32_t>(id);
+        }
+    }
+
+    return true;
+}
+
+bool Tokenizer::load_merges(const GgufFile& file, Error& error)
+{
+    if (m_model == Model::Spm)
+    {
+        return true;
+    }
+    const GgufArray* merge_array = file.get_array("tokenizer.ggml.merges");
+    if (merge_array == nullptr || merge_array->elem_type != GgufType::String)
+    {
+        error.set("tokenizer.ggml.merges is missing or is not an array of strings");
+        return false;
+    }
+
+    Array<std::string_view> merges;
+    if (!merge_array->strings_to(merges))
+    {
+        error.set("out of memory while reading the merges");
+        return false;
+    }
+    return set_merges(merges, error);
+}
+
+bool Tokenizer::load_special_tokens(const GgufFile& file, Error& error)
+{
+    const uint64_t count = m_tokens.size();
+
+    // llama.cpp defaults for this tokenizer model
+    m_bos = count > 11 ? 11 : TOKEN_NONE;
+    m_eos = count > 11 ? 11 : TOKEN_NONE;
+
+    uint64_t id = 0;
+    if (file.get_uint("tokenizer.ggml.bos_token_id", id) && id < count)
+    {
+        m_bos = static_cast<int32_t>(id);
+    }
+    if (file.get_uint("tokenizer.ggml.eos_token_id", id) && id < count)
+    {
+        m_eos = static_cast<int32_t>(id);
+    }
+
+    file.get_bool("tokenizer.ggml.add_bos_token", m_add_bos);
+    file.get_bool("tokenizer.ggml.add_eos_token", m_add_eos);
+    file.get_bool("tokenizer.ggml.add_space_prefix", m_add_space_prefix);
+
+    return collect_special_tokens(error);
+}
+
+// the token texts and types, the byte symbols and the ASCII classes, whatever the file format
+bool Tokenizer::set_vocabulary(const Array<std::string_view>& texts, const Array<int32_t>& types, Error& error)
+{
+    const size_t count = texts.size();
     if (!m_tokens.reserve(count) || !m_symbols.reserve(count + 256) || !m_symbol_index.reserve(count + 256))
     {
         error.set("out of memory while reading the vocabulary");
@@ -412,52 +664,13 @@ bool Tokenizer::load_tokens(const GgufFile& file, Error& error)
         m_ascii_classes[c] = unicode_class(c);
     }
 
-    if (m_model == Model::Spm)
-    {
-        const GgufArray* score_array = file.get_array("tokenizer.ggml.scores");
-        if (score_array == nullptr || score_array->elem_type != GgufType::Float32 || score_array->count < count ||
-            !score_array->copy_to(m_scores))
-        {
-            error.set("tokenizer.ggml.scores is missing or is not a float array with one entry per token");
-            return false;
-        }
-        for (uint32_t byte = 0; byte < 256; ++byte)
-        {
-            m_byte_token[byte] = TOKEN_NONE;
-        }
-        for (size_t i = 0; i < count; ++i)
-        {
-            const Token& token = m_tokens[i];
-            if (token.type == TokenType::Byte && token.text.size() >= 5)
-            {
-                m_byte_token[static_cast<uint8_t>(byte_token_value(token.text))] = static_cast<int32_t>(i);
-            }
-        }
-        uint64_t id = 0;
-        if (file.get_uint("tokenizer.ggml.unknown_token_id", id) && id < count)
-        {
-            m_unk = static_cast<int32_t>(id);
-        }
-    }
-
     return true;
 }
 
-bool Tokenizer::load_merges(const GgufFile& file, Error& error)
+// "left right" pairs in rank order
+bool Tokenizer::set_merges(const Array<std::string_view>& merges, Error& error)
 {
-    if (m_model == Model::Spm)
-    {
-        return true;
-    }
-    const GgufArray* merge_array = file.get_array("tokenizer.ggml.merges");
-    if (merge_array == nullptr || merge_array->elem_type != GgufType::String)
-    {
-        error.set("tokenizer.ggml.merges is missing or is not an array of strings");
-        return false;
-    }
-
-    Array<std::string_view> merges;
-    if (!merge_array->strings_to(merges) || !m_merges.reserve(merges.size()) || !m_merged.reserve(merges.size()))
+    if (!m_merges.reserve(merges.size()) || !m_merged.reserve(merges.size()))
     {
         error.set("out of memory while reading the merges");
         return false;
@@ -510,28 +723,9 @@ bool Tokenizer::load_merges(const GgufFile& file, Error& error)
     return true;
 }
 
-bool Tokenizer::load_special_tokens(const GgufFile& file, Error& error)
+// the control, user defined and unknown tokens that encode() matches in the text, longest first
+bool Tokenizer::collect_special_tokens(Error& error)
 {
-    const uint64_t count = m_tokens.size();
-
-    // llama.cpp defaults for this tokenizer model
-    m_bos = count > 11 ? 11 : TOKEN_NONE;
-    m_eos = count > 11 ? 11 : TOKEN_NONE;
-
-    uint64_t id = 0;
-    if (file.get_uint("tokenizer.ggml.bos_token_id", id) && id < count)
-    {
-        m_bos = static_cast<int32_t>(id);
-    }
-    if (file.get_uint("tokenizer.ggml.eos_token_id", id) && id < count)
-    {
-        m_eos = static_cast<int32_t>(id);
-    }
-
-    file.get_bool("tokenizer.ggml.add_bos_token", m_add_bos);
-    file.get_bool("tokenizer.ggml.add_eos_token", m_add_eos);
-    file.get_bool("tokenizer.ggml.add_space_prefix", m_add_space_prefix);
-
     // llama.cpp makes these end of generation texts control tokens whatever the file says
     static const char* const EOG_TEXTS[] = {"<|eot_id|>", "<|im_end|>", "<|end|>", "<|return|>", "<|call|>", "<|flush|>",
                                             "<|calls|>", "<end_of_turn>", "<|endoftext|>", "</s>", "<|eom_id|>", "<EOT>",

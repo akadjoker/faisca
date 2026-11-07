@@ -5,6 +5,8 @@
 #include "faisca/error.h"
 #include "faisca/gguf.h"
 #include "faisca/int_map.h"
+#include "faisca/json.h"
+#include "faisca/mapped_file.h"
 #include "faisca/string_map.h"
 
 #include <cstddef>
@@ -40,6 +42,9 @@ public:
     Tokenizer& operator=(const Tokenizer&) = delete;
 
     bool load(const GgufFile& file, Error& error);
+    // a Hugging Face tokenizer.json (byte level BPE with the Qwen2 pre-tokenizer); the file is
+    // kept mapped, token texts point into it
+    bool load_hf(const char* path, Error& error);
 
     void release();
 
@@ -179,6 +184,9 @@ private:
     bool build_pieces(Error& error);
     bool load_merges(const GgufFile& file, Error& error);
     bool load_special_tokens(const GgufFile& file, Error& error);
+    bool set_vocabulary(const Array<std::string_view>& texts, const Array<int32_t>& types, Error& error);
+    bool set_merges(const Array<std::string_view>& merges, Error& error);
+    bool collect_special_tokens(Error& error);
 
     bool partition(std::string_view text, bool parse_special);
     bool encode_text(std::string_view text, Array<int32_t>& out);
@@ -198,6 +206,8 @@ private:
     bool spm_try_bigram(int32_t left, int32_t right);
     SpmBigram spm_pop();
 
+    MappedFile m_hf_file;
+    JsonDocument m_hf_json;
     Arena m_arena;
     Array<Token> m_tokens;
     Array<Symbol> m_symbols;

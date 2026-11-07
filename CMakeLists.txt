@@ -214,6 +214,10 @@ if(FAISCA_BUILD_TESTS)
         target_compile_options(cuda_dit_block PRIVATE ${FAISCA_WARNINGS})
     endif()
 
+    add_executable(hf_tokenize tests/hf_tokenize.cpp)
+    target_link_libraries(hf_tokenize PRIVATE faisca_lib)
+    target_compile_options(hf_tokenize PRIVATE ${FAISCA_WARNINGS})
+
     add_executable(safetensors_dump tests/safetensors_dump.cpp)
     target_link_libraries(safetensors_dump PRIVATE faisca_lib)
     target_compile_options(safetensors_dump PRIVATE ${FAISCA_WARNINGS})
