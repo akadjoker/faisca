@@ -19,6 +19,7 @@ def ours(name, shape):
 
 
 STAGES = [
+    ("rgb_cond", lambda r: r[0, 0], "rgb_cond", (512, 512, 3)),
     ("vit_embed", lambda r: r[0], "vit_embed", (1025, 768)),
     ("vit_layer0", lambda r: r[0], "vit_layer0", (1025, 768)),
     ("vit_tokens", lambda r: r[0, 0].T, "vit_tokens", (1025, 768)),

@@ -2,6 +2,7 @@
 
 #include "faisca/array.h"
 #include "faisca/error.h"
+#include "faisca/image.h"
 #include "faisca/runner.h"
 #include "faisca/thread.h"
 #include "faisca/torch_ckpt.h"
@@ -248,6 +249,12 @@ private:
 // torch.nn.functional.interpolate(mode="bicubic", align_corners=False, scale_factor=scale)
 // does on the CPU in float32
 void tripo_bicubic_rows(const float* pos, uint32_t side, uint32_t dim, double scale, uint32_t out_side, float* out);
+
+// TripoSR run.py and ImagePreprocessor without rembg: an image with alpha is cut to its
+// foreground (resize_foreground with ratio, the box of alpha > 0 as numpy slices it),
+// blended on grey 0.5 and rounded to 8 bits; then every image goes to rgb as
+// IMAGE_SIZE x IMAGE_SIZE x 3 floats through F.interpolate(bilinear, antialias=True)
+bool tripo_prepare_image(const Image& image, float foreground_ratio, Array<float>& rgb, Error& error);
 
 // torchmcubes mcubes_cpu (commit a9ac95a) of vol, resolution^3 values indexed
 // [z][y][x], at level 0: points gets x, y, z in grid units per unique vertex (first seen

@@ -466,7 +466,9 @@ bool decode_png(const uint8_t* data, size_t size, Image& out, Error& error)
         error.set("PNG image data is short");
         return false;
     }
-    if (!out.rgb.resize_uninitialized(static_cast<size_t>(width) * height * 3))
+    const bool has_alpha = color == 4 || color == 6;
+    if (!out.rgb.resize_uninitialized(static_cast<size_t>(width) * height * 3) ||
+        !out.alpha.resize_uninitialized(has_alpha ? static_cast<size_t>(width) * height : 0))
     {
         error.set("out of memory");
         return false;
@@ -518,6 +520,10 @@ bool decode_png(const uint8_t* data, size_t size, Image& out, Error& error)
         {
             const uint8_t* px = cur + x * bpp;
             const size_t step = depth / 8;
+            if (has_alpha)
+            {
+                out.alpha[static_cast<size_t>(y) * width + x] = px[(channels - 1) * step];
+            }
             if (color == 3)
             {
                 const uint8_t index = px[0];
@@ -1210,6 +1216,7 @@ bool decode_jpeg(const uint8_t* data, size_t size, Image& out, Error& error)
         error.set("out of memory");
         return false;
     }
+    out.alpha.clear();
     out.width = width;
     out.height = height;
 

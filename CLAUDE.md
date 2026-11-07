@@ -501,8 +501,20 @@ top. No third party dependencies. Owner: Luís (akadjoker). "faisca" is a workin
    in opposite directions and merges them only when the floats coincide.
    Bit identical with 22 and 7 threads. extract_mesh 256^3: 8.0-9.4 s
    against 26.5 s for PyTorch CPU extract_mesh.
-   Next: preprocessing (resize_foreground, antialiased bilinear to 512,
-   rembg), a CLI command writing a mesh file, CUDA, CPU cache tuning.
+   Done: preprocessing (`tripo_prepare_image`; Image now keeps PNG alpha
+   apart). An image with transparency takes run.py's path (tsr.utils
+   remove_background skips rembg then): resize_foreground with ratio 0.85
+   (the alpha > 0 box as numpy slices it, so the last row and column are
+   left out), blend on grey 0.5 in float32 truncated to uint8, then
+   F.interpolate(bilinear, antialias=True) to 512 as UpSampleKernel.cpp
+   computes it (width pass, then height; weights in float). An image
+   without alpha goes straight to the resize (run.py --no-remove-bg);
+   rembg is not ported. Finding: PyTorch's cpu/ kernels are built with
+   -mfma and GCC's default contraction, so `output += t * w` is a fused
+   multiply-add; with std::fma the 786432 values of chair.png's rgb_cond
+   are bit identical (411223 differed by 1 ulp without it).
+   tests/triposr_dump takes an image path or a reference dir.
+   Next: a CLI command writing a mesh file, CUDA, CPU cache tuning.
 
 OmniDreams (NVIDIA video world model) is an exploration, not a plan step:
 read docs/omnidreams_handoff.md first, then docs/omnidreams.md.

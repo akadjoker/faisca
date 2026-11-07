@@ -1095,6 +1095,205 @@ struct GridSource
 
 }
 
+namespace
+{
+
+// PyTorch v2.11.0 UpSampleKernel.cpp _compute_indices_min_size_weights_aa with the
+// HelperInterpLinear filter, scale input / output in float
+struct AaTaps
+{
+    Array<int64_t> first;
+    Array<int64_t> count;
+    Array<float> weights;
+    int64_t width = 0;
+};
+
+bool aa_taps(int64_t input, int64_t output, AaTaps& taps)
+{
+    const float scale = static_cast<float>(input) / static_cast<float>(output);
+    const float support = static_cast<float>((2 * 0.5) * (scale >= 1.0f ? static_cast<double>(scale) : 1.0));
+    taps.width = static_cast<int64_t>(std::ceil(support)) * 2 + 1;
+    if (!taps.first.resize_uninitialized(size_t(output)) || !taps.count.resize_uninitialized(size_t(output)) ||
+        !taps.weights.resize_uninitialized(size_t(output * taps.width)))
+    {
+        return false;
+    }
+    const float invscale = scale >= 1.0f ? static_cast<float>(1.0 / static_cast<double>(scale)) : 1.0f;
+    for (int64_t i = 0; i < output; ++i)
+    {
+        const float center = static_cast<float>(static_cast<double>(scale) * (static_cast<double>(i) + 0.5));
+        int64_t xmin = static_cast<int64_t>(static_cast<double>(center - support) + 0.5);
+        xmin = xmin > 0 ? xmin : 0;
+        int64_t xmax = static_cast<int64_t>(static_cast<double>(center + support) + 0.5);
+        xmax = xmax < input ? xmax : input;
+        int64_t xsize = xmax - xmin;
+        xsize = xsize < 0 ? 0 : (xsize > taps.width ? taps.width : xsize);
+        float* w = taps.weights.data() + i * taps.width;
+        float total = 0.0f;
+        for (int64_t j = 0; j < xsize; ++j)
+        {
+            const float x = static_cast<float>(
+                (static_cast<double>(static_cast<float>(j + xmin) - center) + 0.5) * static_cast<double>(invscale));
+            const float a = std::fabs(x);
+            w[j] = a < 1.0f ? static_cast<float>(1.0 - static_cast<double>(a)) : 0.0f;
+            total += w[j];
+        }
+        if (total != 0.0f)
+        {
+            for (int64_t j = 0; j < xsize; ++j)
+            {
+                w[j] /= total;
+            }
+        }
+        taps.first[size_t(i)] = xmin;
+        taps.count[size_t(i)] = xsize;
+    }
+    return true;
+}
+
+// one output value: t0 w0, then += tj wj (interpolate_aa_single_dim)
+float aa_sum(const float* src, size_t stride, const AaTaps& taps, size_t i)
+{
+    const float* w = taps.weights.data() + int64_t(i) * taps.width;
+    const float* s = src + size_t(taps.first[i]) * stride;
+    float out = s[0] * w[0];
+    for (int64_t j = 1; j < taps.count[i]; ++j)
+    {
+        out = std::fma(s[size_t(j) * stride], w[j], out);
+    }
+    return out;
+}
+
+}
+
+bool tripo_prepare_image(const Image& image, float foreground_ratio, Array<float>& rgb, Error& error)
+{
+    size_t width = image.width;
+    size_t height = image.height;
+    Array<float> src;
+    if (!image.alpha.empty())
+    {
+        size_t y1 = height, y2 = 0, x1 = width, x2 = 0;
+        for (size_t y = 0; y < height; ++y)
+        {
+            for (size_t x = 0; x < width; ++x)
+            {
+                if (image.alpha[y * width + x] > 0)
+                {
+                    y1 = y < y1 ? y : y1;
+                    y2 = y > y2 ? y : y2;
+                    x1 = x < x1 ? x : x1;
+                    x2 = x > x2 ? x : x2;
+                }
+            }
+        }
+        if (y1 > y2)
+        {
+            error.set("the image is fully transparent");
+            return false;
+        }
+        // fg = image[y1:y2, x1:x2], padded to a square, then to int(size / ratio)
+        const size_t h = y2 - y1;
+        const size_t w = x2 - x1;
+        const size_t size = h > w ? h : w;
+        const size_t full = static_cast<size_t>(static_cast<double>(size) / static_cast<double>(foreground_ratio));
+        if (size == 0 || full < size)
+        {
+            error.set("foreground of %zu x %zu pixels with ratio %g", w, h, double(foreground_ratio));
+            return false;
+        }
+        const size_t top = (size - h) / 2 + (full - size) / 2;
+        const size_t left = (size - w) / 2 + (full - size) / 2;
+        if (!src.resize_uninitialized(full * full * 3))
+        {
+            error.set("out of memory preparing the image");
+            return false;
+        }
+        for (size_t y = 0; y < full; ++y)
+        {
+            for (size_t x = 0; x < full; ++x)
+            {
+                const bool inside = y >= top && y < top + h && x >= left && x < left + w;
+                const size_t sy = y1 + y - (inside ? top : 0);
+                const size_t sx = x1 + x - (inside ? left : 0);
+                const float a = inside ? static_cast<float>(image.alpha[sy * width + sx]) / 255.0f : 0.0f;
+                for (size_t c = 0; c < 3; ++c)
+                {
+                    const float v = inside ? static_cast<float>(image.rgb[(sy * width + sx) * 3 + c]) / 255.0f : 0.0f;
+                    const float blended = v * a + (1.0f - a) * 0.5f;
+                    const uint8_t byte = static_cast<uint8_t>(blended * 255.0f);
+                    src[(y * full + x) * 3 + c] = static_cast<float>(byte) / 255.0f;
+                }
+            }
+        }
+        width = height = full;
+    }
+    else
+    {
+        if (!src.resize_uninitialized(width * height * 3))
+        {
+            error.set("out of memory preparing the image");
+            return false;
+        }
+        for (size_t i = 0; i < width * height * 3; ++i)
+        {
+            src[i] = static_cast<float>(image.rgb[i]) / 255.0f;
+        }
+    }
+
+    // separable_upsample_generic_Nd_kernel_impl: the width first, then the height; a
+    // dimension already at the output size is left alone
+    const size_t out = TripoModel::IMAGE_SIZE;
+    if (!rgb.resize_uninitialized(out * out * 3))
+    {
+        error.set("out of memory preparing the image");
+        return false;
+    }
+    Array<float> mid;
+    const float* rows = src.data();
+    if (width != out)
+    {
+        AaTaps taps;
+        if (!aa_taps(int64_t(width), int64_t(out), taps) || !mid.resize_uninitialized(height * out * 3))
+        {
+            error.set("out of memory preparing the image");
+            return false;
+        }
+        for (size_t y = 0; y < height; ++y)
+        {
+            for (size_t x = 0; x < out; ++x)
+            {
+                for (size_t c = 0; c < 3; ++c)
+                {
+                    mid[(y * out + x) * 3 + c] = aa_sum(src.data() + y * width * 3 + c, 3, taps, x);
+                }
+            }
+        }
+        rows = mid.data();
+    }
+    if (height != out)
+    {
+        AaTaps taps;
+        if (!aa_taps(int64_t(height), int64_t(out), taps))
+        {
+            error.set("out of memory preparing the image");
+            return false;
+        }
+        for (size_t y = 0; y < out; ++y)
+        {
+            for (size_t x = 0; x < out * 3; ++x)
+            {
+                rgb[y * out * 3 + x] = aa_sum(rows + x, out * 3, taps, y);
+            }
+        }
+    }
+    else
+    {
+        std::memcpy(rgb.data(), rows, out * out * 3 * sizeof(float));
+    }
+    return true;
+}
+
 bool tripo_marching_cubes(ThreadPool& pool, const float* vol, uint32_t resolution, Array<float>& points,
                           Array<uint32_t>& faces, Error& error)
 {

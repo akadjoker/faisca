@@ -1,6 +1,7 @@
 #include "faisca/triposr.h"
 
 #include <chrono>
+#include <cstring>
 #include <cstdio>
 #include <string>
 #include <thread>
@@ -40,21 +41,40 @@ int main(int argc, char** argv)
 {
     if (argc < 4)
     {
-        std::fprintf(stderr, "usage: triposr_dump <model.ckpt> <reference dir with rgb_cond.f32> <out dir, - for no traces> [threads] [mesh resolution, 64]\n");
+        std::fprintf(stderr, "usage: triposr_dump <model.ckpt> <image .png/.jpg or reference dir with rgb_cond.f32> <out dir, - for no traces> [threads] [mesh resolution, 64]\n");
         return 2;
     }
     const int threads = argc > 4 ? std::atoi(argv[4]) : static_cast<int>(std::thread::hardware_concurrency());
 
     const size_t size = faisca::TripoModel::IMAGE_SIZE;
     std::vector<float> rgb(size * size * 3);
-    const std::string rgb_path = std::string(argv[2]) + "/rgb_cond.f32";
-    FILE* f = std::fopen(rgb_path.c_str(), "rb");
-    if (f == nullptr || std::fread(rgb.data(), sizeof(float), rgb.size(), f) != rgb.size())
+    const std::string input = argv[2];
+    const bool from_image = input.size() > 4 && (input.compare(input.size() - 4, 4, ".png") == 0 ||
+                                                  input.compare(input.size() - 4, 4, ".jpg") == 0);
+    if (from_image)
     {
-        std::fprintf(stderr, "cannot read %s\n", rgb_path.c_str());
-        return 1;
+        faisca::Error error;
+        faisca::Image image;
+        faisca::Array<float> prepared;
+        if (!faisca::read_image(input.c_str(), image, error) ||
+            !faisca::tripo_prepare_image(image, 0.85f, prepared, error))
+        {
+            std::fprintf(stderr, "error: %s\n", error.c_str());
+            return 1;
+        }
+        std::memcpy(rgb.data(), prepared.data(), rgb.size() * sizeof(float));
     }
-    std::fclose(f);
+    else
+    {
+        const std::string rgb_path = input + "/rgb_cond.f32";
+        FILE* f = std::fopen(rgb_path.c_str(), "rb");
+        if (f == nullptr || std::fread(rgb.data(), sizeof(float), rgb.size(), f) != rgb.size())
+        {
+            std::fprintf(stderr, "cannot read %s\n", rgb_path.c_str());
+            return 1;
+        }
+        std::fclose(f);
+    }
 
     faisca::Error error;
     auto start = std::chrono::steady_clock::now();
@@ -77,6 +97,7 @@ int main(int argc, char** argv)
     if (dump.dir != "-")
     {
         runner.set_trace(write_trace, &dump);
+        write_trace(&dump, "rgb_cond", -1, rgb.data(), rgb.size());
     }
 
     start = std::chrono::steady_clock::now();
