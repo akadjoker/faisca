@@ -640,6 +640,19 @@ video matches the Kaggle run's in content and quality (side by side in
 projects/ref/omnidreams-models/kaggle_scene/out_faisca), details differ with
 the noise; the left car smears away in both (the HD map box, not the model).
 
+### Text encoder in faisca (2026-11-07)
+
+The prompt no longer needs PyTorch: own JSON and safetensors readers (checked against
+ct::Json and Python safetensors), Tokenizer::load_hf (Cosmos-Reason1's tokenizer.json;
+the chat template of 6 prompts gives transformers' ids), causal GQA in attention_f16,
+qwen.cu (RMSNorm, SwiGLU, the hidden state normalization) and CosmosTextCudaEncoder
+(include/faisca/text_encoder_cuda.h): 1.7-2.0 s per prompt on the RTX 4060 with the
+layers streamed from the safetensors, closer to a float32 PyTorch run than PyTorch's own
+bf16 (8.2e-3 against 1.14e-2 on the prompt tokens). The 377 padding tokens drift 27-28%
+from float32 in any bf16 run; the video does not notice (at most 1.2/255 per pixel).
+faisca_dreams --prompt "..." --text-model <Cosmos-Reason1-7B dir> encodes it between the
+VAE encoder and the DiT. Left outside faisca: the HD map drawing (ludus).
+
 ## Phase 5 and exclusions
 
 MoE GPU work waits for a CPU MoE implementation validated against llama.cpp.

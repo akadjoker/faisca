@@ -11,6 +11,7 @@
 #include "faisca/omnidreams.h"
 #include "faisca/omnidreams_cuda.h"
 #include "faisca/taehv_cuda.h"
+#include "faisca/text_encoder_cuda.h"
 #include "faisca/torch_ckpt.h"
 #include "faisca/wanvae_cuda.h"
 
@@ -177,6 +178,8 @@ int main(int argc, char** argv)
     const char* vae = option(argc, argv, "--vae", nullptr);
     const char* tae = option(argc, argv, "--tae", nullptr);
     const char* text_path = option(argc, argv, "--text", nullptr);
+    const char* prompt = option(argc, argv, "--prompt", nullptr);
+    const char* text_model = option(argc, argv, "--text-model", nullptr);
     const char* image_path = option(argc, argv, "--image", nullptr);
     const char* hdmap_path = option(argc, argv, "--hdmap", nullptr);
     const char* out_dir = option(argc, argv, "--out", nullptr);
@@ -187,11 +190,14 @@ int main(int argc, char** argv)
     {
         ppm = ppm || std::strcmp(argv[i], "--ppm") == 0;
     }
-    if (checkpoint == nullptr || vae == nullptr || tae == nullptr || text_path == nullptr || image_path == nullptr ||
+    const bool own_text = prompt != nullptr && text_model != nullptr;
+    if (checkpoint == nullptr || vae == nullptr || tae == nullptr || (text_path == nullptr && !own_text) ||
+        image_path == nullptr ||
         hdmap_path == nullptr || out_dir == nullptr || frames < 5 || (frames - 5) % 8 != 0)
     {
         std::printf("usage: faisca_dreams --dit <omnidreams .pt> --vae <lightvaew2_1.pth> --tae <lighttaew2_1.pth>\n"
-                    "         --text <text_embeddings.pt> --image <first frame 1280x704 png>\n"
+                    "         (--prompt \"...\" --text-model <Cosmos-Reason1-7B dir> | --text <text_embeddings.pt>)\n"
+                    "         --image <first frame 1280x704 png>\n"
                     "         --hdmap <frames x 704 x 1280 RGB8 raw> --frames <5 + 8k> --out <dir> [--seed 42] [--ppm]\n");
         return 2;
     }
@@ -261,19 +267,40 @@ int main(int argc, char** argv)
         std::printf("encoded the first frame and %d HD map frames in %.1f s\n", frames, now() - start);
     }
 
-    // phase 2: the DiT (block weights streamed), the text, the decoder
-    faisca::DitCheckpoint dit_weights;
+    // the text embeddings: the prompt through Cosmos-Reason1 on the GPU (released before the DiT),
+    // or read from a .pt
+    faisca::Array<uint16_t> own_embeddings;
     faisca::CkptFile text;
-    if (!dit_weights.open(checkpoint, error) || !text.open(text_path, error))
+    const uint16_t* embeddings = nullptr;
+    if (own_text)
+    {
+        const double text_start = now();
+        faisca::CosmosTextCudaEncoder text_encoder;
+        if (!text_encoder.init(device, text_model, error) || !text_encoder.encode(prompt, own_embeddings, error))
+        {
+            std::printf("text encoder: %s\n", error.message);
+            return 1;
+        }
+        embeddings = own_embeddings.data();
+        std::printf("prompt encoded in %.1f s\n", now() - text_start);
+    }
+    else
+    {
+        const faisca::CkptTensor* text_tensor = text.open(text_path, error) ? text.find("") : nullptr;
+        if (text_tensor == nullptr || text_tensor->dtype != faisca::CkptDtype::BF16 ||
+            text_tensor->n_elements != size_t(faisca::DIT_TEXT_TOKENS) * faisca::DIT_TEXT_IN)
+        {
+            std::printf("%s: expected one bf16 tensor of 512 x 100352\n", text_path);
+            return 1;
+        }
+        embeddings = reinterpret_cast<const uint16_t*>(text_tensor->data);
+    }
+
+    // phase 2: the DiT (block weights streamed), the decoder
+    faisca::DitCheckpoint dit_weights;
+    if (!dit_weights.open(checkpoint, error))
     {
         std::printf("%s\n", error.message);
-        return 1;
-    }
-    const faisca::CkptTensor* text_tensor = text.find("");
-    if (text_tensor == nullptr || text_tensor->dtype != faisca::CkptDtype::BF16 ||
-        text_tensor->n_elements != size_t(faisca::DIT_TEXT_TOKENS) * faisca::DIT_TEXT_IN)
-    {
-        std::printf("%s: expected one bf16 tensor of 512 x 100352\n", text_path);
         return 1;
     }
     faisca::DitConfig config;
@@ -281,7 +308,7 @@ int main(int argc, char** argv)
     faisca::DitCudaRunner dit;
     faisca::TaehvCudaDecoder decoder;
     if (!dit.init(device, dit_weights.weights(), config, error) ||
-        !dit.set_text(reinterpret_cast<const uint16_t*>(text_tensor->data), error) ||
+        !dit.set_text(embeddings, error) ||
         !decoder.init(device, tae, LH, LW, error))
     {
         std::printf("%s\n", error.message);
