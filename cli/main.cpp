@@ -9,6 +9,7 @@
 #endif
 #if defined(FAISCA_CUDA)
 #include "faisca/cuda_runner.h"
+#include "faisca/triposr_cuda.h"
 #endif
 #include "faisca/tokenizer.h"
 #include "faisca/audio.h"
@@ -50,6 +51,7 @@ void print_usage()
         "  faisca describe <model.gguf> <mmproj.gguf> <image> [-p <prompt>] [-n <tokens>] [-c <context>] [-t <threads>]\n"
         "                                [--f32] [--kv-f32]\n"
         "  faisca mesh <model.ckpt> <image> -o <mesh.obj> [--resolution <n>] [--threshold <d>] [--ratio <r>] [-t <threads>]\n"
+        "              [--cuda]\n"
         "  faisca version\n"
         "\n"
         "info options:\n"
@@ -77,7 +79,8 @@ void print_usage()
         "to its foreground as TripoSR's run.py does (--ratio, default 0.85), an image without alpha must\n"
         "already be a centred object on grey (no background removal); writes an OBJ with vertex colours\n"
         "from a --resolution^3 grid (default 256) at density --threshold (default 25); -t defaults to\n"
-        "every hardware thread.\n"
+        "every hardware thread. --cuda runs the network and the grid on an NVIDIA GPU (the marching\n"
+        "cubes stays on the CPU threads).\n"
         "\n"
         "transcribe runs a Whisper model (whisper.cpp ggml file) on a 16 kHz 16 bit WAV, greedy,\n"
         "without timestamps; --language is the two letter code (default en, pt for Portuguese);\n"
@@ -1394,11 +1397,16 @@ int command_mesh(int argc, char** argv)
     float threshold = 25.0f;
     float ratio = 0.85f;
     int threads = static_cast<int>(std::thread::hardware_concurrency());
+    bool cuda = false;
     for (int i = 2; i < argc; ++i)
     {
         if (std::strcmp(argv[i], "-o") == 0 && i + 1 < argc)
         {
             out = argv[++i];
+        }
+        else if (std::strcmp(argv[i], "--cuda") == 0)
+        {
+            cuda = true;
         }
         else if (std::strcmp(argv[i], "--resolution") == 0 && i + 1 < argc)
         {
@@ -1432,38 +1440,75 @@ int command_mesh(int argc, char** argv)
         return 2;
     }
 
+#if !defined(FAISCA_CUDA)
+    if (cuda)
+    {
+        std::fprintf(stderr, "faisca mesh: built without the CUDA backend\n");
+        return 1;
+    }
+#endif
+
     faisca::Error error;
     faisca::TripoModel model;
     faisca::ThreadPool pool;
     faisca::TripoRunner runner;
+#if defined(FAISCA_CUDA)
+    faisca::CudaDevice device;
+    faisca::TripoCudaRunner gpu;
+#endif
     faisca::Image image;
     faisca::Array<float> rgb;
     faisca::TripoMesh mesh;
     const auto t0 = std::chrono::steady_clock::now();
-    if (!model.open(positional[0], error) || !pool.start(threads, error) || !runner.init(model, pool, error))
+    bool ok = model.open(positional[0], error) && pool.start(threads, error);
+#if defined(FAISCA_CUDA)
+    ok = ok && (cuda ? device.init(error) && gpu.init(model, device, pool, error) : runner.init(model, pool, error));
+#else
+    ok = ok && runner.init(model, pool, error);
+#endif
+    if (!ok)
     {
         std::fprintf(stderr, "faisca mesh: %s\n", error.c_str());
         return 1;
     }
     const auto t1 = std::chrono::steady_clock::now();
-    if (!faisca::read_image(positional[1], image, error) || !faisca::tripo_prepare_image(image, ratio, rgb, error) ||
-        !runner.encode_image(rgb.data(), error) || !runner.build_triplane(error))
+    ok = faisca::read_image(positional[1], image, error) && faisca::tripo_prepare_image(image, ratio, rgb, error);
+#if defined(FAISCA_CUDA)
+    if (cuda)
+    {
+        ok = ok && gpu.encode_image(rgb.data(), error) && gpu.build_triplane(error) && gpu.synchronize(error);
+    }
+    else
+#endif
+    {
+        ok = ok && runner.encode_image(rgb.data(), error) && runner.build_triplane(error);
+    }
+    if (!ok)
     {
         std::fprintf(stderr, "faisca mesh: %s\n", error.c_str());
         return 1;
     }
     const auto t2 = std::chrono::steady_clock::now();
-    if (!runner.extract_mesh(static_cast<uint32_t>(resolution), threshold, mesh, error) ||
-        !faisca::tripo_write_obj(out, mesh, error))
+#if defined(FAISCA_CUDA)
+    if (cuda)
+    {
+        ok = gpu.extract_mesh(static_cast<uint32_t>(resolution), threshold, mesh, error);
+    }
+    else
+#endif
+    {
+        ok = runner.extract_mesh(static_cast<uint32_t>(resolution), threshold, mesh, error);
+    }
+    if (!ok || !faisca::tripo_write_obj(out, mesh, error))
     {
         std::fprintf(stderr, "faisca mesh: %s\n", error.c_str());
         return 1;
     }
     const auto t3 = std::chrono::steady_clock::now();
-    std::fprintf(stderr, "load %.2f s, image to triplane %.2f s, mesh %d^3 %.2f s, %zu vertices, %zu faces, %d threads -> %s\n",
+    std::fprintf(stderr, "load %.2f s, image to triplane %.2f s, mesh %d^3 %.2f s, %zu vertices, %zu faces, %s -> %s\n",
                  std::chrono::duration<double>(t1 - t0).count(), std::chrono::duration<double>(t2 - t1).count(), resolution,
                  std::chrono::duration<double>(t3 - t2).count(), mesh.positions.size() / 3, mesh.faces.size() / 3,
-                 threads, out);
+                 cuda ? "CUDA" : "CPU", out);
     return 0;
 }
 

@@ -570,7 +570,12 @@ top. No third party dependencies. Owner: Luís (akadjoker). "faisca" is a workin
    on their contiguous panels, 2.48 ms instead of 3 x 1.14, bit identical.
    Interleaved: image encoder 0.033 s (PyTorch 0.044), triplane 0.42-0.45 s
    (0.61), mesh 256^3 0.6 s (1.4-1.5); the laptop GPU clock moves runs by
-   about 5%. Next: --cuda in `faisca mesh`, then CPU cache tuning.
+   about 5%. `faisca mesh ... --cuda` (TripoCudaRunner, marching cubes on
+   the CPU pool): chair.png 256^3 load 3.4 s, image to triplane 0.49 s,
+   mesh 0.70 s, 84160 faces, render (ref/triposr/out/chair_cuda_compare.png)
+   same shape and colours as the reference; the CPU path takes 2.0 + 11.4 +
+   10.5 s. Next: the load time (packing plus 1.68 GB upload), then CPU
+   cache tuning.
 
 OmniDreams (NVIDIA video world model) is an exploration, not a plan step:
 read docs/omnidreams_handoff.md first, then docs/omnidreams.md.
