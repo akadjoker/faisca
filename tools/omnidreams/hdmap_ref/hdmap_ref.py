@@ -33,6 +33,8 @@ parser.add_argument("--height", type=int, default=704)
 parser.add_argument("--poses-npz", default=None)
 parser.add_argument("--start-us", type=int, default=None, help="first frame time, default the first photo")
 parser.add_argument("--fps", type=float, default=30.0)
+parser.add_argument("--batch", type=int, default=128, help="frames per ludus call (1797 at once fails)")
+parser.add_argument("--raw", default=None, help="write frames x height x width RGB8 to this file instead of PNGs")
 args = parser.parse_args()
 
 os.makedirs(args.out, exist_ok=True)
@@ -86,27 +88,41 @@ print(f"first image ts {first_timestamp}, rendering {count} frames from ts {time
 print(f"camera position first {camera_to_world[0, :3, 3].tolist()} last {camera_to_world[-1, :3, 3].tolist()}")
 
 started = time.time()
-images = ctx.render(
-    torch.full((count,), scene_id, dtype=torch.int32, device=device),
-    torch.full((count,), camera_id, dtype=torch.int32, device=device),
-    torch.tensor(timestamps, dtype=torch.int64, device=device),
-    torch.full((count,), CAMERA_TYPE_REGULAR, dtype=torch.int32, device=device),
-    torch.linalg.inv(camera_to_world),
-    resolution=(args.height, args.width),
-)
+inverse = torch.linalg.inv(camera_to_world)
+raw = open(args.raw, "wb") if args.raw else None
+first_frame = None
+for begin in range(0, count, args.batch):
+    end = min(count, begin + args.batch)
+    n = end - begin
+    images = ctx.render(
+        torch.full((n,), scene_id, dtype=torch.int32, device=device),
+        torch.full((n,), camera_id, dtype=torch.int32, device=device),
+        torch.tensor(timestamps[begin:end], dtype=torch.int64, device=device),
+        torch.full((n,), CAMERA_TYPE_REGULAR, dtype=torch.int32, device=device),
+        inverse[begin:end],
+        resolution=(args.height, args.width),
+    )
+    rgb = images[:, :, :, :3]
+    if ctx.needs_vflip:
+        rgb = rgb.flip(1)
+    if rgb.dtype != torch.uint8:
+        rgb = (rgb.clamp(0.0, 1.0) * 255.0 + 0.5).to(torch.uint8)
+    frames = rgb.cpu().numpy()
+    if first_frame is None:
+        first_frame = frames[0].copy()
+    if raw is not None:
+        raw.write(frames.tobytes())
+    else:
+        for index, frame in enumerate(frames):
+            Image.fromarray(frame).save(os.path.join(args.out, f"hdmap_{begin + index:04d}.png"))
 torch.cuda.synchronize()
-print(f"rendered {tuple(images.shape)} {images.dtype} in {time.time() - started:.3f} s")
-rgb = images[:, :, :, :3]
-if ctx.needs_vflip:
-    rgb = rgb.flip(1)
-if rgb.dtype != torch.uint8:
-    rgb = (rgb.clamp(0.0, 1.0) * 255.0 + 0.5).to(torch.uint8)
-frames = rgb.cpu().numpy()
-
-for index, frame in enumerate(frames):
-    Image.fromarray(frame).save(os.path.join(args.out, f"hdmap_{index:04d}.png"))
-np.savez_compressed(os.path.join(args.out, "hdmap_frames.npz"), frames=frames,
-                    timestamps=np.array(timestamps), poses=camera_to_world.cpu().numpy())
+print(f"rendered {count} frames in {time.time() - started:.3f} s")
+if raw is not None:
+    raw.close()
+    Image.fromarray(first_frame).save(os.path.join(args.out, "hdmap_0000.png"))
+np.savez_compressed(os.path.join(args.out, "hdmap_poses.npz"), timestamps=np.array(timestamps),
+                    poses=camera_to_world.cpu().numpy())
+frames = [first_frame]
 
 if first_image and args.start_us is None:
     with Image.open(first_image) as image:

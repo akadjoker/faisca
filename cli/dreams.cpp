@@ -182,12 +182,17 @@ int main(int argc, char** argv)
     const char* out_dir = option(argc, argv, "--out", nullptr);
     const int frames = std::atoi(option(argc, argv, "--frames", "21"));
     const uint64_t seed = std::strtoull(option(argc, argv, "--seed", "42"), nullptr, 10);
+    bool ppm = false;
+    for (int i = 1; i < argc; ++i)
+    {
+        ppm = ppm || std::strcmp(argv[i], "--ppm") == 0;
+    }
     if (checkpoint == nullptr || vae == nullptr || tae == nullptr || text_path == nullptr || image_path == nullptr ||
         hdmap_path == nullptr || out_dir == nullptr || frames < 5 || (frames - 5) % 8 != 0)
     {
         std::printf("usage: faisca_dreams --dit <omnidreams .pt> --vae <lightvaew2_1.pth> --tae <lighttaew2_1.pth>\n"
                     "         --text <text_embeddings.pt> --image <first frame 1280x704 png>\n"
-                    "         --hdmap <frames x 704 x 1280 RGB8 raw> --frames <5 + 8k> --out <dir> [--seed 42]\n");
+                    "         --hdmap <frames x 704 x 1280 RGB8 raw> --frames <5 + 8k> --out <dir> [--seed 42] [--ppm]\n");
         return 2;
     }
     const uint32_t chunks = 1 + static_cast<uint32_t>(frames - 5) / 8;
@@ -403,9 +408,12 @@ int main(int argc, char** argv)
         for (uint32_t f = 0; f < produced; ++f)
         {
             const float* planes = video.data() + f * frame_floats;
-            char name[64];
-            std::snprintf(name, sizeof(name), "/frame_%03d.ppm", written);
-            write_ppm(std::string(out_dir) + name, planes);
+            if (ppm)
+            {
+                char name[64];
+                std::snprintf(name, sizeof(name), "/frame_%04d.ppm", written);
+                write_ppm(std::string(out_dir) + name, planes);
+            }
             const size_t plane = size_t(HEIGHT) * WIDTH;
             for (size_t p = 0; p < plane; ++p)
             {
@@ -418,8 +426,9 @@ int main(int argc, char** argv)
             std::fwrite(bytes.data(), 1, bytes.size(), raw);
             ++written;
         }
-        std::printf("chunk %u: DiT 3 passes %.1f s, decode %.2f s, %u frames\n", k, dit_done - chunk_start,
-                    now() - dit_done, produced);
+        std::printf("chunk %u/%u: DiT 3 passes %.1f s, decode %.2f s, %u frames, %.0f s so far\n", k + 1, chunks,
+                    dit_done - chunk_start, now() - dit_done, produced, now() - start);
+        std::fflush(stdout);
     }
     std::fclose(raw);
     std::printf("%d frames in %s (video.rgb: ffmpeg -f rawvideo -pix_fmt rgb24 -s %ux%u -r 30 -i video.rgb "
