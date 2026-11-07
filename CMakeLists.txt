@@ -74,6 +74,8 @@ add_library(faisca_lib STATIC
     src/torch_ckpt.cpp
     src/triposr.cpp
     src/omnidreams.cpp
+    src/json.cpp
+    src/safetensors.cpp
 )
 find_package(Threads REQUIRED)
 target_link_libraries(faisca_lib PUBLIC Threads::Threads)
@@ -211,6 +213,10 @@ if(FAISCA_BUILD_TESTS)
         target_link_libraries(cuda_dit_block PRIVATE faisca_lib)
         target_compile_options(cuda_dit_block PRIVATE ${FAISCA_WARNINGS})
     endif()
+
+    add_executable(safetensors_dump tests/safetensors_dump.cpp)
+    target_link_libraries(safetensors_dump PRIVATE faisca_lib)
+    target_compile_options(safetensors_dump PRIVATE ${FAISCA_WARNINGS})
 
     add_executable(gguf_dump tests/gguf_dump.cpp)
     target_link_libraries(gguf_dump PRIVATE faisca_lib)
