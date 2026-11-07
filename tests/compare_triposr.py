@@ -22,6 +22,10 @@ STAGES = [
     ("vit_embed", lambda r: r[0], "vit_embed", (1025, 768)),
     ("vit_layer0", lambda r: r[0], "vit_layer0", (1025, 768)),
     ("vit_tokens", lambda r: r[0, 0].T, "vit_tokens", (1025, 768)),
+    ("bb_proj_in", lambda r: r[0], "bb_proj_in", (3072, 1024)),
+    ("bb_block0", lambda r: r[0], "bb_block0", (3072, 1024)),
+    ("bb_out", lambda r: r[0].T, "bb_out", (3072, 1024)),
+    ("scene_codes", lambda r: r[0], "scene_codes", (3, 40, 64, 64)),
 ]
 
 worst = 0.0

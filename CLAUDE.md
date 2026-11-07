@@ -448,10 +448,21 @@ top. No third party dependencies. Owner: Luís (akadjoker). "faisca" is a workin
    7.3e-7 after the embeddings, 8.4e-7 after layer 0, 1.9e-6 on the final
    tokens; bit identical with 22 and 5 threads. 2.4 s with 22 threads, 2.0 s
    with 5 (F32 Weight::matmul, one token at a time; not optimized yet).
-   Next: triplane transformer (Transformer1D: GroupNorm 32, proj_in, 16
-   BasicTransformerBlocks with self and cross attention and GEGLU,
-   proj_out), upsample, NeRF MLP density grid, marching cubes, then the
-   preprocessing (resize_foreground, antialiased bilinear to 512).
+   Done: triplane transformer and upsampler (`TripoRunner::build_triplane`):
+   plane embeddings as 3072 tokens, GroupNorm 32 (eps 1e-6), proj_in, 16
+   blocks (LayerNorm eps 1e-5, self attention 16 x 64 without q/k/v bias,
+   cross attention to the 1025 image tokens, GEGLU 2 x 4096 with the erf
+   GELU), proj_out plus the pre-norm input, ConvTranspose2d 2x2/2 to
+   3 x 40 x 64 x 64. On dumps/chair: rel L2 1.7e-7 after proj_in, 5.4e-7
+   after block 0, 1.5e-6 on the transformer output and the scene codes;
+   bit identical with 22 and 11 threads. Slow: 51 s with 22 threads (88 s
+   with 11) against 27 s for the whole PyTorch CPU reference, because the
+   F32 Weight::matmul goes one token at a time; a blocked F32 GEMM (or the
+   GPU) comes after the mesh is right.
+   Next: NeRF MLP density grid (grid_sample bilinear, align_corners False,
+   on the three planes xy, xz, yz, concat to 120, 9 x 64 SiLU, density
+   exp(x - 1)), marching cubes against torchmcubes, then the preprocessing
+   (resize_foreground, antialiased bilinear to 512).
 
 OmniDreams (NVIDIA video world model) is an exploration, not a plan step:
 read docs/omnidreams_handoff.md first, then docs/omnidreams.md.

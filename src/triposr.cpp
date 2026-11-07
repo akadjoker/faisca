@@ -39,12 +39,9 @@ void parallel_for(ThreadPool& pool, size_t count, size_t group, const F& body)
         &job);
 }
 
-void gelu_erf(float* x, size_t n)
+float gelu_erf(float x)
 {
-    for (size_t i = 0; i < n; ++i)
-    {
-        x[i] = x[i] * 0.5f * (1.0f + std::erf(x[i] * 0.70710678118654752440f));
-    }
+    return x * 0.5f * (1.0f + std::erf(x * 0.70710678118654752440f));
 }
 
 }
@@ -158,6 +155,74 @@ bool TripoModel::open(const char* path, Error& error)
             return false;
         }
     }
+
+    m_planes = f32("tokenizer.embeddings", 3, DIM, PLANE_SIZE, PLANE_SIZE, error);
+    m_group_w = f32("backbone.norm.weight", DIM, 0, 0, 0, error);
+    m_group_b = f32("backbone.norm.bias", DIM, 0, 0, 0, error);
+    if (!m_planes || !m_group_w || !m_group_b || !linear("backbone.proj_in", DIM, DIM, m_proj_in, &m_proj_in_b, error) ||
+        !linear("backbone.proj_out", DIM, DIM, m_proj_out, &m_proj_out_b, error))
+    {
+        return false;
+    }
+    for (uint32_t ib = 0; ib < BLOCKS; ++ib)
+    {
+        TripoBlock& b = m_blocks[ib];
+        char base[96];
+        std::snprintf(base, sizeof(base), "backbone.transformer_blocks.%u", ib);
+        auto vec = [&](const char* suffix) -> const float*
+        {
+            std::snprintf(key, sizeof(key), "%s.%s", base, suffix);
+            return f32(key, DIM, 0, 0, 0, error);
+        };
+        auto lin = [&](const char* suffix, uint64_t n_out, uint64_t n_in, Weight& w, const float** bias)
+        {
+            std::snprintf(key, sizeof(key), "%s.%s", base, suffix);
+            return linear(key, n_out, n_in, w, bias, error);
+        };
+        b.ln1_w = vec("norm1.weight");
+        b.ln1_b = vec("norm1.bias");
+        b.ln2_w = vec("norm2.weight");
+        b.ln2_b = vec("norm2.bias");
+        b.ln3_w = vec("norm3.weight");
+        b.ln3_b = vec("norm3.bias");
+        if (!b.ln1_w || !b.ln1_b || !b.ln2_w || !b.ln2_b || !b.ln3_w || !b.ln3_b ||
+            !lin("attn1.to_q", DIM, DIM, b.self_q, nullptr) || !lin("attn1.to_k", DIM, DIM, b.self_k, nullptr) ||
+            !lin("attn1.to_v", DIM, DIM, b.self_v, nullptr) ||
+            !lin("attn1.to_out.0", DIM, DIM, b.self_out, &b.self_out_b) ||
+            !lin("attn2.to_q", DIM, DIM, b.cross_q, nullptr) ||
+            !lin("attn2.to_k", DIM, VIT_DIM, b.cross_k, nullptr) ||
+            !lin("attn2.to_v", DIM, VIT_DIM, b.cross_v, nullptr) ||
+            !lin("attn2.to_out.0", DIM, DIM, b.cross_out, &b.cross_out_b) ||
+            !lin("ff.net.0.proj", 2 * FF, DIM, b.ff_in, &b.ff_in_b) ||
+            !lin("ff.net.2", DIM, FF, b.ff_out, &b.ff_out_b))
+        {
+            return false;
+        }
+    }
+
+    const float* up = f32("post_processor.upsample.weight", DIM, CODE_CHANNELS, 2, 2, error);
+    m_upsample_b = f32("post_processor.upsample.bias", CODE_CHANNELS, 0, 0, 0, error);
+    if (!up || !m_upsample_b)
+    {
+        return false;
+    }
+    const size_t rows = CODE_CHANNELS * 4;
+    if (!m_upsample_rows.resize_uninitialized(rows * DIM))
+    {
+        error.set("out of memory for the TripoSR upsampler");
+        return false;
+    }
+    for (size_t ci = 0; ci < DIM; ++ci)
+    {
+        for (size_t r = 0; r < rows; ++r)
+        {
+            m_upsample_rows[r * DIM + ci] = up[ci * rows + r];
+        }
+    }
+    m_upsample.type = GgmlType::F32;
+    m_upsample.data = reinterpret_cast<const uint8_t*>(m_upsample_rows.data());
+    m_upsample.n_in = DIM;
+    m_upsample.n_out = rows;
     return true;
 }
 
@@ -228,26 +293,35 @@ bool TripoRunner::init(const TripoModel& model, ThreadPool& pool, Error& error)
     m_model = &model;
     m_pool = &pool;
     const size_t side = TripoModel::IMAGE_SIZE / TripoModel::VIT_PATCH;
-    const size_t dim = TripoModel::VIT_DIM;
-    m_n_tokens = side * side + 1;
-    const size_t n = m_n_tokens;
+    const size_t vit_dim = TripoModel::VIT_DIM;
+    m_n_image = side * side + 1;
+    const size_t n_plane = TripoModel::PLANE_TOKENS;
     const size_t taps = 3 * TripoModel::VIT_PATCH * TripoModel::VIT_PATCH;
     const size_t threads = static_cast<size_t>(pool.size());
-    const bool ok = m_pos.resize_uninitialized(n * dim) && m_patches.resize_uninitialized((n - 1) * taps) &&
-                    m_x.resize_uninitialized(n * dim) && m_h.resize_uninitialized(n * dim) &&
-                    m_q.resize_uninitialized(n * dim) && m_k.resize_uninitialized(n * dim) &&
-                    m_v.resize_uninitialized(n * dim) && m_attn.resize_uninitialized(n * dim) &&
-                    m_up.resize_uninitialized(n * TripoModel::VIT_FF) && m_scores.resize_uninitialized(threads * n);
+    const size_t rows = n_plane > m_n_image ? n_plane : m_n_image;
+    const size_t wide = rows * TripoModel::DIM;
+    const size_t ff = n_plane * 2 * TripoModel::FF > m_n_image * TripoModel::VIT_FF ? n_plane * 2 * TripoModel::FF
+                                                                                     : m_n_image * TripoModel::VIT_FF;
+    const size_t code = 3 * TripoModel::CODE_CHANNELS * TripoModel::CODE_SIZE * TripoModel::CODE_SIZE;
+    const bool ok = m_pos.resize_uninitialized(m_n_image * vit_dim) &&
+                    m_patches.resize_uninitialized((m_n_image - 1) * taps) &&
+                    m_image.resize_uninitialized(m_n_image * vit_dim) && m_residual.resize_uninitialized(wide) &&
+                    m_x.resize_uninitialized(wide) && m_h.resize_uninitialized(wide) &&
+                    m_q.resize_uninitialized(wide) && m_k.resize_uninitialized(wide) &&
+                    m_v.resize_uninitialized(wide) && m_attn.resize_uninitialized(wide) &&
+                    m_up.resize_uninitialized(ff) && m_scores.resize_uninitialized(threads * rows) &&
+                    m_code.resize_uninitialized(code);
     if (!ok)
     {
         error.set("out of memory for the TripoSR buffers");
         return false;
     }
     // ViTEmbeddings.interpolate_pos_encoding of transformers 4.35.0: scale_factor (side + 0.1) / 14
-    std::memcpy(m_pos.data(), model.vit_pos(), dim * sizeof(float));
-    const double scale = (static_cast<double>(side) + 0.1) / std::sqrt(double(TripoModel::VIT_POS_SIDE * TripoModel::VIT_POS_SIDE));
-    tripo_bicubic_rows(model.vit_pos() + dim, TripoModel::VIT_POS_SIDE, TripoModel::VIT_DIM, scale,
-                       static_cast<uint32_t>(side), m_pos.data() + dim);
+    std::memcpy(m_pos.data(), model.vit_pos(), vit_dim * sizeof(float));
+    const double scale =
+        (static_cast<double>(side) + 0.1) / std::sqrt(double(TripoModel::VIT_POS_SIDE * TripoModel::VIT_POS_SIDE));
+    tripo_bicubic_rows(model.vit_pos() + vit_dim, TripoModel::VIT_POS_SIDE, TripoModel::VIT_DIM, scale,
+                       static_cast<uint32_t>(side), m_pos.data() + vit_dim);
     return true;
 }
 
@@ -259,12 +333,14 @@ void TripoRunner::trace(const char* name, int layer, const float* data, size_t c
     }
 }
 
-void TripoRunner::matmul(const Weight& w, const float* bias, const float* x, size_t n_tokens, float* out)
+void TripoRunner::matmul(const Weight& w, const float* bias, const float* x, size_t n_tokens, float* out,
+                         size_t x_stride)
 {
+    const size_t stride = x_stride != 0 ? x_stride : w.n_in;
     parallel_for(*m_pool, w.n_out, w.row_group(),
                  [&](size_t first, size_t last, int)
                  {
-                     w.matmul(x, w.n_in, nullptr, 0, nullptr, 0, n_tokens, first, last, out, w.n_out);
+                     w.matmul(x, stride, nullptr, 0, nullptr, 0, n_tokens, first, last, out, w.n_out);
                      if (bias != nullptr)
                      {
                          for (size_t t = 0; t < n_tokens; ++t)
@@ -292,38 +368,37 @@ void TripoRunner::norm_rows(const float* x, const float* w, const float* b, floa
                  });
 }
 
-void TripoRunner::vit_attention(const TripoVitLayer&)
+void TripoRunner::attention(const float* q, const float* k, const float* v, size_t n_q, size_t n_kv, size_t heads,
+                            size_t head_dim, float* out)
 {
-    const size_t n = m_n_tokens;
-    const size_t dim = TripoModel::VIT_DIM;
-    const size_t head_dim = dim / TripoModel::VIT_HEADS;
+    const size_t stride = heads * head_dim;
     const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
-    parallel_for(*m_pool, TripoModel::VIT_HEADS * n, 1,
+    parallel_for(*m_pool, heads * n_q, 1,
                  [&](size_t first, size_t last, int thread)
                  {
-                     float* scores = m_scores.data() + size_t(thread) * n;
+                     float* scores = m_scores.data() + size_t(thread) * (m_scores.size() / size_t(m_pool->size()));
                      for (size_t u = first; u < last; ++u)
                      {
-                         const size_t head = u / n;
-                         const size_t query = u % n;
-                         const float* q = m_q.data() + query * dim + head * head_dim;
-                         for (size_t j = 0; j < n; ++j)
+                         const size_t head = u / n_q;
+                         const size_t query = u % n_q;
+                         const float* qh = q + query * stride + head * head_dim;
+                         for (size_t j = 0; j < n_kv; ++j)
                          {
-                             scores[j] = dot(q, m_k.data() + j * dim + head * head_dim, head_dim) * scale;
+                             scores[j] = dot(qh, k + j * stride + head * head_dim, head_dim) * scale;
                          }
-                         softmax(scores, n);
-                         float* o = m_attn.data() + query * dim + head * head_dim;
+                         softmax(scores, n_kv);
+                         float* o = out + query * stride + head * head_dim;
                          for (size_t d = 0; d < head_dim; ++d)
                          {
                              o[d] = 0.0f;
                          }
-                         for (size_t j = 0; j < n; ++j)
+                         for (size_t j = 0; j < n_kv; ++j)
                          {
                              const float p = scores[j];
-                             const float* v = m_v.data() + j * dim + head * head_dim;
+                             const float* vh = v + j * stride + head * head_dim;
                              for (size_t d = 0; d < head_dim; ++d)
                              {
-                                 o[d] += p * v[d];
+                                 o[d] += p * vh[d];
                              }
                          }
                      }
@@ -341,7 +416,7 @@ bool TripoRunner::encode_image(const float* rgb, Error& error)
     const size_t size = TripoModel::IMAGE_SIZE;
     const size_t patch = TripoModel::VIT_PATCH;
     const size_t side = size / patch;
-    const size_t n = m_n_tokens;
+    const size_t n = m_n_image;
     const size_t dim = TripoModel::VIT_DIM;
     const size_t taps = 3 * patch * patch;
     const float mean[3] = {0.485f, 0.456f, 0.406f};
@@ -368,32 +443,179 @@ bool TripoRunner::encode_image(const float* rgb, Error& error)
                          }
                      }
                  });
-    matmul(m.vit_patch(), m.vit_patch_b(), m_patches.data(), side * side, m_x.data() + dim);
-    std::memcpy(m_x.data(), m.vit_cls(), dim * sizeof(float));
-    add(m_x.data(), m_pos.data(), n * dim);
-    trace("vit_embed", -1, m_x.data(), n * dim);
+    float* x = m_image.data();
+    matmul(m.vit_patch(), m.vit_patch_b(), m_patches.data(), side * side, x + dim);
+    std::memcpy(x, m.vit_cls(), dim * sizeof(float));
+    add(x, m_pos.data(), n * dim);
+    trace("vit_embed", -1, x, n * dim);
 
     for (uint32_t il = 0; il < TripoModel::VIT_LAYERS; ++il)
     {
         const TripoVitLayer& l = m.vit_layer(il);
-        norm_rows(m_x.data(), l.ln1_w, l.ln1_b, TripoModel::VIT_EPS, n, dim, m_h.data());
+        norm_rows(x, l.ln1_w, l.ln1_b, TripoModel::VIT_EPS, n, dim, m_h.data());
         matmul(l.q, l.q_b, m_h.data(), n, m_q.data());
         matmul(l.k, l.k_b, m_h.data(), n, m_k.data());
         matmul(l.v, l.v_b, m_h.data(), n, m_v.data());
-        vit_attention(l);
+        attention(m_q.data(), m_k.data(), m_v.data(), n, n, TripoModel::VIT_HEADS, dim / TripoModel::VIT_HEADS,
+                  m_attn.data());
         matmul(l.out, l.out_b, m_attn.data(), n, m_h.data());
-        add(m_x.data(), m_h.data(), n * dim);
-        norm_rows(m_x.data(), l.ln2_w, l.ln2_b, TripoModel::VIT_EPS, n, dim, m_h.data());
+        add(x, m_h.data(), n * dim);
+        norm_rows(x, l.ln2_w, l.ln2_b, TripoModel::VIT_EPS, n, dim, m_h.data());
         matmul(l.up, l.up_b, m_h.data(), n, m_up.data());
+        parallel_for(*m_pool, n * TripoModel::VIT_FF, 4096,
+                     [&](size_t first, size_t last, int)
+                     {
+                         for (size_t i = first; i < last; ++i)
+                         {
+                             m_up[i] = gelu_erf(m_up[i]);
+                         }
+                     });
+        matmul(l.down, l.down_b, m_up.data(), n, m_h.data());
+        add(x, m_h.data(), n * dim);
+        trace("vit_layer", static_cast<int>(il), x, n * dim);
+    }
+    norm_rows(x, m.vit_norm_w(), m.vit_norm_b(), TripoModel::VIT_EPS, n, dim, x);
+    trace("vit_tokens", -1, x, n * dim);
+    return true;
+}
+
+bool TripoRunner::build_triplane(Error& error)
+{
+    if (m_model == nullptr)
+    {
+        error.set("TripoRunner used before init");
+        return false;
+    }
+    const TripoModel& m = *m_model;
+    const size_t n = TripoModel::PLANE_TOKENS;
+    const size_t dim = TripoModel::DIM;
+    const size_t plane = TripoModel::PLANE_SIZE * TripoModel::PLANE_SIZE;
+    const size_t heads = TripoModel::HEADS;
+    const size_t head_dim = dim / heads;
+    const size_t ff = TripoModel::FF;
+
+    // Triplane1DTokenizer: token (np, hp, wp) of channel c is embeddings[np][c][hp][wp]
+    const float* planes = m.plane_embeddings();
+    float* residual = m_residual.data();
+    for (size_t t = 0; t < n; ++t)
+    {
+        const size_t np = t / plane;
+        const size_t pixel = t % plane;
+        for (size_t c = 0; c < dim; ++c)
+        {
+            residual[t * dim + c] = planes[(np * dim + c) * plane + pixel];
+        }
+    }
+    // GroupNorm over (channels of the group, all tokens), then proj_in on the token rows
+    const size_t group = dim / TripoModel::GROUPS;
+    parallel_for(*m_pool, TripoModel::GROUPS, 1,
+                 [&](size_t first, size_t last, int)
+                 {
+                     for (size_t g = first; g < last; ++g)
+                     {
+                         double sum = 0.0;
+                         for (size_t t = 0; t < n; ++t)
+                         {
+                             for (size_t c = g * group; c < (g + 1) * group; ++c)
+                             {
+                                 sum += residual[t * dim + c];
+                             }
+                         }
+                         const double mean = sum / double(n * group);
+                         double squares = 0.0;
+                         for (size_t t = 0; t < n; ++t)
+                         {
+                             for (size_t c = g * group; c < (g + 1) * group; ++c)
+                             {
+                                 const double d = residual[t * dim + c] - mean;
+                                 squares += d * d;
+                             }
+                         }
+                         const float rstd =
+                             static_cast<float>(1.0 / std::sqrt(squares / double(n * group) + TripoModel::GROUP_EPS));
+                         const float mean_f = static_cast<float>(mean);
+                         for (size_t t = 0; t < n; ++t)
+                         {
+                             for (size_t c = g * group; c < (g + 1) * group; ++c)
+                             {
+                                 m_h[t * dim + c] =
+                                     (residual[t * dim + c] - mean_f) * rstd * m.group_norm_w()[c] + m.group_norm_b()[c];
+                             }
+                         }
+                     }
+                 });
+    float* x = m_x.data();
+    matmul(m.proj_in(), m.proj_in_b(), m_h.data(), n, x);
+    trace("bb_proj_in", -1, x, n * dim);
+
+    const size_t n_image = m_n_image;
+    for (uint32_t ib = 0; ib < TripoModel::BLOCKS; ++ib)
+    {
+        const TripoBlock& b = m.block(ib);
+        norm_rows(x, b.ln1_w, b.ln1_b, TripoModel::LN_EPS, n, dim, m_h.data());
+        matmul(b.self_q, nullptr, m_h.data(), n, m_q.data());
+        matmul(b.self_k, nullptr, m_h.data(), n, m_k.data());
+        matmul(b.self_v, nullptr, m_h.data(), n, m_v.data());
+        attention(m_q.data(), m_k.data(), m_v.data(), n, n, heads, head_dim, m_attn.data());
+        matmul(b.self_out, b.self_out_b, m_attn.data(), n, m_h.data());
+        add(x, m_h.data(), n * dim);
+
+        norm_rows(x, b.ln2_w, b.ln2_b, TripoModel::LN_EPS, n, dim, m_h.data());
+        matmul(b.cross_q, nullptr, m_h.data(), n, m_q.data());
+        matmul(b.cross_k, nullptr, m_image.data(), n_image, m_k.data());
+        matmul(b.cross_v, nullptr, m_image.data(), n_image, m_v.data());
+        attention(m_q.data(), m_k.data(), m_v.data(), n, n_image, heads, head_dim, m_attn.data());
+        matmul(b.cross_out, b.cross_out_b, m_attn.data(), n, m_h.data());
+        add(x, m_h.data(), n * dim);
+
+        // GEGLU: the first half of the projection times the erf GELU of the second, in place
+        // in the first half of each row
+        norm_rows(x, b.ln3_w, b.ln3_b, TripoModel::LN_EPS, n, dim, m_h.data());
+        matmul(b.ff_in, b.ff_in_b, m_h.data(), n, m_up.data());
         parallel_for(*m_pool, n, 1,
                      [&](size_t first, size_t last, int)
-                     { gelu_erf(m_up.data() + first * TripoModel::VIT_FF, (last - first) * TripoModel::VIT_FF); });
-        matmul(l.down, l.down_b, m_up.data(), n, m_h.data());
-        add(m_x.data(), m_h.data(), n * dim);
-        trace("vit_layer", static_cast<int>(il), m_x.data(), n * dim);
+                     {
+                         for (size_t t = first; t < last; ++t)
+                         {
+                             float* row = m_up.data() + t * 2 * ff;
+                             for (size_t i = 0; i < ff; ++i)
+                             {
+                                 row[i] = row[i] * gelu_erf(row[ff + i]);
+                             }
+                         }
+                     });
+        matmul(b.ff_out, b.ff_out_b, m_up.data(), n, m_h.data(), 2 * ff);
+        add(x, m_h.data(), n * dim);
+        trace("bb_block", static_cast<int>(ib), x, n * dim);
     }
-    norm_rows(m_x.data(), m.vit_norm_w(), m.vit_norm_b(), TripoModel::VIT_EPS, n, dim, m_x.data());
-    trace("vit_tokens", -1, m_x.data(), n * dim);
+    matmul(m.proj_out(), m.proj_out_b(), x, n, m_h.data());
+    add(m_h.data(), residual, n * dim);
+    trace("bb_out", -1, m_h.data(), n * dim);
+
+    // ConvTranspose2d(DIM, CODE_CHANNELS, 2, stride 2) per plane
+    const Weight& up = m.upsample();
+    matmul(up, nullptr, m_h.data(), n, m_attn.data());
+    const size_t code_side = TripoModel::CODE_SIZE;
+    const size_t channels = TripoModel::CODE_CHANNELS;
+    for (size_t t = 0; t < n; ++t)
+    {
+        const size_t np = t / plane;
+        const size_t hp = (t % plane) / TripoModel::PLANE_SIZE;
+        const size_t wp = t % TripoModel::PLANE_SIZE;
+        const float* row = m_attn.data() + t * up.n_out;
+        for (size_t co = 0; co < channels; ++co)
+        {
+            for (size_t ky = 0; ky < 2; ++ky)
+            {
+                for (size_t kx = 0; kx < 2; ++kx)
+                {
+                    m_code[((np * channels + co) * code_side + 2 * hp + ky) * code_side + 2 * wp + kx] =
+                        row[(co * 2 + ky) * 2 + kx] + m.upsample_b()[co];
+                }
+            }
+        }
+    }
+    trace("scene_codes", -1, m_code.data(), m_code.size());
     return true;
 }
 

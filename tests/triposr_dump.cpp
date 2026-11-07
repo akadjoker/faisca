@@ -83,5 +83,12 @@ int main(int argc, char** argv)
         return 1;
     }
     std::fprintf(stderr, "image encoder %.3f s with %d threads (traces included)\n", seconds_since(start), threads);
+    start = std::chrono::steady_clock::now();
+    if (!runner.build_triplane(error))
+    {
+        std::fprintf(stderr, "error: %s\n", error.c_str());
+        return 1;
+    }
+    std::fprintf(stderr, "triplane %.3f s (traces included)\n", seconds_since(start));
     return 0;
 }

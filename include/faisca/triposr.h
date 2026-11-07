@@ -33,6 +33,30 @@ struct TripoVitLayer
     const float* down_b;
 };
 
+struct TripoBlock
+{
+    const float* ln1_w;
+    const float* ln1_b;
+    Weight self_q;
+    Weight self_k;
+    Weight self_v;
+    Weight self_out;
+    const float* self_out_b;
+    const float* ln2_w;
+    const float* ln2_b;
+    Weight cross_q;
+    Weight cross_k;
+    Weight cross_v;
+    Weight cross_out;
+    const float* cross_out_b;
+    const float* ln3_w;
+    const float* ln3_b;
+    Weight ff_in;
+    const float* ff_in_b;
+    Weight ff_out;
+    const float* ff_out_b;
+};
+
 // stabilityai/TripoSR model.ckpt: DINO ViT-B/16 image encoder, triplane transformer,
 // upsampler and NeRF MLP (config.yaml of that release)
 class TripoModel
@@ -46,6 +70,19 @@ public:
     static constexpr uint32_t VIT_POS_SIDE = 14;
     static constexpr float VIT_EPS = 1e-12f;
     static constexpr uint32_t IMAGE_SIZE = 512;
+
+    static constexpr uint32_t PLANE_SIZE = 32;
+    static constexpr uint32_t PLANE_TOKENS = 3 * PLANE_SIZE * PLANE_SIZE;
+    static constexpr uint32_t DIM = 1024;
+    static constexpr uint32_t HEADS = 16;
+    static constexpr uint32_t BLOCKS = 16;
+    static constexpr uint32_t FF = 4096;
+    static constexpr uint32_t GROUPS = 32;
+    static constexpr float GROUP_EPS = 1e-6f;
+    static constexpr float LN_EPS = 1e-5f;
+
+    static constexpr uint32_t CODE_CHANNELS = 40;
+    static constexpr uint32_t CODE_SIZE = 2 * PLANE_SIZE;
 
     TripoModel() = default;
 
@@ -89,6 +126,58 @@ public:
         return m_vit_norm_b;
     }
 
+    // [3][DIM][PLANE_SIZE][PLANE_SIZE]
+    const float* plane_embeddings() const
+    {
+        return m_planes;
+    }
+
+    const float* group_norm_w() const
+    {
+        return m_group_w;
+    }
+
+    const float* group_norm_b() const
+    {
+        return m_group_b;
+    }
+
+    const Weight& proj_in() const
+    {
+        return m_proj_in;
+    }
+
+    const float* proj_in_b() const
+    {
+        return m_proj_in_b;
+    }
+
+    const TripoBlock& block(uint32_t index) const
+    {
+        return m_blocks[index];
+    }
+
+    const Weight& proj_out() const
+    {
+        return m_proj_out;
+    }
+
+    const float* proj_out_b() const
+    {
+        return m_proj_out_b;
+    }
+
+    // the transposed convolution as CODE_CHANNELS * 4 rows of DIM: row (co * 2 + ky) * 2 + kx
+    const Weight& upsample() const
+    {
+        return m_upsample;
+    }
+
+    const float* upsample_b() const
+    {
+        return m_upsample_b;
+    }
+
 private:
     const float* f32(const char* name, uint64_t d0, uint64_t d1, uint64_t d2, uint64_t d3, Error& error);
     bool linear(const char* name, uint64_t n_out, uint64_t n_in, Weight& w, const float** bias, Error& error);
@@ -101,6 +190,18 @@ private:
     const float* m_vit_patch_b = nullptr;
     const float* m_vit_norm_w = nullptr;
     const float* m_vit_norm_b = nullptr;
+
+    const float* m_planes = nullptr;
+    const float* m_group_w = nullptr;
+    const float* m_group_b = nullptr;
+    Weight m_proj_in;
+    const float* m_proj_in_b = nullptr;
+    TripoBlock m_blocks[BLOCKS] = {};
+    Weight m_proj_out;
+    const float* m_proj_out_b = nullptr;
+    Array<float> m_upsample_rows;
+    Weight m_upsample;
+    const float* m_upsample_b = nullptr;
 };
 
 // pos is side x side rows of dim values; out gets out_side x out_side rows, resampled as
@@ -131,28 +232,41 @@ public:
     // image_token_count() rows of VIT_DIM values: the CLS token, then the patches
     const float* image_tokens() const
     {
-        return m_x.data();
+        return m_image.data();
     }
 
     size_t image_token_count() const
     {
-        return m_n_tokens;
+        return m_n_image;
+    }
+
+    // the triplane transformer and upsampler over image_tokens(); fills scene_code()
+    bool build_triplane(Error& error);
+
+    // [3][CODE_CHANNELS][CODE_SIZE][CODE_SIZE], TripoSR's scene_codes[0]
+    const float* scene_code() const
+    {
+        return m_code.data();
     }
 
 private:
     void trace(const char* name, int layer, const float* data, size_t count) const;
-    void matmul(const Weight& w, const float* bias, const float* x, size_t n_tokens, float* out);
+    // x_stride 0 means w.n_in
+    void matmul(const Weight& w, const float* bias, const float* x, size_t n_tokens, float* out, size_t x_stride = 0);
     void norm_rows(const float* x, const float* w, const float* b, float eps, size_t rows, size_t width, float* out);
-    void vit_attention(const TripoVitLayer& layer);
+    void attention(const float* q, const float* k, const float* v, size_t n_q, size_t n_kv, size_t heads,
+                   size_t head_dim, float* out);
 
     const TripoModel* m_model = nullptr;
     ThreadPool* m_pool = nullptr;
     RunnerTrace m_trace = nullptr;
     void* m_trace_user = nullptr;
-    size_t m_n_tokens = 0;
+    size_t m_n_image = 0;
 
     Array<float> m_pos;
     Array<float> m_patches;
+    Array<float> m_image;
+    Array<float> m_residual;
     Array<float> m_x;
     Array<float> m_h;
     Array<float> m_q;
@@ -161,6 +275,7 @@ private:
     Array<float> m_attn;
     Array<float> m_up;
     Array<float> m_scores;
+    Array<float> m_code;
 };
 
 }
