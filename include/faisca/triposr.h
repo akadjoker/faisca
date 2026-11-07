@@ -2,7 +2,6 @@
 
 #include "faisca/array.h"
 #include "faisca/error.h"
-#include "faisca/model.h"
 #include "faisca/runner.h"
 #include "faisca/thread.h"
 #include "faisca/torch_ckpt.h"
@@ -13,23 +12,31 @@
 namespace faisca
 {
 
+// a float32 linear layer packed for gemm_f32_packed
+struct TripoLinear
+{
+    const float* panels;
+    size_t n_in;
+    size_t n_out;
+};
+
 struct TripoVitLayer
 {
     const float* ln1_w;
     const float* ln1_b;
-    Weight q;
+    TripoLinear q;
     const float* q_b;
-    Weight k;
+    TripoLinear k;
     const float* k_b;
-    Weight v;
+    TripoLinear v;
     const float* v_b;
-    Weight out;
+    TripoLinear out;
     const float* out_b;
     const float* ln2_w;
     const float* ln2_b;
-    Weight up;
+    TripoLinear up;
     const float* up_b;
-    Weight down;
+    TripoLinear down;
     const float* down_b;
 };
 
@@ -37,23 +44,23 @@ struct TripoBlock
 {
     const float* ln1_w;
     const float* ln1_b;
-    Weight self_q;
-    Weight self_k;
-    Weight self_v;
-    Weight self_out;
+    TripoLinear self_q;
+    TripoLinear self_k;
+    TripoLinear self_v;
+    TripoLinear self_out;
     const float* self_out_b;
     const float* ln2_w;
     const float* ln2_b;
-    Weight cross_q;
-    Weight cross_k;
-    Weight cross_v;
-    Weight cross_out;
+    TripoLinear cross_q;
+    TripoLinear cross_k;
+    TripoLinear cross_v;
+    TripoLinear cross_out;
     const float* cross_out_b;
     const float* ln3_w;
     const float* ln3_b;
-    Weight ff_in;
+    TripoLinear ff_in;
     const float* ff_in_b;
-    Weight ff_out;
+    TripoLinear ff_out;
     const float* ff_out_b;
 };
 
@@ -106,7 +113,7 @@ public:
         return m_vit_pos;
     }
 
-    const Weight& vit_patch() const
+    const TripoLinear& vit_patch() const
     {
         return m_vit_patch;
     }
@@ -142,7 +149,7 @@ public:
         return m_group_b;
     }
 
-    const Weight& proj_in() const
+    const TripoLinear& proj_in() const
     {
         return m_proj_in;
     }
@@ -157,7 +164,7 @@ public:
         return m_blocks[index];
     }
 
-    const Weight& proj_out() const
+    const TripoLinear& proj_out() const
     {
         return m_proj_out;
     }
@@ -168,7 +175,7 @@ public:
     }
 
     // the transposed convolution as CODE_CHANNELS * 4 rows of DIM: row (co * 2 + ky) * 2 + kx
-    const Weight& upsample() const
+    const TripoLinear& upsample() const
     {
         return m_upsample;
     }
@@ -180,13 +187,25 @@ public:
 
 private:
     const float* f32(const char* name, uint64_t d0, uint64_t d1, uint64_t d2, uint64_t d3, Error& error);
-    bool linear(const char* name, uint64_t n_out, uint64_t n_in, Weight& w, const float** bias, Error& error);
+    bool linear(const char* name, uint64_t n_out, uint64_t n_in, TripoLinear& w, const float** bias, Error& error);
+    void add_linear(const float* rows, size_t n_out, size_t n_in, TripoLinear& w);
+    bool pack_linears(Error& error);
+
+    static constexpr size_t MAX_LINEARS = 256;
+    struct Pending
+    {
+        TripoLinear* linear;
+        const float* rows;
+    };
+    Pending m_pending[MAX_LINEARS] = {};
+    size_t m_n_pending = 0;
+    Array<float> m_panels;
 
     CkptFile m_file;
     TripoVitLayer m_vit_layers[VIT_LAYERS] = {};
     const float* m_vit_cls = nullptr;
     const float* m_vit_pos = nullptr;
-    Weight m_vit_patch;
+    TripoLinear m_vit_patch;
     const float* m_vit_patch_b = nullptr;
     const float* m_vit_norm_w = nullptr;
     const float* m_vit_norm_b = nullptr;
@@ -194,13 +213,13 @@ private:
     const float* m_planes = nullptr;
     const float* m_group_w = nullptr;
     const float* m_group_b = nullptr;
-    Weight m_proj_in;
+    TripoLinear m_proj_in;
     const float* m_proj_in_b = nullptr;
     TripoBlock m_blocks[BLOCKS] = {};
-    Weight m_proj_out;
+    TripoLinear m_proj_out;
     const float* m_proj_out_b = nullptr;
     Array<float> m_upsample_rows;
-    Weight m_upsample;
+    TripoLinear m_upsample;
     const float* m_upsample_b = nullptr;
 };
 
@@ -250,9 +269,11 @@ public:
     }
 
 private:
+    static constexpr size_t ATTENTION_QUERIES = 48;
+
     void trace(const char* name, int layer, const float* data, size_t count) const;
     // x_stride 0 means w.n_in
-    void matmul(const Weight& w, const float* bias, const float* x, size_t n_tokens, float* out, size_t x_stride = 0);
+    void matmul(const TripoLinear& w, const float* bias, const float* x, size_t n_tokens, float* out, size_t x_stride = 0);
     void norm_rows(const float* x, const float* w, const float* b, float eps, size_t rows, size_t width, float* out);
     void attention(const float* q, const float* k, const float* v, size_t n_q, size_t n_kv, size_t heads,
                    size_t head_dim, float* out);
@@ -275,6 +296,9 @@ private:
     Array<float> m_attn;
     Array<float> m_up;
     Array<float> m_scores;
+    Array<float> m_k_tiles;
+    Array<float> m_v_heads;
+    Array<float> m_gemm_scratch;
     Array<float> m_code;
 };
 

@@ -701,6 +701,54 @@ void test_dot_and_matvec()
     CHECK(r[0] == 3.0f && r[1] == -4.0f);
 }
 
+void test_gemm_f32_packed()
+{
+    std::mt19937 rng(11);
+    for (const size_t n_in : {1, 7, 64, 768, 1029})
+    {
+        const size_t n_out = 48;
+        const std::vector<float> w = random_values(rng, n_in * n_out, 0.1f);
+        std::vector<float> panels(n_in * n_out);
+        pack_f32_panels(w.data(), n_in, n_out, panels.data());
+        for (const size_t n_tokens : {1, 5, 6, 7, 13})
+        {
+            const size_t x_stride = n_in + 3;
+            const std::vector<float> x = random_values(rng, n_tokens * x_stride, 1.0f);
+            const size_t out_stride = n_out + 5;
+            std::vector<float> fast(n_tokens * out_stride, 9.0f);
+            std::vector<float> scalar(n_tokens * out_stride, 9.0f);
+            std::vector<float> scratch(gemm_f32_scratch(n_in));
+            gemm_f32_packed(panels.data(), n_in, x.data(), x_stride, n_tokens, 0, 16, fast.data(), out_stride,
+                            scratch.data());
+            gemm_f32_packed(panels.data(), n_in, x.data(), x_stride, n_tokens, 16, n_out, fast.data(), out_stride,
+                            scratch.data());
+            gemm_f32_packed_scalar(panels.data(), n_in, x.data(), x_stride, n_tokens, 0, n_out, scalar.data(),
+                                   out_stride);
+            bool same = true;
+            bool near = true;
+            for (size_t t = 0; t < n_tokens; ++t)
+            {
+                for (size_t o = 0; o < n_out; ++o)
+                {
+                    double expected = 0.0;
+                    double magnitude = 0.0;
+                    for (size_t k = 0; k < n_in; ++k)
+                    {
+                        expected += static_cast<double>(x[t * x_stride + k]) * w[o * n_in + k];
+                        magnitude += std::fabs(static_cast<double>(x[t * x_stride + k]) * w[o * n_in + k]);
+                    }
+                    const float f = fast[t * out_stride + o];
+                    same = same && bits_of(f) == bits_of(scalar[t * out_stride + o]);
+                    near = near && std::fabs(f - expected) <= 1e-6 * magnitude + 1e-30;
+                }
+                same = same && fast[t * out_stride + n_out] == 9.0f;
+            }
+            CHECK(same);
+            CHECK(near);
+        }
+    }
+}
+
 void test_rms_norm()
 {
     std::mt19937 rng(11);
@@ -1435,6 +1483,7 @@ int main()
     test_q8_k();
     test_k_quants_packed();
     test_dot_and_matvec();
+    test_gemm_f32_packed();
     test_rms_norm();
     test_rope();
     test_softmax();

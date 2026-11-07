@@ -455,10 +455,28 @@ top. No third party dependencies. Owner: Luís (akadjoker). "faisca" is a workin
    GELU), proj_out plus the pre-norm input, ConvTranspose2d 2x2/2 to
    3 x 40 x 64 x 64. On dumps/chair: rel L2 1.7e-7 after proj_in, 5.4e-7
    after block 0, 1.5e-6 on the transformer output and the scene codes;
-   bit identical with 22 and 11 threads. Slow: 51 s with 22 threads (88 s
-   with 11) against 27 s for the whole PyTorch CPU reference, because the
-   F32 Weight::matmul goes one token at a time; a blocked F32 GEMM (or the
-   GPU) comes after the mesh is right.
+   bit identical with 22, 11 and 7 threads.
+   Speed (the owner: nothing may be slower than the reference; find the
+   reason of any slowness). First version 51 s for the triplane. Found
+   with perf and per-op timers: (1) the F32 path was one matvec per token;
+   (2) static equal splits on this hybrid CPU (6 P with HT at 4.7-5.0 GHz,
+   8 E at 3.8, 2 LP-E at 2.5) wait for the slowest core; (3) GCC kept the
+   GEMM accumulators of an __m256 array on the stack (12 stores per k);
+   (4) unpacked token rows 4 KB apart. Now: weights packed once at open in
+   panels of 16 rows (ops_gemm.cpp, gemm_f32_packed: 6 x 16 AVX2 FMA
+   kernel, named accumulators, tokens packed [k][6]; bit identical to the
+   std::fma scalar one, ops_unit), work handed out from an atomic counter
+   (parallel_dynamic), attention as two GEMMs per head and 48 queries
+   (keys in the KEY_TILE layout are the panel layout) with exp_values.
+   Single core: 11-13 MAC/cycle on P (peak 16), 3-6 on E (peak 8). Whole
+   run under the owner's background load (Defender, editor git): image
+   encoder 0.5-0.9 s, triplane 8.2-11.3 s, against PyTorch 2.11 CPU (16
+   threads, oneDNN) on the same inputs interleaved: 0.9-2.1 s and
+   9.2-18.7 s. All threads give 2.9 MAC/cycle on average at 2.6 GHz and
+   8 -> 22 threads scale 1.5x: the next limit is cache (L2 shared by HT
+   pairs and by 4 E cores; attention keeps ~2.2 MB per thread). open takes
+   1.9 s: single threaded packing of 1.68 GB read through the NTFS FUSE
+   mount.
    Next: NeRF MLP density grid (grid_sample bilinear, align_corners False,
    on the three planes xy, xz, yz, concat to 120, 9 x 64 SiLU, density
    exp(x - 1)), marching cubes against torchmcubes, then the preprocessing

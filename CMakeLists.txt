@@ -62,6 +62,7 @@ add_library(faisca_lib STATIC
     src/audio.cpp
     src/ops_whisper.cpp
     src/ops_conv.cpp
+    src/ops_gemm.cpp
     src/image.cpp
     src/vision_model.cpp
     src/vision_runner.cpp

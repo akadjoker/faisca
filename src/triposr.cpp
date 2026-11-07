@@ -2,6 +2,7 @@
 
 #include "faisca/ops.h"
 
+#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -34,6 +35,42 @@ void parallel_for(ThreadPool& pool, size_t count, size_t group, const F& body)
             if (begin < end)
             {
                 (*j.body)(begin, end, thread_index);
+            }
+        },
+        &job);
+}
+
+// units handed out one chunk at a time from a shared counter, so the faster cores of a
+// hybrid CPU take more of them; body(first, last, thread) must not depend on the thread
+// for its results
+template <typename F>
+void parallel_dynamic(ThreadPool& pool, size_t count, size_t chunk, const F& body)
+{
+    struct Job
+    {
+        const F* body;
+        size_t count;
+        size_t chunk;
+        std::atomic<size_t> next;
+    };
+    Job job;
+    job.body = &body;
+    job.count = count;
+    job.chunk = chunk;
+    job.next.store(0, std::memory_order_relaxed);
+    pool.run(
+        [](void* user, int thread_index, int)
+        {
+            Job& j = *static_cast<Job*>(user);
+            for (;;)
+            {
+                const size_t first = j.next.fetch_add(j.chunk, std::memory_order_relaxed);
+                if (first >= j.count)
+                {
+                    return;
+                }
+                const size_t last = first + j.chunk < j.count ? first + j.chunk : j.count;
+                (*j.body)(first, last, thread_index);
             }
         },
         &job);
@@ -73,7 +110,54 @@ const float* TripoModel::f32(const char* name, uint64_t d0, uint64_t d1, uint64_
     return reinterpret_cast<const float*>(t->data);
 }
 
-bool TripoModel::linear(const char* name, uint64_t n_out, uint64_t n_in, Weight& w, const float** bias, Error& error)
+void TripoModel::add_linear(const float* rows, size_t n_out, size_t n_in, TripoLinear& w)
+{
+    w.panels = nullptr;
+    w.n_in = n_in;
+    w.n_out = n_out;
+    if (m_n_pending < MAX_LINEARS)
+    {
+        m_pending[m_n_pending] = Pending{&w, rows};
+    }
+    m_n_pending += 1;
+}
+
+bool TripoModel::pack_linears(Error& error)
+{
+    if (m_n_pending > MAX_LINEARS)
+    {
+        error.set("TripoSR: more than %zu linear layers", MAX_LINEARS);
+        return false;
+    }
+    size_t total = 0;
+    for (size_t i = 0; i < m_n_pending; ++i)
+    {
+        const TripoLinear& w = *m_pending[i].linear;
+        if (w.n_out % F32_PANEL != 0)
+        {
+            error.set("TripoSR: a linear layer of %zu outputs is not a multiple of %zu", w.n_out, F32_PANEL);
+            return false;
+        }
+        total += w.n_in * w.n_out;
+    }
+    if (!m_panels.resize_uninitialized(total))
+    {
+        error.set("out of memory packing %zu TripoSR weights", total);
+        return false;
+    }
+    size_t offset = 0;
+    for (size_t i = 0; i < m_n_pending; ++i)
+    {
+        TripoLinear& w = *m_pending[i].linear;
+        pack_f32_panels(m_pending[i].rows, w.n_in, w.n_out, m_panels.data() + offset);
+        w.panels = m_panels.data() + offset;
+        offset += w.n_in * w.n_out;
+    }
+    m_n_pending = 0;
+    return true;
+}
+
+bool TripoModel::linear(const char* name, uint64_t n_out, uint64_t n_in, TripoLinear& w, const float** bias, Error& error)
 {
     char key[192];
     std::snprintf(key, sizeof(key), "%s.weight", name);
@@ -82,11 +166,7 @@ bool TripoModel::linear(const char* name, uint64_t n_out, uint64_t n_in, Weight&
     {
         return false;
     }
-    w.type = GgmlType::F32;
-    w.packed = false;
-    w.data = reinterpret_cast<const uint8_t*>(data);
-    w.n_in = n_in;
-    w.n_out = n_out;
+    add_linear(data, n_out, n_in, w);
     if (bias != nullptr)
     {
         std::snprintf(key, sizeof(key), "%s.bias", name);
@@ -120,10 +200,7 @@ bool TripoModel::open(const char* path, Error& error)
     {
         return false;
     }
-    m_vit_patch.type = GgmlType::F32;
-    m_vit_patch.data = reinterpret_cast<const uint8_t*>(patch);
-    m_vit_patch.n_in = 3 * VIT_PATCH * VIT_PATCH;
-    m_vit_patch.n_out = VIT_DIM;
+    add_linear(patch, VIT_DIM, 3 * VIT_PATCH * VIT_PATCH, m_vit_patch);
 
     for (uint32_t il = 0; il < VIT_LAYERS; ++il)
     {
@@ -135,7 +212,7 @@ bool TripoModel::open(const char* path, Error& error)
             std::snprintf(key, sizeof(key), "%s.%s", base, suffix);
             return f32(key, VIT_DIM, 0, 0, 0, error);
         };
-        auto lin = [&](const char* suffix, uint64_t n_out, uint64_t n_in, Weight& w, const float** b)
+        auto lin = [&](const char* suffix, uint64_t n_out, uint64_t n_in, TripoLinear& w, const float** b)
         {
             std::snprintf(key, sizeof(key), "%s.%s", base, suffix);
             return linear(key, n_out, n_in, w, b, error);
@@ -174,7 +251,7 @@ bool TripoModel::open(const char* path, Error& error)
             std::snprintf(key, sizeof(key), "%s.%s", base, suffix);
             return f32(key, DIM, 0, 0, 0, error);
         };
-        auto lin = [&](const char* suffix, uint64_t n_out, uint64_t n_in, Weight& w, const float** bias)
+        auto lin = [&](const char* suffix, uint64_t n_out, uint64_t n_in, TripoLinear& w, const float** bias)
         {
             std::snprintf(key, sizeof(key), "%s.%s", base, suffix);
             return linear(key, n_out, n_in, w, bias, error);
@@ -219,10 +296,12 @@ bool TripoModel::open(const char* path, Error& error)
             m_upsample_rows[r * DIM + ci] = up[ci * rows + r];
         }
     }
-    m_upsample.type = GgmlType::F32;
-    m_upsample.data = reinterpret_cast<const uint8_t*>(m_upsample_rows.data());
-    m_upsample.n_in = DIM;
-    m_upsample.n_out = rows;
+    add_linear(m_upsample_rows.data(), rows, DIM, m_upsample);
+    if (!pack_linears(error))
+    {
+        return false;
+    }
+    m_upsample_rows.release();
     return true;
 }
 
@@ -309,8 +388,11 @@ bool TripoRunner::init(const TripoModel& model, ThreadPool& pool, Error& error)
                     m_x.resize_uninitialized(wide) && m_h.resize_uninitialized(wide) &&
                     m_q.resize_uninitialized(wide) && m_k.resize_uninitialized(wide) &&
                     m_v.resize_uninitialized(wide) && m_attn.resize_uninitialized(wide) &&
-                    m_up.resize_uninitialized(ff) && m_scores.resize_uninitialized(threads * rows) &&
-                    m_code.resize_uninitialized(code);
+                    m_up.resize_uninitialized(ff) &&
+                    m_scores.resize_uninitialized(threads * ATTENTION_QUERIES * (rows + KEY_TILE)) &&
+                    m_k_tiles.resize_uninitialized(TripoModel::HEADS * (rows + KEY_TILE) * (TripoModel::DIM / TripoModel::HEADS)) &&
+                    m_v_heads.resize_uninitialized(wide) && m_code.resize_uninitialized(code) &&
+                    m_gemm_scratch.resize_uninitialized(threads * gemm_f32_scratch(TripoModel::FF > rows ? TripoModel::FF : rows));
     if (!ok)
     {
         error.set("out of memory for the TripoSR buffers");
@@ -333,26 +415,40 @@ void TripoRunner::trace(const char* name, int layer, const float* data, size_t c
     }
 }
 
-void TripoRunner::matmul(const Weight& w, const float* bias, const float* x, size_t n_tokens, float* out,
+// one unit is GEMM_PANELS panels of outputs for GEMM_TOKENS tokens
+void TripoRunner::matmul(const TripoLinear& w, const float* bias, const float* x, size_t n_tokens, float* out,
                          size_t x_stride)
 {
+    const size_t GEMM_PANELS = 4;
+    const size_t GEMM_TOKENS = 192;
     const size_t stride = x_stride != 0 ? x_stride : w.n_in;
-    parallel_for(*m_pool, w.n_out, w.row_group(),
-                 [&](size_t first, size_t last, int)
-                 {
-                     w.matmul(x, stride, nullptr, 0, nullptr, 0, n_tokens, first, last, out, w.n_out);
-                     if (bias != nullptr)
+    const size_t groups = (w.n_out / F32_PANEL + GEMM_PANELS - 1) / GEMM_PANELS;
+    const size_t chunks = (n_tokens + GEMM_TOKENS - 1) / GEMM_TOKENS;
+    const size_t scratch = m_gemm_scratch.size() / static_cast<size_t>(m_pool->size());
+    parallel_dynamic(*m_pool, groups * chunks, 1,
+                     [&](size_t first, size_t last, int thread)
                      {
-                         for (size_t t = 0; t < n_tokens; ++t)
+                         for (size_t u = first; u < last; ++u)
                          {
-                             float* o = out + t * w.n_out;
-                             for (size_t r = first; r < last; ++r)
+                             const size_t t0 = (u % chunks) * GEMM_TOKENS;
+                             const size_t nt = n_tokens - t0 < GEMM_TOKENS ? n_tokens - t0 : GEMM_TOKENS;
+                             const size_t o0 = (u / chunks) * GEMM_PANELS * F32_PANEL;
+                             const size_t o1 = o0 + GEMM_PANELS * F32_PANEL < w.n_out ? o0 + GEMM_PANELS * F32_PANEL : w.n_out;
+                             gemm_f32_packed(w.panels, w.n_in, x + t0 * stride, stride, nt, o0, o1, out + t0 * w.n_out,
+                                             w.n_out, m_gemm_scratch.data() + size_t(thread) * scratch);
+                             if (bias != nullptr)
                              {
-                                 o[r] += bias[r];
+                                 for (size_t t = t0; t < t0 + nt; ++t)
+                                 {
+                                     float* o = out + t * w.n_out;
+                                     for (size_t r = o0; r < o1; ++r)
+                                     {
+                                         o[r] += bias[r];
+                                     }
+                                 }
                              }
                          }
-                     }
-                 });
+                     });
 }
 
 void TripoRunner::norm_rows(const float* x, const float* w, const float* b, float eps, size_t rows, size_t width,
@@ -368,41 +464,102 @@ void TripoRunner::norm_rows(const float* x, const float* w, const float* b, floa
                  });
 }
 
+// per head, the keys as gemm panels of 16 positions (the KEY_TILE layout) and the values
+// as head_dim / 16 panels over the positions; then per head and block of ATTENTION_QUERIES
+// queries: scores = q k^T with gemm_f32_packed, softmax over the n_kv real positions,
+// out = p v with gemm_f32_packed, divided by the sum. Units do not depend on the thread
 void TripoRunner::attention(const float* q, const float* k, const float* v, size_t n_q, size_t n_kv, size_t heads,
                             size_t head_dim, float* out)
 {
     const size_t stride = heads * head_dim;
-    const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
-    parallel_for(*m_pool, heads * n_q, 1,
-                 [&](size_t first, size_t last, int thread)
+    const size_t padded = (n_kv + KEY_TILE - 1) / KEY_TILE * KEY_TILE;
+    const size_t per_head = padded * head_dim;
+    parallel_for(*m_pool, heads, 1,
+                 [&](size_t first, size_t last, int)
                  {
-                     float* scores = m_scores.data() + size_t(thread) * (m_scores.size() / size_t(m_pool->size()));
-                     for (size_t u = first; u < last; ++u)
+                     for (size_t head = first; head < last; ++head)
                      {
-                         const size_t head = u / n_q;
-                         const size_t query = u % n_q;
-                         const float* qh = q + query * stride + head * head_dim;
-                         for (size_t j = 0; j < n_kv; ++j)
+                         float* tiles = m_k_tiles.data() + head * per_head;
+                         for (size_t p = 0; p < n_kv; ++p)
                          {
-                             scores[j] = dot(qh, k + j * stride + head * head_dim, head_dim) * scale;
-                         }
-                         softmax(scores, n_kv);
-                         float* o = out + query * stride + head * head_dim;
-                         for (size_t d = 0; d < head_dim; ++d)
-                         {
-                             o[d] = 0.0f;
-                         }
-                         for (size_t j = 0; j < n_kv; ++j)
-                         {
-                             const float p = scores[j];
-                             const float* vh = v + j * stride + head * head_dim;
+                             const float* row = k + p * stride + head * head_dim;
                              for (size_t d = 0; d < head_dim; ++d)
                              {
-                                 o[d] += p * vh[d];
+                                 tiles[key_index(head_dim, p, d)] = row[d];
+                             }
+                         }
+                         for (size_t p = n_kv; p < padded; ++p)
+                         {
+                             for (size_t d = 0; d < head_dim; ++d)
+                             {
+                                 tiles[key_index(head_dim, p, d)] = 0.0f;
+                             }
+                         }
+                         float* panels = m_v_heads.data() + head * n_kv * head_dim;
+                         for (size_t j = 0; j < head_dim / F32_PANEL; ++j)
+                         {
+                             float* panel = panels + j * n_kv * F32_PANEL;
+                             for (size_t p = 0; p < n_kv; ++p)
+                             {
+                                 std::memcpy(panel + p * F32_PANEL, v + p * stride + head * head_dim + j * F32_PANEL,
+                                             F32_PANEL * sizeof(float));
                              }
                          }
                      }
                  });
+    const size_t block = ATTENTION_QUERIES;
+    const size_t blocks = (n_q + block - 1) / block;
+    const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+    const size_t scores_per_thread = m_scores.size() / static_cast<size_t>(m_pool->size());
+    const size_t gemm_per_thread = m_gemm_scratch.size() / static_cast<size_t>(m_pool->size());
+    parallel_dynamic(*m_pool, heads * blocks, 1,
+                     [&](size_t first, size_t last, int thread)
+                     {
+                         float* scores = m_scores.data() + size_t(thread) * scores_per_thread;
+                         float* scratch = m_gemm_scratch.data() + size_t(thread) * gemm_per_thread;
+                         for (size_t u = first; u < last; ++u)
+                         {
+                             const size_t head = u / blocks;
+                             const size_t i = (u % blocks) * block;
+                             const size_t count = n_q - i < block ? n_q - i : block;
+                             gemm_f32_packed(m_k_tiles.data() + head * per_head, head_dim, q + i * stride + head * head_dim,
+                                             stride, count, 0, padded, scores, padded, scratch);
+                             float sums[ATTENTION_QUERIES];
+                             for (size_t r = 0; r < count; ++r)
+                             {
+                                 float* row = scores + r * padded;
+                                 float max = row[0] * scale;
+                                 for (size_t p = 0; p < n_kv; ++p)
+                                 {
+                                     row[p] *= scale;
+                                     max = row[p] > max ? row[p] : max;
+                                 }
+                                 for (size_t p = 0; p < n_kv; ++p)
+                                 {
+                                     row[p] -= max;
+                                 }
+                                 exp_values(row, n_kv);
+                                 float lanes[8] = {};
+                                 for (size_t p = 0; p < n_kv; ++p)
+                                 {
+                                     lanes[p & 7] += row[p];
+                                 }
+                                 sums[r] = ((lanes[0] + lanes[1]) + (lanes[2] + lanes[3])) +
+                                           ((lanes[4] + lanes[5]) + (lanes[6] + lanes[7]));
+                             }
+                             float* o = out + i * stride + head * head_dim;
+                             gemm_f32_packed(m_v_heads.data() + head * n_kv * head_dim, n_kv, scores, padded, count, 0,
+                                             head_dim, o, stride, scratch);
+                             for (size_t r = 0; r < count; ++r)
+                             {
+                                 const float inverse = 1.0f / sums[r];
+                                 for (size_t d = 0; d < head_dim; ++d)
+                                 {
+                                     o[r * stride + d] *= inverse;
+                                 }
+                             }
+                         }
+                     });
 }
 
 bool TripoRunner::encode_image(const float* rgb, Error& error)
@@ -593,7 +750,7 @@ bool TripoRunner::build_triplane(Error& error)
     trace("bb_out", -1, m_h.data(), n * dim);
 
     // ConvTranspose2d(DIM, CODE_CHANNELS, 2, stride 2) per plane
-    const Weight& up = m.upsample();
+    const TripoLinear& up = m.upsample();
     matmul(up, nullptr, m_h.data(), n, m_attn.data());
     const size_t code_side = TripoModel::CODE_SIZE;
     const size_t channels = TripoModel::CODE_CHANNELS;

@@ -232,6 +232,24 @@ void swiglu_scalar(const float* gate, const float* up, size_t n, float* out);
 
 void add(float* x, const float* y, size_t n);
 
+// float32 weights for many tokens (src/ops_gemm.cpp): n_out rows of n_in, n_out a multiple
+// of F32_PANEL, packed as panels of F32_PANEL rows stored k-major ([k][row])
+constexpr size_t F32_PANEL = 16;
+void pack_f32_panels(const float* w, size_t n_in, size_t n_out, float* out);
+
+// out[t][o] = sum over k of x[t][k] w[o][k] for t < n_tokens and o in [first, last), both
+// multiples of F32_PANEL; every output is one fused multiply-add chain in k order, so the
+// AVX2 kernel and the scalar one (std::fma) give the same bits for any split of the work;
+// scratch holds gemm_f32_scratch(n_in) floats
+inline size_t gemm_f32_scratch(size_t n_in)
+{
+    return n_in * 6;
+}
+void gemm_f32_packed(const float* panels, size_t n_in, const float* x, size_t x_stride, size_t n_tokens, size_t first,
+                     size_t last, float* out, size_t out_stride, float* scratch);
+void gemm_f32_packed_scalar(const float* panels, size_t n_in, const float* x, size_t x_stride, size_t n_tokens,
+                            size_t first, size_t last, float* out, size_t out_stride);
+
 // float32 ops of the Whisper encoder and decoder (src/ops_whisper.cpp)
 
 // mean and variance over n: out = (x - mean) / sqrt(var + eps) * weight + bias

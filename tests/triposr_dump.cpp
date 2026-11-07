@@ -40,7 +40,7 @@ int main(int argc, char** argv)
 {
     if (argc < 4)
     {
-        std::fprintf(stderr, "usage: triposr_dump <model.ckpt> <reference dir with rgb_cond.f32> <out dir> [threads]\n");
+        std::fprintf(stderr, "usage: triposr_dump <model.ckpt> <reference dir with rgb_cond.f32> <out dir, - for no traces> [threads]\n");
         return 2;
     }
     const int threads = argc > 4 ? std::atoi(argv[4]) : static_cast<int>(std::thread::hardware_concurrency());
@@ -74,7 +74,10 @@ int main(int argc, char** argv)
         return 1;
     }
     Dump dump = {argv[3]};
-    runner.set_trace(write_trace, &dump);
+    if (dump.dir != "-")
+    {
+        runner.set_trace(write_trace, &dump);
+    }
 
     start = std::chrono::steady_clock::now();
     if (!runner.encode_image(rgb.data(), error))
@@ -82,13 +85,13 @@ int main(int argc, char** argv)
         std::fprintf(stderr, "error: %s\n", error.c_str());
         return 1;
     }
-    std::fprintf(stderr, "image encoder %.3f s with %d threads (traces included)\n", seconds_since(start), threads);
+    std::fprintf(stderr, "image encoder %.3f s with %d threads\n", seconds_since(start), threads);
     start = std::chrono::steady_clock::now();
     if (!runner.build_triplane(error))
     {
         std::fprintf(stderr, "error: %s\n", error.c_str());
         return 1;
     }
-    std::fprintf(stderr, "triplane %.3f s (traces included)\n", seconds_since(start));
+    std::fprintf(stderr, "triplane %.3f s\n", seconds_since(start));
     return 0;
 }
