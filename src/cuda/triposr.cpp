@@ -282,9 +282,14 @@ bool TripoCudaRunner::gemm(uint64_t x, uint32_t x_stride, uint64_t w, uint32_t n
 bool TripoCudaRunner::layer_norm(uint64_t x, uint64_t w, uint64_t b, uint64_t out, uint32_t rows, uint32_t width,
                                  float eps, Error& error)
 {
-    void* arguments[] = {&x, &w, &b, &out, &width, &eps};
+    if (width % 128 != 0 || width > 1024)
+    {
+        error.set("tripo_layer_norm: width %u not a multiple of 128 up to 1024", width);
+        return false;
+    }
+    void* arguments[] = {&x, &w, &b, &out, &rows, &width, &eps};
     CudaLaunch launch;
-    launch.grid_x = rows;
+    launch.grid_x = (rows + 7) / 8;
     launch.block_x = 256;
     return m_device->launch(m_layer_norm, m_stream, launch, arguments, error);
 }

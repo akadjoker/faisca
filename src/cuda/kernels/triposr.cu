@@ -130,53 +130,105 @@ extern "C" __global__ void __launch_bounds__(256, 2)
     }
 }
 
-// layer_norm (src/ops_whisper.cpp) of one row per block of 256 threads: double sums of the
-// values and of the squared centred values, reduced by a fixed tree
-extern "C" __global__ void tripo_layer_norm(const float* x, const float* weight, const float* bias, float* out,
-                                            unsigned int width, float eps)
+// Knuth's TwoSum: s + e == a + b exactly
+__device__ void two_sum(float a, float b, float& s, float& e)
 {
-    __shared__ double partial[256];
-    const float* row = x + (size_t)blockIdx.x * width;
-    float* dst = out + (size_t)blockIdx.x * width;
-    double sum = 0.0;
-    for (unsigned int i = threadIdx.x; i < width; i += 256)
+    s = a + b;
+    const float bb = s - a;
+    e = (a - (s - bb)) + (b - bb);
+}
+
+__device__ double warp_float_float_sum(float hi, float lo)
+{
+    for (int o = 16; o > 0; o /= 2)
     {
-        sum += row[i];
+        const float h2 = __shfl_xor_sync(0xffffffffu, hi, o);
+        const float l2 = __shfl_xor_sync(0xffffffffu, lo, o);
+        float s, e;
+        two_sum(hi, h2, s, e);
+        e = e + (lo + l2);
+        hi = s + e;
+        lo = e - (hi - s);
     }
-    partial[threadIdx.x] = sum;
-    __syncthreads();
-    for (unsigned int s = 128; s > 0; s /= 2)
+    return (double)hi + (double)lo;
+}
+
+// layer_norm (src/ops_whisper.cpp) of one row per warp, 8 rows per block of 256 threads,
+// width a multiple of 128 up to 1024 held in registers. The CPU's double sums cost 1/64
+// rate FP64 here (563 us for 3072 x 1024); compensated float-float sums (TwoSum, exact
+// squares by fmaf) keep about 48 bits and gave the same outputs on random and model rows.
+extern "C" __global__ void tripo_layer_norm(const float* x, const float* weight, const float* bias, float* out,
+                                            unsigned int rows, unsigned int width, float eps)
+{
+    const unsigned int lane = threadIdx.x % 32;
+    const unsigned int r = blockIdx.x * 8 + threadIdx.x / 32;
+    if (r >= rows)
     {
-        if (threadIdx.x < s)
+        return;
+    }
+    const unsigned int chunks = width / 128;
+    const float* row = x + (size_t)r * width;
+    float v[32];
+    float hi = 0.0f;
+    float lo = 0.0f;
+#pragma unroll
+    for (unsigned int j = 0; j < 8; ++j)
+    {
+        if (j < chunks)
         {
-            partial[threadIdx.x] += partial[threadIdx.x + s];
+            const float4 f = *(const float4*)(row + j * 128 + lane * 4);
+            v[4 * j] = f.x;
+            v[4 * j + 1] = f.y;
+            v[4 * j + 2] = f.z;
+            v[4 * j + 3] = f.w;
+#pragma unroll
+            for (int c = 0; c < 4; ++c)
+            {
+                float s, e;
+                two_sum(hi, v[4 * j + c], s, e);
+                hi = s;
+                lo = lo + e;
+            }
         }
-        __syncthreads();
     }
-    const float mean = (float)(partial[0] / (double)width);
-    __syncthreads();
-    double squares = 0.0;
-    for (unsigned int i = threadIdx.x; i < width; i += 256)
+    const float mean = (float)(warp_float_float_sum(hi, lo) / (double)width);
+    hi = 0.0f;
+    lo = 0.0f;
+#pragma unroll
+    for (unsigned int j = 0; j < 8; ++j)
     {
-        const float centered = row[i] - mean;
-        squares += (double)centered * (double)centered;
-    }
-    partial[threadIdx.x] = squares;
-    __syncthreads();
-    for (unsigned int s = 128; s > 0; s /= 2)
-    {
-        if (threadIdx.x < s)
+        if (j < chunks)
         {
-            partial[threadIdx.x] += partial[threadIdx.x + s];
+#pragma unroll
+            for (int c = 0; c < 4; ++c)
+            {
+                const float centered = v[4 * j + c] - mean;
+                const float p = centered * centered;
+                float s, e;
+                two_sum(hi, p, s, e);
+                hi = s;
+                lo = lo + e + fmaf(centered, centered, -p);
+            }
         }
-        __syncthreads();
     }
-    const float variance = (float)(partial[0] / (double)width);
+    const float variance = (float)(warp_float_float_sum(hi, lo) / (double)width);
     const float scale = 1.0f / sqrtf(variance + eps);
-    for (unsigned int i = threadIdx.x; i < width; i += 256)
+    float* dst = out + (size_t)r * width;
+#pragma unroll
+    for (unsigned int j = 0; j < 8; ++j)
     {
-        const float centered = row[i] - mean;
-        dst[i] = centered * scale * weight[i] + bias[i];
+        if (j < chunks)
+        {
+            const unsigned int i = j * 128 + lane * 4;
+            const float4 w = *(const float4*)(weight + i);
+            const float4 b = *(const float4*)(bias + i);
+            float4 o;
+            o.x = (v[4 * j] - mean) * scale * w.x + b.x;
+            o.y = (v[4 * j + 1] - mean) * scale * w.y + b.y;
+            o.z = (v[4 * j + 2] - mean) * scale * w.z + b.z;
+            o.w = (v[4 * j + 3] - mean) * scale * w.w + b.w;
+            *(float4*)(dst + i) = o;
+        }
     }
 }
 

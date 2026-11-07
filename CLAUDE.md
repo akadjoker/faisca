@@ -548,10 +548,15 @@ top. No third party dependencies. Owner: Luís (akadjoker). "faisca" is a workin
    traces of chair (tokens to mesh) are bit identical to the first version.
    Interleaved with PyTorch: image encoder 0.037 s (0.044), triplane
    0.48-0.49 s (0.61-0.62), mesh 256^3 0.54-0.58 s (0.96). Per kernel still
-   behind: tripo_layer_norm 574 us per 3072 rows against PyTorch's 54 us
-   (25 ms per triplane), GEMM 3072 x 1024 x 1024 1.14 ms against cuBLAS's
-   1.0 ms (split-K 64 x 64). Next: those two, then --cuda in `faisca mesh`,
-   then CPU cache tuning.
+   behind: GEMM 3072 x 1024 x 1024 1.14 ms against cuBLAS's 1.0 ms
+   (split-K 64 x 64). tripo_layer_norm was 563 us per 3072 x 1024 against
+   PyTorch's 54 us: a float copy of it took 90 us, so the cause was the
+   double sums (FP64 at 1/64 rate on this GPU). Now one warp per row in
+   registers with float-float sums (TwoSum, squares made exact by fmaf):
+   same outputs as the double kernel on 3.1 M random values and on all 38
+   chair traces; 25 us with a warm L2, 131 us cold against PyTorch's 138 us
+   (DRAM bound). Image encoder 0.034 s, triplane 0.47 s. Next: that GEMM
+   shape and attention, then --cuda in `faisca mesh`, then CPU cache tuning.
 
 OmniDreams (NVIDIA video world model) is an exploration, not a plan step:
 read docs/omnidreams_handoff.md first, then docs/omnidreams.md.
