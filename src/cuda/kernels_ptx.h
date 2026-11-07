@@ -13,5 +13,6 @@ extern const char ptx_matvec_q8_0[];
 extern const char ptx_rms_norm[];
 extern const char ptx_rope[];
 extern const char ptx_swiglu[];
+extern const char ptx_triposr[];
 
 }

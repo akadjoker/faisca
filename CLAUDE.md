@@ -524,7 +524,24 @@ top. No third party dependencies. Owner: Luís (akadjoker). "faisca" is a workin
    scene codes 1.6e-6, density 5.1e-6 (one of 16.7 M grid points on the
    other side of the threshold), 156032 faces as the reference, 78161
    vertices against 78159, triposr_mc_check bit identical.
-   Next: CUDA, CPU cache tuning.
+   CUDA, first version (`TripoCudaRunner`, triposr_cuda.h, src/cuda/triposr.cpp,
+   kernels src/cuda/kernels/triposr.cu, PTX via tools/embed_ptx.py with nvcc
+   12.8; the other kernels' PTX came out unchanged): float32, packed panels
+   uploaded once (1.68 GB), tripo_gemm 64 x 64 tiles with 4 x 4 fmaf chains
+   per thread in k order (the same bits as gemm_f32_packed: vit_embed and
+   bb_proj_in errors equal the CPU's), double-sum layer norm, one query per
+   thread online-softmax attention, fused tripo_query (grid_sample + whole
+   MLP per point, weights staged per layer in shared memory), marching
+   cubes on the CPU pool. `triposr_dump ... --cuda`. chair.png against the
+   reference: tokens 3.6e-6, scene codes 2.5e-6, density 5.8e-6, 256^3 same
+   84160 faces, 42158 vertices against 42170, positions within 6e-6.
+   Speed on the RTX 4060 Laptop (synchronized, warm): ours image encoder
+   0.08 s, triplane 0.95 s, mesh 256^3 0.6-1.4 s; PyTorch 2.11 CUDA
+   (ref/triposr/bench_torch_cuda.py, TF32 matmul off): 0.045 s, 0.60 s,
+   1.5-1.75 s. STILL SLOWER in the encoder and the triplane: next task is
+   to find why (profile per kernel: tripo_gemm reaches about 1.4 TMAC/s,
+   attention is one query per thread) and beat PyTorch; then wire --cuda
+   into `faisca mesh`; then CPU cache tuning.
 
 OmniDreams (NVIDIA video world model) is an exploration, not a plan step:
 read docs/omnidreams_handoff.md first, then docs/omnidreams.md.

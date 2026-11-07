@@ -141,6 +141,17 @@ public:
     }
 
     // [3][DIM][PLANE_SIZE][PLANE_SIZE]
+    // every packed linear layer lives in this one block
+    const float* panel_data() const
+    {
+        return m_panels.data();
+    }
+
+    size_t panel_floats() const
+    {
+        return m_panels.size();
+    }
+
     const float* plane_embeddings() const
     {
         return m_planes;
@@ -245,6 +256,15 @@ private:
     const float* m_upsample_b = nullptr;
 };
 
+// pieces shared by the CPU and CUDA runners: the CLS and resampled position embeddings
+// ((IMAGE_SIZE / VIT_PATCH)^2 + 1 rows), the normalized patches p in [first, last) of an
+// rgb image (3 x 16 x 16 values each), the plane embeddings as PLANE_TOKENS rows of DIM,
+// and their GroupNorm for the groups in [first, last)
+void tripo_vit_positions(const TripoModel& model, float* pos);
+void tripo_patches(const float* rgb, size_t first, size_t last, float* patches);
+void tripo_plane_tokens(const TripoModel& model, float* tokens);
+void tripo_group_norm(const TripoModel& model, const float* tokens, size_t first, size_t last, float* out);
+
 // pos is side x side rows of dim values; out gets out_side x out_side rows, resampled as
 // torch.nn.functional.interpolate(mode="bicubic", align_corners=False, scale_factor=scale)
 // does on the CPU in float32
@@ -268,6 +288,11 @@ struct TripoMesh
     Array<float> colors;    // r, g, b per vertex in [0, 1]
     Array<uint32_t> faces;  // three vertex indices per triangle
 };
+
+// the grid axis of TSR.extract_mesh (resolution values in (-RADIUS, RADIUS)) and the
+// marching cubes points (grid units, x y z) back to positions in (-RADIUS, RADIUS)
+void tripo_grid_axis(uint32_t resolution, float* lin);
+void tripo_mesh_positions(const float* grid_points, size_t n, uint32_t resolution, float* positions);
 
 // Wavefront OBJ with a colour per vertex ("v x y z r g b", as trimesh writes them)
 bool tripo_write_obj(const char* path, const TripoMesh& mesh, Error& error);

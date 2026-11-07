@@ -395,6 +395,101 @@ void tripo_bicubic_rows(const float* pos, uint32_t side, uint32_t dim, double sc
     }
 }
 
+void tripo_vit_positions(const TripoModel& model, float* pos)
+{
+    // ViTEmbeddings.interpolate_pos_encoding of transformers 4.35.0: scale_factor (side + 0.1) / 14
+    const size_t side = TripoModel::IMAGE_SIZE / TripoModel::VIT_PATCH;
+    const size_t dim = TripoModel::VIT_DIM;
+    std::memcpy(pos, model.vit_pos(), dim * sizeof(float));
+    const double scale =
+        (static_cast<double>(side) + 0.1) / std::sqrt(double(TripoModel::VIT_POS_SIDE * TripoModel::VIT_POS_SIDE));
+    tripo_bicubic_rows(model.vit_pos() + dim, TripoModel::VIT_POS_SIDE, TripoModel::VIT_DIM, scale,
+                       static_cast<uint32_t>(side), pos + dim);
+}
+
+void tripo_patches(const float* rgb, size_t first, size_t last, float* patches)
+{
+    const size_t size = TripoModel::IMAGE_SIZE;
+    const size_t patch = TripoModel::VIT_PATCH;
+    const size_t side = size / patch;
+    const size_t taps = 3 * patch * patch;
+    const float mean[3] = {0.485f, 0.456f, 0.406f};
+    const float stdev[3] = {0.229f, 0.224f, 0.225f};
+    for (size_t p = first; p < last; ++p)
+    {
+        const size_t py = p / side;
+        const size_t px = p % side;
+        float* out = patches + p * taps;
+        for (size_t c = 0; c < 3; ++c)
+        {
+            for (size_t ky = 0; ky < patch; ++ky)
+            {
+                const float* row = rgb + ((py * patch + ky) * size + px * patch) * 3;
+                for (size_t kx = 0; kx < patch; ++kx)
+                {
+                    out[(c * patch + ky) * patch + kx] = (row[kx * 3 + c] - mean[c]) / stdev[c];
+                }
+            }
+        }
+    }
+}
+
+void tripo_plane_tokens(const TripoModel& model, float* tokens)
+{
+    // Triplane1DTokenizer: token (np, hp, wp) of channel c is embeddings[np][c][hp][wp]
+    const size_t n = TripoModel::PLANE_TOKENS;
+    const size_t dim = TripoModel::DIM;
+    const size_t plane = TripoModel::PLANE_SIZE * TripoModel::PLANE_SIZE;
+    const float* planes = model.plane_embeddings();
+    for (size_t t = 0; t < n; ++t)
+    {
+        const size_t np = t / plane;
+        const size_t pixel = t % plane;
+        for (size_t c = 0; c < dim; ++c)
+        {
+            tokens[t * dim + c] = planes[(np * dim + c) * plane + pixel];
+        }
+    }
+}
+
+void tripo_group_norm(const TripoModel& model, const float* tokens, size_t first, size_t last, float* out)
+{
+    // GroupNorm over (channels of the group, all tokens)
+    const size_t n = TripoModel::PLANE_TOKENS;
+    const size_t dim = TripoModel::DIM;
+    const size_t group = dim / TripoModel::GROUPS;
+    for (size_t g = first; g < last; ++g)
+    {
+        double sum = 0.0;
+        for (size_t t = 0; t < n; ++t)
+        {
+            for (size_t c = g * group; c < (g + 1) * group; ++c)
+            {
+                sum += tokens[t * dim + c];
+            }
+        }
+        const double mean = sum / double(n * group);
+        double squares = 0.0;
+        for (size_t t = 0; t < n; ++t)
+        {
+            for (size_t c = g * group; c < (g + 1) * group; ++c)
+            {
+                const double d = tokens[t * dim + c] - mean;
+                squares += d * d;
+            }
+        }
+        const float rstd = static_cast<float>(1.0 / std::sqrt(squares / double(n * group) + TripoModel::GROUP_EPS));
+        const float mean_f = static_cast<float>(mean);
+        for (size_t t = 0; t < n; ++t)
+        {
+            for (size_t c = g * group; c < (g + 1) * group; ++c)
+            {
+                out[t * dim + c] = (tokens[t * dim + c] - mean_f) * rstd * model.group_norm_w()[c] + model.group_norm_b()[c];
+            }
+        }
+    }
+}
+
 bool TripoRunner::init(const TripoModel& model, ThreadPool& pool, Error& error)
 {
     m_model = &model;
@@ -429,12 +524,7 @@ bool TripoRunner::init(const TripoModel& model, ThreadPool& pool, Error& error)
         error.set("out of memory for the TripoSR buffers");
         return false;
     }
-    // ViTEmbeddings.interpolate_pos_encoding of transformers 4.35.0: scale_factor (side + 0.1) / 14
-    std::memcpy(m_pos.data(), model.vit_pos(), vit_dim * sizeof(float));
-    const double scale =
-        (static_cast<double>(side) + 0.1) / std::sqrt(double(TripoModel::VIT_POS_SIDE * TripoModel::VIT_POS_SIDE));
-    tripo_bicubic_rows(model.vit_pos() + vit_dim, TripoModel::VIT_POS_SIDE, TripoModel::VIT_DIM, scale,
-                       static_cast<uint32_t>(side), m_pos.data() + vit_dim);
+    tripo_vit_positions(model, m_pos.data());
     return true;
 }
 
@@ -606,31 +696,8 @@ bool TripoRunner::encode_image(const float* rgb, Error& error)
     const size_t side = size / patch;
     const size_t n = m_n_image;
     const size_t dim = TripoModel::VIT_DIM;
-    const size_t taps = 3 * patch * patch;
-    const float mean[3] = {0.485f, 0.456f, 0.406f};
-    const float stdev[3] = {0.229f, 0.224f, 0.225f};
-
     parallel_for(*m_pool, side * side, 1,
-                 [&](size_t first, size_t last, int)
-                 {
-                     for (size_t p = first; p < last; ++p)
-                     {
-                         const size_t py = p / side;
-                         const size_t px = p % side;
-                         float* out = m_patches.data() + p * taps;
-                         for (size_t c = 0; c < 3; ++c)
-                         {
-                             for (size_t ky = 0; ky < patch; ++ky)
-                             {
-                                 const float* row = rgb + ((py * patch + ky) * size + px * patch) * 3;
-                                 for (size_t kx = 0; kx < patch; ++kx)
-                                 {
-                                     out[(c * patch + ky) * patch + kx] = (row[kx * 3 + c] - mean[c]) / stdev[c];
-                                 }
-                             }
-                         }
-                     }
-                 });
+                 [&](size_t first, size_t last, int) { tripo_patches(rgb, first, last, m_patches.data()); });
     float* x = m_image.data();
     matmul(m.vit_patch(), m.vit_patch_b(), m_patches.data(), side * side, x + dim);
     std::memcpy(x, m.vit_cls(), dim * sizeof(float));
@@ -682,56 +749,10 @@ bool TripoRunner::build_triplane(Error& error)
     const size_t head_dim = dim / heads;
     const size_t ff = TripoModel::FF;
 
-    // Triplane1DTokenizer: token (np, hp, wp) of channel c is embeddings[np][c][hp][wp]
-    const float* planes = m.plane_embeddings();
     float* residual = m_residual.data();
-    for (size_t t = 0; t < n; ++t)
-    {
-        const size_t np = t / plane;
-        const size_t pixel = t % plane;
-        for (size_t c = 0; c < dim; ++c)
-        {
-            residual[t * dim + c] = planes[(np * dim + c) * plane + pixel];
-        }
-    }
-    // GroupNorm over (channels of the group, all tokens), then proj_in on the token rows
-    const size_t group = dim / TripoModel::GROUPS;
+    tripo_plane_tokens(m, residual);
     parallel_for(*m_pool, TripoModel::GROUPS, 1,
-                 [&](size_t first, size_t last, int)
-                 {
-                     for (size_t g = first; g < last; ++g)
-                     {
-                         double sum = 0.0;
-                         for (size_t t = 0; t < n; ++t)
-                         {
-                             for (size_t c = g * group; c < (g + 1) * group; ++c)
-                             {
-                                 sum += residual[t * dim + c];
-                             }
-                         }
-                         const double mean = sum / double(n * group);
-                         double squares = 0.0;
-                         for (size_t t = 0; t < n; ++t)
-                         {
-                             for (size_t c = g * group; c < (g + 1) * group; ++c)
-                             {
-                                 const double d = residual[t * dim + c] - mean;
-                                 squares += d * d;
-                             }
-                         }
-                         const float rstd =
-                             static_cast<float>(1.0 / std::sqrt(squares / double(n * group) + TripoModel::GROUP_EPS));
-                         const float mean_f = static_cast<float>(mean);
-                         for (size_t t = 0; t < n; ++t)
-                         {
-                             for (size_t c = g * group; c < (g + 1) * group; ++c)
-                             {
-                                 m_h[t * dim + c] =
-                                     (residual[t * dim + c] - mean_f) * rstd * m.group_norm_w()[c] + m.group_norm_b()[c];
-                             }
-                         }
-                     }
-                 });
+                 [&](size_t first, size_t last, int) { tripo_group_norm(m, residual, first, last, m_h.data()); });
     float* x = m_x.data();
     matmul(m.proj_in(), m.proj_in_b(), m_h.data(), n, x);
     trace("bb_proj_in", -1, x, n * dim);
@@ -1399,6 +1420,35 @@ bool tripo_marching_cubes(ThreadPool& pool, const float* vol, uint32_t resolutio
     return true;
 }
 
+void tripo_grid_axis(uint32_t resolution, float* lin)
+{
+    // torch.linspace(0, 1, size) (RangeFactoriesKernel.cpp linspace_kernel), then
+    // scale_tensor to (-RADIUS, RADIUS)
+    const size_t size = resolution;
+    const float step = (1.0f - 0.0f) / static_cast<float>(size - 1);
+    for (size_t i = 0; i < size; ++i)
+    {
+        const float v = i < size / 2 ? 0.0f + step * static_cast<float>(i)
+                                     : 1.0f - step * static_cast<float>(size - i - 1);
+        lin[i] = v * (TripoModel::RADIUS - -TripoModel::RADIUS) + -TripoModel::RADIUS;
+    }
+}
+
+void tripo_mesh_positions(const float* grid_points, size_t n, uint32_t resolution, float* positions)
+{
+    // v_pos[..., [2, 1, 0]] / (resolution - 1), scale_tensor to (-RADIUS, RADIUS)
+    const float scale = static_cast<float>(resolution) - 1.0f;
+    for (size_t i = 0; i < n; ++i)
+    {
+        const float* g = grid_points + 3 * i;
+        const float v[3] = {g[2] / scale, g[1] / scale, g[0] / scale};
+        for (int d = 0; d < 3; ++d)
+        {
+            positions[3 * i + size_t(d)] = v[d] * (TripoModel::RADIUS - -TripoModel::RADIUS) + -TripoModel::RADIUS;
+        }
+    }
+}
+
 bool tripo_write_obj(const char* path, const TripoMesh& mesh, Error& error)
 {
     FILE* f = std::fopen(path, "wb");
@@ -1444,15 +1494,7 @@ bool TripoRunner::extract_mesh(uint32_t resolution, float threshold, TripoMesh& 
         error.set("out of memory for a %u^3 density grid", resolution);
         return false;
     }
-    // torch.linspace(0, 1, size) (RangeFactoriesKernel.cpp linspace_kernel), then
-    // scale_tensor to (-RADIUS, RADIUS)
-    const float step = (1.0f - 0.0f) / static_cast<float>(size - 1);
-    for (size_t i = 0; i < size; ++i)
-    {
-        const float v = i < size / 2 ? 0.0f + step * static_cast<float>(i)
-                                     : 1.0f - step * static_cast<float>(size - i - 1);
-        lin[i] = v * (TripoModel::RADIUS - -TripoModel::RADIUS) + -TripoModel::RADIUS;
-    }
+    tripo_grid_axis(resolution, lin.data());
     GridSource grid = {lin.data(), size};
     if (!query_points(
             [](const void* user, size_t index, float out[3])
@@ -1485,17 +1527,7 @@ bool TripoRunner::extract_mesh(uint32_t resolution, float threshold, TripoMesh& 
         error.set("out of memory for %zu vertices", n_vertices);
         return false;
     }
-    const float scale = static_cast<float>(resolution) - 1.0f;
-    for (size_t i = 0; i < n_vertices; ++i)
-    {
-        const float* g = grid_points.data() + 3 * i;
-        const float v[3] = {g[2] / scale, g[1] / scale, g[0] / scale};
-        for (int d = 0; d < 3; ++d)
-        {
-            mesh.positions[3 * i + size_t(d)] =
-                v[d] * (TripoModel::RADIUS - -TripoModel::RADIUS) + -TripoModel::RADIUS;
-        }
-    }
+    tripo_mesh_positions(grid_points.data(), n_vertices, resolution, mesh.positions.data());
     Array<float> density;
     if (!density.resize_uninitialized(n_vertices))
     {

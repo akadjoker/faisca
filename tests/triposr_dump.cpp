@@ -1,4 +1,7 @@
 #include "faisca/triposr.h"
+#if defined(FAISCA_CUDA)
+#include "faisca/triposr_cuda.h"
+#endif
 
 #include <chrono>
 #include <cstring>
@@ -9,6 +12,72 @@
 
 namespace
 {
+
+// the CPU or the CUDA runner behind the same calls
+struct Runner
+{
+    faisca::TripoRunner* cpu;
+#if defined(FAISCA_CUDA)
+    faisca::TripoCudaRunner* gpu;
+#endif
+
+    void set_trace(faisca::RunnerTrace callback, void* user)
+    {
+#if defined(FAISCA_CUDA)
+        if (gpu != nullptr)
+        {
+            gpu->set_trace(callback, user);
+            return;
+        }
+#endif
+        cpu->set_trace(callback, user);
+    }
+
+    bool encode_image(const float* rgb, faisca::Error& error)
+    {
+#if defined(FAISCA_CUDA)
+        if (gpu != nullptr)
+        {
+            return gpu->encode_image(rgb, error);
+        }
+#endif
+        return cpu->encode_image(rgb, error);
+    }
+
+    bool synchronize(faisca::Error& error)
+    {
+#if defined(FAISCA_CUDA)
+        if (gpu != nullptr)
+        {
+            return gpu->synchronize(error);
+        }
+#endif
+        (void)error;
+        return true;
+    }
+
+    bool build_triplane(faisca::Error& error)
+    {
+#if defined(FAISCA_CUDA)
+        if (gpu != nullptr)
+        {
+            return gpu->build_triplane(error);
+        }
+#endif
+        return cpu->build_triplane(error);
+    }
+
+    bool extract_mesh(uint32_t resolution, float threshold, faisca::TripoMesh& mesh, faisca::Error& error)
+    {
+#if defined(FAISCA_CUDA)
+        if (gpu != nullptr)
+        {
+            return gpu->extract_mesh(resolution, threshold, mesh, error);
+        }
+#endif
+        return cpu->extract_mesh(resolution, threshold, mesh, error);
+    }
+};
 
 struct Dump
 {
@@ -39,9 +108,23 @@ double seconds_since(std::chrono::steady_clock::time_point start)
 
 int main(int argc, char** argv)
 {
+    bool use_cuda = false;
+    int kept = 1;
+    for (int i = 1; i < argc; ++i)
+    {
+        if (std::strcmp(argv[i], "--cuda") == 0)
+        {
+            use_cuda = true;
+        }
+        else
+        {
+            argv[kept++] = argv[i];
+        }
+    }
+    argc = kept;
     if (argc < 4)
     {
-        std::fprintf(stderr, "usage: triposr_dump <model.ckpt> <image .png/.jpg or reference dir with rgb_cond.f32> <out dir, - for no traces> [threads] [mesh resolution, 64]\n");
+        std::fprintf(stderr, "usage: triposr_dump <model.ckpt> <image .png/.jpg or reference dir with rgb_cond.f32> <out dir, - for no traces> [threads] [mesh resolution, 64] [--cuda]\n");
         return 2;
     }
     const int threads = argc > 4 ? std::atoi(argv[4]) : static_cast<int>(std::thread::hardware_concurrency());
@@ -87,12 +170,41 @@ int main(int argc, char** argv)
     std::fprintf(stderr, "open %.3f s\n", seconds_since(start));
 
     faisca::ThreadPool pool;
-    faisca::TripoRunner runner;
-    if (!pool.start(threads, error) || !runner.init(model, pool, error))
+    faisca::TripoRunner cpu;
+#if defined(FAISCA_CUDA)
+    faisca::CudaDevice device;
+    faisca::TripoCudaRunner gpu;
+#endif
+    if (!pool.start(threads, error))
     {
         std::fprintf(stderr, "error: %s\n", error.c_str());
         return 1;
     }
+    if (use_cuda)
+    {
+#if defined(FAISCA_CUDA)
+        start = std::chrono::steady_clock::now();
+        if (!device.init(error) || !gpu.init(model, device, pool, error))
+        {
+            std::fprintf(stderr, "error: %s\n", error.c_str());
+            return 1;
+        }
+        std::fprintf(stderr, "CUDA %s, upload %.3f s\n", device.device_name(), seconds_since(start));
+#else
+        std::fprintf(stderr, "error: built without FAISCA_CUDA\n");
+        return 1;
+#endif
+    }
+    else if (!cpu.init(model, pool, error))
+    {
+        std::fprintf(stderr, "error: %s\n", error.c_str());
+        return 1;
+    }
+    Runner runner = {use_cuda ? nullptr : &cpu,
+#if defined(FAISCA_CUDA)
+                     use_cuda ? &gpu : nullptr
+#endif
+    };
     Dump dump = {argv[3]};
     if (dump.dir != "-")
     {
@@ -101,14 +213,14 @@ int main(int argc, char** argv)
     }
 
     start = std::chrono::steady_clock::now();
-    if (!runner.encode_image(rgb.data(), error))
+    if (!runner.encode_image(rgb.data(), error) || !runner.synchronize(error))
     {
         std::fprintf(stderr, "error: %s\n", error.c_str());
         return 1;
     }
     std::fprintf(stderr, "image encoder %.3f s with %d threads\n", seconds_since(start), threads);
     start = std::chrono::steady_clock::now();
-    if (!runner.build_triplane(error))
+    if (!runner.build_triplane(error) || !runner.synchronize(error))
     {
         std::fprintf(stderr, "error: %s\n", error.c_str());
         return 1;
